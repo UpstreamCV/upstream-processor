@@ -95,3 +95,11 @@ shutdown budget than mock. Defaults are now DeepStream-safe —
 `DEEPSTREAM_PROCESS_STOP_TIMEOUT_SECONDS=5` — so future inference tests do
 not rely on ad hoc env overrides. No behavior change to inference /
 observations (not implemented). Env overrides still supported.
+
+**M8.2C1-A inference smoke (2026-05-19):** the Blackwell concern above is now
+**confirmed real for inference**. nvinfer ran but TensorRT 10.3 in
+`deepstream:7.1-samples-multiarch` cannot build an engine on the RTX 5070 Ti
+(`Unsupported SM: 0xc00` = sm_120, then core dump). Decode still works
+(NVDEC bypasses TensorRT). Inference needs a newer DeepStream image
+(TensorRT ≥ 10.7, CUDA ≥ 12.8). Full write-up + reusable probe:
+`docs/deepstream-inference-smoke.md` / `scripts/probe_deepstream_inference.sh`.
