@@ -1,21 +1,26 @@
-"""Resolve an eligible session's ``package_id`` to a package spec.
+"""Resolve a ``package_id`` to a package spec.
 
-M8.1 ships exactly one package (``mock.detect.v0``, runtime ``mock``). Per
-the brief this resolver is strict: an unknown ``package_id`` or a non-``mock``
-runtime is rejected clearly (``PackageResolutionError``) so the worker posts
-``failed`` rather than silently mis-running.
+The package registry entry declares the runtime; the worker manager
+dispatches on ``spec.runtime``. M8.2B supports two runtimes:
+
+- ``mock``       — M8.1 mock handoff (``mock.detect.v0``)
+- ``deepstream`` — M8.2B decode-only probe (``deepstream.decode_probe.v0``)
+
+Strict: an unknown ``package_id`` or a package whose runtime is not in the
+supported set is rejected clearly (``PackageResolutionError``) so the worker
+posts ``failed`` rather than silently mis-running.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import resources
 
 from app.errors import PackageResolutionError
 
-_SUPPORTED_RUNTIME = "mock"
+SUPPORTED_RUNTIMES: frozenset[str] = frozenset({"mock", "deepstream"})
 
 
 @dataclass(frozen=True)
@@ -25,6 +30,7 @@ class PackageSpec:
     runtime: str
     description: str
     outputs: tuple[str, ...]
+    supports: dict[str, bool] = field(default_factory=dict)
 
 
 @lru_cache(maxsize=1)
@@ -42,31 +48,28 @@ def load_registry() -> dict[str, PackageSpec]:
             display_name=entry["display_name"],
             runtime=entry["runtime"],
             description=entry["description"],
-            outputs=tuple(entry["outputs"]),
+            outputs=tuple(entry.get("outputs", [])),
+            supports=dict(entry.get("supports", {})),
         )
         registry[spec.package_id] = spec
     return registry
 
 
-def resolve(package_id: str, runtime: str) -> PackageSpec:
+def resolve(package_id: str) -> PackageSpec:
     """Return the spec for ``package_id``.
 
-    Raises ``PackageResolutionError`` if the package is unknown, if the
-    session's ``runtime`` is not ``mock``, or if the catalogued package's
-    runtime is not ``mock`` (defence-in-depth for M8.1).
+    Raises ``PackageResolutionError`` if the package is unknown or if its
+    declared runtime is not in ``SUPPORTED_RUNTIMES``.
     """
-    if runtime != _SUPPORTED_RUNTIME:
-        raise PackageResolutionError(
-            f"unsupported runtime {runtime!r}: M8.1 only supports {_SUPPORTED_RUNTIME!r}"
-        )
     registry = load_registry()
     spec = registry.get(package_id)
     if spec is None:
         raise PackageResolutionError(
             f"unknown package_id {package_id!r}; known: {sorted(registry)}"
         )
-    if spec.runtime != _SUPPORTED_RUNTIME:
+    if spec.runtime not in SUPPORTED_RUNTIMES:
         raise PackageResolutionError(
-            f"package {package_id!r} requires runtime {spec.runtime!r}, not supported in M8.1"
+            f"package {package_id!r} declares unsupported runtime "
+            f"{spec.runtime!r}; supported: {sorted(SUPPORTED_RUNTIMES)}"
         )
     return spec

@@ -4,6 +4,56 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P1/M8.2B: Minimal DeepStream Runtime Worker
+
+### Summary
+Turns the M8.2A manual decode probe into a supervisor-managed runtime worker.
+New `deepstream.decode_probe.v0` package (runtime `deepstream`, decode only,
+no observations). `DeepStreamWorker` runs the proven Docker/GStreamer NVDEC
+pipeline as a managed subprocess and maps it onto the M8.0 status lifecycle
+(`starting → attached → processing → stopped`/`failed`). Resolver now
+dispatches by the package's runtime; `UPSTREAM_FORCE_PACKAGE_ID` routes a
+mock-defaulted session to the DeepStream package without touching prod
+config. RTSP URL is never logged (redacted); secret never handled here.
+**No inference, no Triton, no tracking, no nvdsanalytics, no observations.**
+
+### Files touched
+- `app/packages/package_registry.json` — added `deepstream.decode_probe.v0`.
+- `app/packages/resolver.py` — `resolve(package_id)` (drop runtime arg);
+  `SUPPORTED_RUNTIMES={mock,deepstream}`; `PackageSpec.supports`.
+- `app/config.py` — `force_package_id` + 5 `deepstream_*` settings.
+- `app/supervisor/processor_status.py` — optional `runtime`/`package_id`
+  overrides (mock unchanged; DeepStream reports its resolved runtime).
+- `app/redact.py` (new) — `redact_rtsp` / `scrub_rtsp_in_text`.
+- `app/runtimes/deepstream_runtime/{__init__,process_manager,worker}.py`
+  (new) — `ProcessManager` protocol, `DeepStreamProcessManager`,
+  `DeepStreamWorker`; `README.md` updated.
+- `app/supervisor/worker_manager.py` — `effective_package_id` +
+  `build_worker` runtime dispatch; `_Handle.worker: Runtime`.
+- `tests/` — rewrote `test_package_resolver`; fixed `test_mock_runtime` /
+  `test_worker_manager`; new `test_deepstream_runtime` (fake PM, no Docker).
+- `docs/` — README, architecture, local-dev (M8.2B checklist),
+  deepstream-rtsp-probe, this log.
+
+### System interaction notes
+`SessionPoller → WorkerManager (effective_package_id → resolve →
+build_worker) → DeepStreamWorker → DeepStreamProcessManager (docker run
+--gpus all --network host …) → fpsdisplaysink lines → POST /status`.
+No observation writes.
+
+### Testing/checks
+- `uv run pytest -q` — 51/51 pass (was 39; +12).
+- `uv run ruff check .` / `ruff format --check .` — clean.
+- `uv run mypy app` — clean (28 files).
+- Live DeepStream worker run = operator checklist (`docs/local-dev.md`).
+
+### Follow-up TODOs
+- Live-verify the worker against an active stream on crowdcountS2.
+- Later: first inference probe (re-evaluate DeepStream tag for RTX 5070 Ti
+  / Blackwell sm_120 — decode is fine, TensorRT is the open question).
+
+---
+
 ## 2026-05-18 - M8.1: Mock Processor Handoff (initial repo)
 
 ### Summary

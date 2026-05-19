@@ -44,12 +44,34 @@ every worker, then awaits each best-effort final `stopped` under
 `final_status_timeout`, all under an overall `wait_for(overall_timeout)` with a
 hard `task.cancel()` escape hatch so a dead API cannot hang exit.
 
-## Future: the DeepStream runtime (M8.2+)
+## DeepStream decode-probe runtime (M8.2B)
 
-`runtimes/base.Runtime` is the seam. M8.2 adds `runtimes/deepstream_runtime/`
-implementing the same `run()` / `request_stop()` / `state` / `session_id`
-interface. Only then is `internal_rtsp_url` consumed (to open the MediaMTX
-RTSP read path). The supervisor, poller, status/observation paths, schemas,
-and resolver are unchanged — the runtime is the only new moving part. The
-contract-legal `lagging` status is reserved for that real-pipeline runtime;
-the mock never emits it.
+`runtimes/base.Runtime` is the seam. `runtimes/deepstream_runtime/`
+implements the same `run()` / `request_stop()` / `state` / `session_id`
+interface, so the supervisor, poller, status path, and schemas are
+unchanged. Runtime selection: `resolver.resolve(package_id)` returns a
+`PackageSpec`; `worker_manager.build_worker` dispatches on `spec.runtime`
+(`mock` → `MockWorker`, `deepstream` → `DeepStreamWorker`).
+`UPSTREAM_FORCE_PACKAGE_ID` lets a mock-defaulted session route to the
+DeepStream package without changing production config.
+
+- **`DeepStreamProcessManager`** owns a Docker subprocess running the
+  M8.2A-proven pipeline (`rtspsrc → rtph264depay → h264parse →
+  nvv4l2decoder → nvvideoconvert → fpsdisplaysink`, `--gpus all
+  --network host`). It builds the argv, streams stdout, and on stop does
+  `docker stop` → SIGTERM → SIGKILL-after-`stop_timeout`. The RTSP URL is
+  only ever in the subprocess argv; everything logged is redacted
+  (`rtsp://host:port/sess_<redacted>`), and any `rtsp://` echoed by
+  `gst-launch -v` is scrubbed before it can reach a log/error.
+- **`DeepStreamWorker`** consumes the eligible session's
+  `internal_rtsp_url`, posts `starting`, starts the subprocess, and parses
+  `fpsdisplaysink` lines: first `rendered: N>0` → `attached`; subsequent
+  fps → throttled `processing` posts carrying `fps_processed`. On graceful
+  stop / clean exit codes → `stopped`; on unexpected nonzero exit →
+  `failed` (with `error_code`/redacted `error_message`). Status rows report
+  `runtime="deepstream"` / the resolved `package_id` (the M8.0 session
+  itself still says `mock`). **No observations** are emitted in M8.2B.
+
+The contract-legal `lagging` status is still unused (decode probe has no
+inference backlog to fall behind); it is reserved for a later inference
+runtime. Decode only — no inference / Triton / tracking / nvdsanalytics yet.

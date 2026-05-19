@@ -77,9 +77,14 @@ argument/env (never hard-coded, never committed).
 
 ## Status / next step
 
-GPU + Docker + Container Toolkit + RTSP port reachability: **proven**.
-Live RTSP read/decode: **pending an active validated stream** (rerun step 2–3
-when `GET /eligible-sessions` returns one). Until decode is shown with frames
-flowing, M8.2A is **not** "DeepStream-works" complete. Next:
-**wait for an active stream and rerun the RTSP/DeepStream probe**, then
-proceed to **P1/M8.2B Minimal DeepStream Runtime Worker**.
+M8.2A is **complete**: GPU + Docker + Container Toolkit + RTSP reachability
+proven, and on an active stream `ffprobe` + the DeepStream/GStreamer
+container both opened `internal_rtsp_url` and decoded ~30 fps with 0 dropped
+frames (`scripts/probe_deepstream_rtsp.sh`).
+
+**M8.2B is implemented**: that proven manual pipeline now runs as a
+supervisor-managed worker — `app/runtimes/deepstream_runtime/` +
+`deepstream.decode_probe.v0`. Run it via
+`UPSTREAM_FORCE_PACKAGE_ID=deepstream.decode_probe.v0` (see README /
+`docs/local-dev.md` M8.2B checklist). Still decode only — no inference,
+Triton, tracking, nvdsanalytics, or observations.

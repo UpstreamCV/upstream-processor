@@ -6,8 +6,16 @@ from collections.abc import Callable
 import pytest
 from app.errors import ApiAuthError
 from app.observations.schemas import EligibleSession
+from app.observations.writer import ObservationWriter
+from app.packages.resolver import resolve
+from app.runtimes.deepstream_runtime.worker import DeepStreamWorker
+from app.runtimes.mock_runtime.worker import MockWorker
 from app.supervisor.session_poller import SessionPoller
-from app.supervisor.worker_manager import WorkerManager
+from app.supervisor.worker_manager import (
+    WorkerManager,
+    build_worker,
+    effective_package_id,
+)
 
 from tests._fakes import FakeApi
 from tests.conftest import eligible_session_dict
@@ -80,7 +88,7 @@ async def test_unresolvable_package_is_quarantined_not_spawned(
     fast_settings,  # type: ignore[no-untyped-def]
 ) -> None:
     api = FakeApi()
-    api.queue_eligible([_session(runtime="deepstream")])  # not supported in M8.1
+    api.queue_eligible([_session(package_id="does.not.exist")])  # unknown package
     mgr, shutdown = _manager(api, fast_settings)
     task = asyncio.create_task(mgr.run())
 
@@ -104,3 +112,39 @@ async def test_shutdown_stops_all_workers(fast_settings) -> None:  # type: ignor
     await asyncio.wait_for(task, timeout=3)
     assert mgr.active_count() == 0
     assert api.status_sequence().count("stopped") == 2
+
+
+# --- M8.2B: package override + runtime dispatch (pure, no docker) ---------
+
+
+def test_effective_package_id_defaults_to_session(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    sess = _session(package_id="mock.detect.v0")
+    assert effective_package_id(fast_settings, sess) == "mock.detect.v0"
+
+
+def test_effective_package_id_force_override(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    forced = fast_settings.model_copy(update={"force_package_id": "deepstream.decode_probe.v0"})
+    sess = _session(package_id="mock.detect.v0")
+    assert effective_package_id(forced, sess) == "deepstream.decode_probe.v0"
+
+
+def test_build_worker_dispatches_on_runtime(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    api = FakeApi()
+    writer = ObservationWriter(api, fast_settings.processor_id)
+    sess = _session()
+    mock_w = build_worker(
+        session=sess,
+        spec=resolve("mock.detect.v0"),
+        settings=fast_settings,
+        api=api,
+        writer=writer,
+    )
+    ds_w = build_worker(
+        session=sess,
+        spec=resolve("deepstream.decode_probe.v0"),
+        settings=fast_settings,
+        api=api,
+        writer=writer,
+    )
+    assert isinstance(mock_w, MockWorker)
+    assert isinstance(ds_w, DeepStreamWorker)  # constructed, not run -> no docker

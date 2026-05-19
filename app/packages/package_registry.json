@@ -10,6 +10,16 @@
         "processor.mock_heartbeat",
         "processor.mock_detection"
       ]
+    },
+    {
+      "package_id": "deepstream.decode_probe.v0",
+      "display_name": "DeepStream Decode Probe v0",
+      "runtime": "deepstream",
+      "description": "Minimal DeepStream/GStreamer RTSP decode probe package.",
+      "outputs": [],
+      "supports": {
+        "decode_only": true
+      }
     }
   ]
 }

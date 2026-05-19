@@ -48,6 +48,42 @@ cp .env.example .env
 [ ] No webhook secret appears in logs
 ```
 
+## Live verification checklist (M8.2B — DeepStream decode probe)
+
+Run on the GPU/streaming host (crowdcountS2) so `127.0.0.1:18554` is the
+streaming host. The DeepStream image (~9 GB) is cached there from M8.2A.
+
+```
+[ ] Start a valid upstream-agent stream
+[ ] Wait for validation_status=true
+[ ] eligible-sessions returns one session
+[ ] Run upstream-processor with:
+      UPSTREAM_FORCE_PACKAGE_ID=deepstream.decode_probe.v0
+      UPSTREAM_DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream:7.1-samples-multiarch
+      UPSTREAM_PROCESSOR_ID=proc_m82b_live
+[ ] DeepStream worker starts (log: "package override active", "deepstream worker")
+[ ] Status posts `starting`
+[ ] DeepStream container opens internal_rtsp_url (only redacted URL in logs)
+[ ] Frames flow (fpsdisplaysink rendered: N)
+[ ] Status posts `attached`
+[ ] Status posts `processing` with fps_processed (~30)
+[ ] Stop processor (SIGINT)
+[ ] DeepStream subprocess stops cleanly (docker stop; no lingering container)
+[ ] Status posts `stopped`
+[ ] processor_statuses row: runtime=deepstream, package_id=deepstream.decode_probe.v0
+[ ] No observations are posted
+[ ] No secret or full RTSP URL appears in logs
+```
+
+### What was verified during M8.2B build
+
+- Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.
+- DeepStream worker lifecycle (starting/attached/processing/stopped/failed),
+  no-observations, RTSP redaction, command builder, force override + runtime
+  dispatch, and hung-process SIGKILL are all unit-tested with a fake process
+  manager (no Docker/GPU in the suite).
+- Live worker run against an active stream is the operator checklist above.
+
 ### What was verified during M8.1 build
 
 - Full unit/integration suite (39 tests) green; ruff + mypy clean.

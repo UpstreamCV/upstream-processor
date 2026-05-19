@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     max_restarts: int = 5
     restart_window_seconds: float = 60.0
 
+    # --- M8.2B DeepStream decode-probe runtime ---------------------------
+    # Dev/test only: force every eligible session to resolve to this package
+    # id (e.g. deepstream.decode_probe.v0) without mutating production camera
+    # config. Unset => use the session's own package_id.
+    force_package_id: str | None = None
+    deepstream_image: str = "nvcr.io/nvidia/deepstream:7.1-samples-multiarch"
+    deepstream_rtsp_transport: str = "tcp"
+    deepstream_probe_timeout_seconds: float = 30.0
+    deepstream_process_stop_timeout_seconds: float = 10.0
+    deepstream_docker_network: str = "host"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -25,7 +25,9 @@ from app.errors import (
 )
 from app.observations.schemas import EligibleSession
 from app.observations.writer import ObservationWriter
-from app.packages.resolver import resolve
+from app.packages.resolver import PackageSpec, resolve
+from app.runtimes.base import Runtime
+from app.runtimes.deepstream_runtime.worker import DeepStreamWorker
 from app.runtimes.mock_runtime.worker import MockWorker
 from app.supervisor.processor_status import build_status_request
 from app.supervisor.session_poller import SessionPoller
@@ -33,10 +35,39 @@ from app.supervisor.session_poller import SessionPoller
 _log = logging.getLogger("upstream_processor.manager")
 
 
+def effective_package_id(settings: Settings, session: EligibleSession) -> str:
+    """Dev/test override: ``UPSTREAM_FORCE_PACKAGE_ID`` wins over the session's
+    own ``package_id`` (so a mock-defaulted session can be routed to the
+    DeepStream decode probe without mutating production camera config)."""
+    return settings.force_package_id or session.package_id
+
+
+def build_worker(
+    *,
+    session: EligibleSession,
+    spec: PackageSpec,
+    settings: Settings,
+    api: ProcessorApi,
+    writer: ObservationWriter,
+) -> Runtime:
+    """Pick the runtime worker from the resolved package's runtime. Pure +
+    side-effect free (constructing a DeepStreamWorker does NOT touch Docker —
+    the subprocess starts in ``run()``), so this is unit-testable."""
+    if spec.runtime == "deepstream":
+        return DeepStreamWorker(session=session, settings=settings, api=api, package=spec)
+    return MockWorker(
+        session=session,
+        settings=settings,
+        api=api,
+        writer=writer,
+        package=spec,
+    )
+
+
 @dataclass
 class _Handle:
     task: asyncio.Task[None]
-    worker: MockWorker
+    worker: Runtime
 
 
 @dataclass
@@ -138,24 +169,32 @@ class WorkerManager:
                     window,
                 )
                 continue
+            pkg_id = effective_package_id(self._settings, session)
+            if self._settings.force_package_id and pkg_id != session.package_id:
+                _log.info(
+                    "package override active for %s: forced=%s (session offered %s)",
+                    sid,
+                    pkg_id,
+                    session.package_id,
+                )
             try:
-                resolve(session.package_id, session.runtime)
+                spec = resolve(pkg_id)
             except PackageResolutionError as exc:
                 _log.error("package resolution failed for %s: %s", sid, exc)
                 self._spawn_bg(self._post_failed(session, "package_resolution", str(exc)))
                 self._quarantine[sid] = now + window
                 continue
-            self._spawn(sid, session)
+            self._spawn(sid, session, spec)
             book.starts.append(now)
             self._quarantine.pop(sid, None)
 
-    def _spawn(self, sid: UUID, session: EligibleSession) -> None:
-        worker = MockWorker(
+    def _spawn(self, sid: UUID, session: EligibleSession, spec: PackageSpec) -> None:
+        worker = build_worker(
             session=session,
+            spec=spec,
             settings=self._settings,
             api=self._api,
             writer=self._writer,
-            package=resolve(session.package_id, session.runtime),
         )
         task: asyncio.Task[None] = asyncio.create_task(worker.run())
         self._workers[sid] = _Handle(task=task, worker=worker)

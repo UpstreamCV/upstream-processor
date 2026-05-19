@@ -2,21 +2,38 @@ from __future__ import annotations
 
 import pytest
 from app.errors import PackageResolutionError
-from app.packages.resolver import resolve
+from app.packages import resolver
+from app.packages.resolver import PackageSpec, resolve
 
 
 def test_resolves_known_mock_package() -> None:
-    spec = resolve("mock.detect.v0", "mock")
+    spec = resolve("mock.detect.v0")
     assert spec.package_id == "mock.detect.v0"
     assert spec.runtime == "mock"
     assert "processor.mock_detection" in spec.outputs
 
 
+def test_resolves_deepstream_decode_probe_package() -> None:
+    spec = resolve("deepstream.decode_probe.v0")
+    assert spec.package_id == "deepstream.decode_probe.v0"
+    assert spec.runtime == "deepstream"
+    assert spec.outputs == ()  # decode only — no observations
+    assert spec.supports.get("decode_only") is True
+
+
 def test_rejects_unknown_package() -> None:
     with pytest.raises(PackageResolutionError, match="unknown package_id"):
-        resolve("does.not.exist", "mock")
+        resolve("does.not.exist")
 
 
-def test_rejects_non_mock_runtime() -> None:
+def test_rejects_unsupported_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    bad = PackageSpec(
+        package_id="triton.thing.v0",
+        display_name="Triton Thing",
+        runtime="triton",  # not in SUPPORTED_RUNTIMES
+        description="x",
+        outputs=(),
+    )
+    monkeypatch.setattr(resolver, "load_registry", lambda: {bad.package_id: bad})
     with pytest.raises(PackageResolutionError, match="unsupported runtime"):
-        resolve("mock.detect.v0", "deepstream")
+        resolve("triton.thing.v0")

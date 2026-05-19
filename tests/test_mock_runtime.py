@@ -25,7 +25,7 @@ def _worker(api: FakeApi, settings):  # type: ignore[no-untyped-def]
         settings=settings,
         api=api,
         writer=ObservationWriter(api, settings.processor_id),
-        package=resolve("mock.detect.v0", "mock"),
+        package=resolve("mock.detect.v0"),
     )
 
 
