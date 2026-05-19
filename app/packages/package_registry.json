@@ -20,6 +20,16 @@
       "supports": {
         "decode_only": true
       }
+    },
+    {
+      "package_id": "deepstream.inference_probe.v0",
+      "display_name": "DeepStream Inference Probe v0",
+      "runtime": "deepstream",
+      "description": "DeepStream 8.0 nvinfer sample-model (TrafficCamNet) inference probe. RTSP decode + nvinfer; detection evidence is status/log-only (KITTI dump). No observations, no metadata extraction, no pyds.",
+      "outputs": [],
+      "supports": {
+        "inference_probe": true
+      }
     }
   ]
 }

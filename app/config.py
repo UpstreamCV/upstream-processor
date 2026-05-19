@@ -61,11 +61,28 @@ class Settings(BaseSettings):
     # id (e.g. deepstream.decode_probe.v0) without mutating production camera
     # config. Unset => use the session's own package_id.
     force_package_id: str | None = None
-    deepstream_image: str = "nvcr.io/nvidia/deepstream:7.1-samples-multiarch"
+    # DeepStream 8.0 by default: 7.1 decodes on Blackwell but FAILS inference
+    # (TensorRT 10.3 → "Unsupported SM: 0xc00", M8.2C1-A). 8.0 (TensorRT 10.9
+    # / CUDA 12.8) builds the engine and runs nvinfer on the RTX 5070 Ti.
+    # 8.0 also decodes fine, so it is safe as the single default for both the
+    # decode_probe and inference_probe packages. Env-overridable.
+    deepstream_image: str = "nvcr.io/nvidia/deepstream:8.0-samples-multiarch"
     deepstream_rtsp_transport: str = "tcp"
     deepstream_probe_timeout_seconds: float = 30.0
     deepstream_process_stop_timeout_seconds: float = 5.0
     deepstream_docker_network: str = "host"
+
+    # --- M8.2C1-B DeepStream inference-probe runtime ---------------------
+    # Bounded nvinfer smoke under the supervisor (TrafficCamNet sample model).
+    # Detection evidence is status/log-only (KITTI dump) — NO observations,
+    # NO metadata extraction, NO pyds. All env-overridable.
+    deepstream_inference_timeout_seconds: float = 60.0
+    # Empty => auto temp dir under the system tempdir. If set, the per-run
+    # work dir (deepstream-app/PGIE config + KITTI output) is created under
+    # this base (useful for post-run inspection on a GPU host).
+    deepstream_inference_output_dir: str = ""
+    deepstream_inference_model: str = "trafficcamnet"
+    deepstream_keep_temp_files: bool = False
 
 
 @lru_cache(maxsize=1)

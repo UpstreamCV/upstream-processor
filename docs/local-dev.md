@@ -75,6 +75,45 @@ streaming host. The DeepStream image (~9 GB) is cached there from M8.2A.
 [ ] No secret or full RTSP URL appears in logs
 ```
 
+## Live verification checklist (M8.2C1-B — DeepStream inference probe)
+
+Run on the GPU/streaming host (crowdcountS2). The DeepStream **8.0** image
+(`nvcr.io/nvidia/deepstream:8.0-samples-multiarch`, ~33 GB) is cached there
+from M8.2C1-A. Status: implementation complete; **live verification pending
+until explicitly run** (do not claim live-verified otherwise).
+
+```
+[ ] Start a valid upstream-agent stream
+[ ] Wait for validation_status=true
+[ ] eligible-sessions returns one session
+[ ] Run upstream-processor with:
+      UPSTREAM_FORCE_PACKAGE_ID=deepstream.inference_probe.v0
+      UPSTREAM_DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream:8.0-samples-multiarch
+      UPSTREAM_PROCESSOR_ID=proc_m82c1b_live
+[ ] DeepStream inference worker starts (log: "package override active",
+    "deepstream worker ... mode=inference_probe")
+[ ] Status posts `starting`
+[ ] DeepStream container opens internal_rtsp_url (only redacted URL in logs)
+[ ] nvinfer initializes; TensorRT engine builds/loads (no "Unsupported SM")
+[ ] Status posts `attached`
+[ ] Inference runs; `**PERF` fps lines; KITTI frames/detections appear
+[ ] Status posts `processing` (payload: inference_enabled=true,
+    inference_engine_built=true, model, image, detection_*counts)
+[ ] Stop processor (SIGINT) — or the bounded probe self-exits at the timeout
+[ ] DeepStream subprocess stops cleanly (docker stop; no lingering container)
+[ ] Status posts `stopped`
+[ ] processor_statuses row: runtime=deepstream,
+    package_id=deepstream.inference_probe.v0
+[ ] No observations are posted
+[ ] No raw RTSP URL, stream key, secret, Authorization or Bearer in logs
+[ ] Temp config/output dir cleaned up (unless KEEP_TEMP_FILES=true)
+```
+
+Note: the inference probe is bounded by
+`UPSTREAM_DEEPSTREAM_INFERENCE_TIMEOUT_SECONDS` (default 60). It exits `124`
+(timeout, clean) and the supervisor will restart it next poll while the
+session stays eligible — expected for a probe (same shape as decode probe).
+
 ### M8.2B cleanup — shutdown defaults
 
 Live verification needed bigger shutdown timeouts than the mock defaults, so

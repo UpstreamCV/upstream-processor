@@ -80,6 +80,48 @@ DeepStream package without changing production config.
   `runtime="deepstream"` / the resolved `package_id` (the M8.0 session
   itself still says `mock`). **No observations** are emitted in M8.2B.
 
-The contract-legal `lagging` status is still unused (decode probe has no
-inference backlog to fall behind); it is reserved for a later inference
-runtime. Decode only — no inference / Triton / tracking / nvdsanalytics yet.
+The contract-legal `lagging` status is still unused; it is reserved for a
+later production inference runtime.
+
+## DeepStream inference-probe runtime (M8.2C1-B)
+
+Same seam, same `DeepStreamWorker`. The resolved package's `supports`
+selects the mode: `supports.decode_only` → decode (M8.2B, unchanged);
+`supports.inference_probe` (`deepstream.inference_probe.v0`) → inference.
+`mock.detect.v0` and `deepstream.decode_probe.v0` are untouched.
+
+- **`inference.py`** — pure builders (`build_pgie_config`,
+  `build_app_config`, `build_inference_docker_command`) +
+  **`DeepStreamInferenceProcessManager`**. The PM creates a per-run **temp
+  work dir** (deepstream-app + PGIE config + a `kitti/` output dir),
+  bind-mounted into the container at the same path, and runs the
+  M8.2C1-A-proven DeepStream 8.0 pipeline: `timeout -s INT <t> deepstream-app`
+  with RTSP/TCP `source` → `nvstreammux` → `nvinfer` (bundled TrafficCamNet
+  ONNX, INT8, engine built fresh) → `fakesink`, no display
+  (`--gpus all --network host -v wd:wd`). It streams stdout, does the same
+  `docker stop` → SIGTERM → SIGKILL-after-`stop_timeout`, exposes
+  `kitti_stats()` (frame/detection-line counts), and removes the temp dir on
+  stop unless `keep_temp_files`. The RTSP URL is only in the temp `ds_app.txt`
+  + argv; logs are redacted; `rtsp://` echoed in stdout is scrubbed.
+- **`DeepStreamWorker` (inference mode)** posts `starting`, starts the
+  subprocess, and parses the proven M8.2C1-A markers: first
+  source/nvinfer line (`deserialize engine from file`, `NvDsInferContext`,
+  `nvstreammux`, …) → `attached`; engine-built (`serialize cuda engine to
+  file: …successfully`) or a `**PERF` fps line → `processing` (throttled),
+  payload carrying `inference_enabled`, `inference_engine_built`, `model`,
+  `image`, `fps_processed`, and KITTI `detection_frames_count` /
+  `detection_count`. Graceful stop / clean exit (incl. `124` from the bounded
+  `timeout`) → `stopped`; `Unsupported SM` / TensorRT / CUDA / core-dump →
+  `failed` with `error_code` (`deepstream_unsupported_sm` /
+  `deepstream_trt_error` / `deepstream_exit`) and a **redacted**
+  `error_message`. Status rows report `runtime="deepstream"` /
+  `deepstream.inference_probe.v0`.
+
+Default image is **DeepStream 8.0** (`UPSTREAM_DEEPSTREAM_IMAGE`): 7.1's
+TensorRT 10.3 fails inference on Blackwell sm_120 (M8.2C1-A); 8.0's TensorRT
+10.9 / CUDA 12.8 works. **No observations** in either mode. The inference
+probe runs `nvinfer` but is still a probe — KITTI output is debug/inference
+evidence only, **not** metadata extraction. Out of scope: pyds, pad probes,
+MetadataSource, metadata adapter, observations, tracking, nvtracker,
+nvdsanalytics, line crossing, zones, Triton, dashboard, package catalog,
+billing. API contracts unchanged.

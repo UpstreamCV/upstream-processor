@@ -105,3 +105,10 @@ stream (~30 fps, detections via KITTI). **M8.2C1-A passed; next M8.2C1-B.**
 The inference probe's default image is now 8.0. Full write-up + reusable
 probe: `docs/deepstream-inference-smoke.md` /
 `scripts/probe_deepstream_inference.sh`.
+
+**M8.2C1-B (2026-05-19):** the M8.2C1-A inference pipeline now runs under the
+supervisor as `deepstream.inference_probe.v0` (`DeepStreamWorker` inference
+mode + `DeepStreamInferenceProcessManager`). Decode probe (M8.2B) unchanged.
+Default DeepStream image bumped to 8.0 for both. Still **no observations / no
+metadata extraction / no pyds**. Implementation complete + unit-tested; live
+verification pending. See `docs/local-dev.md` M8.2C1-B checklist.

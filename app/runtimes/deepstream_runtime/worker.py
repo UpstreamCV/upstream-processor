@@ -1,14 +1,24 @@
-"""M8.2B DeepStream decode-probe worker.
+"""DeepStream worker — decode probe (M8.2B) + inference probe (M8.2C1-B).
 
 Implements the existing ``Runtime`` interface so the supervisor treats it
-exactly like the mock worker. It runs the M8.2A-proven GStreamer decode
-pipeline as a managed subprocess and maps it onto the M8.0 status lifecycle:
+exactly like the mock worker. The resolved package's ``supports`` selects
+the mode:
 
-    starting -> attached (first frames decoded) -> processing (fps updates)
-             -> stopped (graceful) | failed (process error)
+- ``decode_probe`` (``deepstream.decode_probe.v0``, M8.2B) — the M8.2A-proven
+  GStreamer NVDEC decode pipeline. **Decode only.**
+- ``inference_probe`` (``deepstream.inference_probe.v0``, M8.2C1-B) — the
+  M8.2C1-A-proven DeepStream 8.0 ``deepstream-app`` nvinfer pipeline
+  (TrafficCamNet sample model). Inference runs; detection evidence is
+  status/log-only (KITTI dump). **No observations, no metadata extraction.**
 
-Decode only: **no inference, no tracking, no observations**. The RTSP URL is
-never logged (only its redacted form); the secret is never handled here.
+Both map onto the M8.0 status lifecycle:
+
+    starting -> attached (source/pipeline up) -> processing (fps/inference)
+             -> stopped (graceful) | failed (process / TensorRT-SM error)
+
+Neither emits observations. The RTSP URL is never logged (only its redacted
+form); the secret is never handled here. **No pyds, no pad probes, no
+MetadataSource, no metadata adapter, no tracking, no nvdsanalytics.**
 """
 
 from __future__ import annotations
@@ -34,6 +44,9 @@ from app.observations.schemas import EligibleSession
 from app.packages.resolver import PackageSpec
 from app.redact import redact_rtsp, scrub_rtsp_in_text
 from app.runtimes.base import Runtime, WorkerState
+from app.runtimes.deepstream_runtime.inference import (
+    DeepStreamInferenceProcessManager,
+)
 from app.runtimes.deepstream_runtime.process_manager import (
     DeepStreamProcessManager,
     ProcessManager,
@@ -48,6 +61,9 @@ _READLINE_POLL_SECONDS = 0.5
 # graceful endings (124 = timeout, 130 = SIGINT, 137 = SIGKILL after stop).
 _CLEAN_EXIT_CODES = frozenset({0, 124, 130, 137})
 
+_DECODE_MODE = "decode_probe"
+_INFERENCE_MODE = "inference_probe"
+
 _FPS_RE = re.compile(
     r"rendered:\s*(\d+),\s*dropped:\s*(\d+),.*?average:\s*([\d.]+)",
     re.IGNORECASE,
@@ -59,6 +75,47 @@ def _parse_fps(line: str) -> tuple[int, int, float] | None:
     if m is None:
         return None
     return int(m.group(1)), int(m.group(2)), float(m.group(3))
+
+
+# --- inference-probe (M8.2C1-B) log markers, from the proven M8.2C1-A run ---
+# deepstream-app PERF line: "**PERF:  30.00 (29.98)" → (instant, avg). The
+# "**PERF:  FPS 0 (Avg)" header has no decimal and is intentionally skipped.
+_PERF_RE = re.compile(r"\*\*PERF:\s+([0-9]+\.[0-9]+)\s+\(([0-9]+\.[0-9]+)\)")
+# nvinfer built or loaded a usable TensorRT engine (success).
+_ENGINE_OK_RE = re.compile(
+    r"serialize cuda engine to file:.*successfully"
+    r"|deserialized trt engine"
+    r"|Use deserialized engine model"
+    r"|Loaded engine",
+    re.IGNORECASE,
+)
+# Source/pipeline/nvinfer is up — earliest attach marker (appears well before
+# the engine finishes building).
+_ATTACH_RE = re.compile(
+    r"Trying to create engine from model files"
+    r"|deserialize engine from file"
+    r"|NvDsInferContext"
+    r"|Pipeline running"
+    r"|nvstreammux",
+    re.IGNORECASE,
+)
+# Hard TensorRT / GPU-architecture failure (the DS 7.1 / Blackwell case).
+_HARD_FAIL_RE = re.compile(
+    r"Unsupported SM"
+    r"|buildSerializedNetwork:.*Error"
+    r"|failed to build (cuda|network) engine"
+    r"|Segmentation fault"
+    r"|core dump",
+    re.IGNORECASE,
+)
+
+
+def _parse_perf(line: str) -> float | None:
+    """Average fps from a deepstream-app ``**PERF:`` line, or ``None``."""
+    m = _PERF_RE.search(line)
+    if m is None:
+        return None
+    return float(m.group(2))
 
 
 class DeepStreamWorker(Runtime):
@@ -99,7 +156,29 @@ class DeepStreamWorker(Runtime):
     def request_stop(self) -> None:
         self._stop.set()
 
+    @property
+    def _mode(self) -> str:
+        """``inference_probe`` (M8.2C1-B) or ``decode_probe`` (M8.2B),
+        from the resolved package's ``supports``."""
+        if self._package.supports.get("inference_probe"):
+            return _INFERENCE_MODE
+        return _DECODE_MODE
+
     def _default_pm_factory(self) -> ProcessManager:
+        if self._mode == _INFERENCE_MODE:
+            return DeepStreamInferenceProcessManager(
+                rtsp_url=self._session.internal_rtsp_url,
+                image=self._settings.deepstream_image,
+                network=self._settings.deepstream_docker_network,
+                rtsp_transport=self._settings.deepstream_rtsp_transport,
+                probe_timeout_seconds=self._settings.deepstream_inference_timeout_seconds,
+                stop_timeout_seconds=self._settings.deepstream_process_stop_timeout_seconds,
+                model=self._settings.deepstream_inference_model,
+                output_base_dir=self._settings.deepstream_inference_output_dir,
+                keep_temp_files=self._settings.deepstream_keep_temp_files,
+                width=self._session.approved.width,
+                height=self._session.approved.height,
+            )
         return DeepStreamProcessManager(
             rtsp_url=self._session.internal_rtsp_url,
             image=self._settings.deepstream_image,
@@ -124,73 +203,19 @@ class DeepStreamWorker(Runtime):
             if not await self._post_gating("starting"):
                 return
             _log.info(
-                "deepstream worker session=%s package=%s url=%s",
+                "deepstream worker session=%s package=%s mode=%s url=%s",
                 self.session_id,
                 self._package.package_id,
+                self._mode,
                 redact_rtsp(self._session.internal_rtsp_url),
             )
             self._pm = self._pm_factory()
             await self._pm.start()
 
-            attached = False
-            last_proc_post = 0.0
-            last_fps: float | None = None
-            last_err: str | None = None
-
-            while not self._stop.is_set():
-                try:
-                    line = await asyncio.wait_for(
-                        self._pm.readline(), timeout=_READLINE_POLL_SECONDS
-                    )
-                except TimeoutError:
-                    continue
-                if line is None:
-                    break  # decode process ended
-                if "ERROR" in line:
-                    last_err = scrub_rtsp_in_text(line)[:480]
-                parsed = _parse_fps(line)
-                if parsed is None:
-                    continue
-                frames, dropped, fps = parsed
-                last_fps = fps
-                if not attached and frames > 0:
-                    attached = True
-                    self._state = WorkerState.ATTACHED
-                    if not await self._post_gating("attached", fps_processed=fps):
-                        break
-                    self._state = WorkerState.PROCESSING
-                if attached:
-                    now = time.monotonic()
-                    if now - last_proc_post >= self._settings.status_interval_seconds:
-                        last_proc_post = now
-                        await self._post(
-                            "processing",
-                            transient_ok=True,
-                            fps_processed=fps,
-                            last_frame_at=now_utc(),
-                            payload={
-                                "runtime": "deepstream",
-                                "frames": frames,
-                                "dropped": dropped,
-                                "decoder": "nvv4l2decoder",
-                            },
-                        )
-
-            await self._safe_stop_pm()
-            rc = self._pm.returncode if self._pm else None
-            graceful = self._stop.is_set() or rc in _CLEAN_EXIT_CODES
-            if graceful:
-                self._state = WorkerState.STOPPED
-                await self._post_best_effort("stopped", fps_processed=last_fps)
+            if self._mode == _INFERENCE_MODE:
+                await self._drive_inference()
             else:
-                self._state = WorkerState.FAILED
-                await self._post_best_effort(
-                    "failed",
-                    error_code="deepstream_exit",
-                    error_message=(
-                        f"decode process exited rc={rc}; last_error={last_err or 'n/a'}"
-                    ),
-                )
+                await self._drive_decode()
         except ApiSessionGoneError:
             self._state = WorkerState.FAILED
             _log.info("session %s gone; stopping quietly", self.session_id)
@@ -211,6 +236,193 @@ class DeepStreamWorker(Runtime):
             await self._safe_stop_pm()
             await self._post_best_effort(
                 "failed", error_code="worker_error", error_message=repr(exc)
+            )
+
+    # --- decode-probe driver (M8.2B, unchanged behaviour) ----------------
+
+    async def _drive_decode(self) -> None:
+        assert self._pm is not None
+        attached = False
+        last_proc_post = 0.0
+        last_fps: float | None = None
+        last_err: str | None = None
+
+        while not self._stop.is_set():
+            try:
+                line = await asyncio.wait_for(self._pm.readline(), timeout=_READLINE_POLL_SECONDS)
+            except TimeoutError:
+                continue
+            if line is None:
+                break  # decode process ended
+            if "ERROR" in line:
+                last_err = scrub_rtsp_in_text(line)[:480]
+            parsed = _parse_fps(line)
+            if parsed is None:
+                continue
+            frames, dropped, fps = parsed
+            last_fps = fps
+            if not attached and frames > 0:
+                attached = True
+                self._state = WorkerState.ATTACHED
+                if not await self._post_gating("attached", fps_processed=fps):
+                    break
+                self._state = WorkerState.PROCESSING
+            if attached:
+                now = time.monotonic()
+                if now - last_proc_post >= self._settings.status_interval_seconds:
+                    last_proc_post = now
+                    await self._post(
+                        "processing",
+                        transient_ok=True,
+                        fps_processed=fps,
+                        last_frame_at=now_utc(),
+                        payload={
+                            "runtime": "deepstream",
+                            "frames": frames,
+                            "dropped": dropped,
+                            "decoder": "nvv4l2decoder",
+                        },
+                    )
+
+        await self._safe_stop_pm()
+        rc = self._pm.returncode if self._pm else None
+        graceful = self._stop.is_set() or rc in _CLEAN_EXIT_CODES
+        if graceful:
+            self._state = WorkerState.STOPPED
+            await self._post_best_effort("stopped", fps_processed=last_fps)
+        else:
+            self._state = WorkerState.FAILED
+            await self._post_best_effort(
+                "failed",
+                error_code="deepstream_exit",
+                error_message=(f"decode process exited rc={rc}; last_error={last_err or 'n/a'}"),
+            )
+
+    # --- inference-probe driver (M8.2C1-B) -------------------------------
+
+    def _infer_payload(
+        self,
+        *,
+        engine_built: bool,
+        fps: float | None,
+        frames: int | None = None,
+        detections: int | None = None,
+    ) -> dict[str, Any]:
+        """Status payload for the inference probe. All fields are
+        status/debug evidence only — NOT metadata extraction."""
+        p: dict[str, Any] = {
+            "runtime": "deepstream",
+            "mode": _INFERENCE_MODE,
+            "inference_enabled": True,
+            "inference_engine_built": engine_built,
+            "model": self._settings.deepstream_inference_model,
+            "image": self._settings.deepstream_image,
+        }
+        if fps is not None:
+            p["fps_processed"] = fps
+        if frames is not None:
+            p["detection_frames_count"] = frames
+        if detections is not None:
+            p["detection_count"] = detections
+        return p
+
+    def _kitti_stats(self) -> tuple[int | None, int | None]:
+        """Best-effort KITTI (frame_count, detection_lines) from the process
+        manager, if it exposes them. Status evidence only."""
+        fn = getattr(self._pm, "kitti_stats", None)
+        if not callable(fn):
+            return (None, None)
+        try:
+            frames, dets = fn()
+            return (int(frames), int(dets))
+        except Exception:  # evidence is best-effort, never fatal
+            return (None, None)
+
+    async def _drive_inference(self) -> None:
+        assert self._pm is not None
+        attached = False
+        processing = False
+        engine_built = False
+        last_proc_post = 0.0
+        last_fps: float | None = None
+        last_err: str | None = None
+        hard_fail_code: str | None = None
+
+        while not self._stop.is_set():
+            try:
+                line = await asyncio.wait_for(self._pm.readline(), timeout=_READLINE_POLL_SECONDS)
+            except TimeoutError:
+                continue
+            if line is None:
+                break  # inference process ended
+            safe = scrub_rtsp_in_text(line)
+
+            if hard_fail_code is None and _HARD_FAIL_RE.search(line):
+                hard_fail_code = (
+                    "deepstream_unsupported_sm"
+                    if "unsupported sm" in line.lower()
+                    else "deepstream_trt_error"
+                )
+                last_err = safe[:480]
+                continue  # let the process die; we will post `failed`
+            if "ERROR" in line and last_err is None:
+                last_err = safe[:480]
+            if not engine_built and _ENGINE_OK_RE.search(line):
+                engine_built = True
+            if not attached and (_ATTACH_RE.search(line) or engine_built):
+                attached = True
+                self._state = WorkerState.ATTACHED
+                if not await self._post_gating("attached"):
+                    break
+
+            fps = _parse_perf(line)
+            if fps is not None:
+                last_fps = fps
+
+            evidence = engine_built or fps is not None
+            if attached and evidence and not processing:
+                processing = True
+                self._state = WorkerState.PROCESSING
+                last_proc_post = time.monotonic()
+                await self._post(
+                    "processing",
+                    transient_ok=True,
+                    fps_processed=last_fps,
+                    last_frame_at=now_utc(),
+                    payload=self._infer_payload(engine_built=engine_built, fps=last_fps),
+                )
+            elif processing:
+                now = time.monotonic()
+                if now - last_proc_post >= self._settings.status_interval_seconds:
+                    last_proc_post = now
+                    await self._post(
+                        "processing",
+                        transient_ok=True,
+                        fps_processed=last_fps,
+                        last_frame_at=now_utc(),
+                        payload=self._infer_payload(engine_built=engine_built, fps=last_fps),
+                    )
+
+        frames, dets = self._kitti_stats()
+        await self._safe_stop_pm()
+        rc = self._pm.returncode if self._pm else None
+        graceful = hard_fail_code is None and (self._stop.is_set() or rc in _CLEAN_EXIT_CODES)
+        payload = self._infer_payload(
+            engine_built=engine_built,
+            fps=last_fps,
+            frames=frames,
+            detections=dets,
+        )
+        if graceful:
+            self._state = WorkerState.STOPPED
+            await self._post_best_effort("stopped", fps_processed=last_fps, payload=payload)
+        else:
+            self._state = WorkerState.FAILED
+            await self._post_best_effort(
+                "failed",
+                error_code=hard_fail_code or "deepstream_exit",
+                error_message=(f"inference process rc={rc}; last_error={last_err or 'n/a'}"),
+                payload=payload,
             )
 
     # --- helpers ----------------------------------------------------------
@@ -271,6 +483,7 @@ class DeepStreamWorker(Runtime):
         fps_processed: float | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         for _ in range(_TERMINAL_STATUS_ATTEMPTS):
             try:
@@ -280,6 +493,7 @@ class DeepStreamWorker(Runtime):
                         fps_processed=fps_processed,
                         error_code=error_code,
                         error_message=error_message,
+                        payload=payload,
                     )
                 )
                 return
