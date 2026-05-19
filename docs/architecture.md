@@ -44,6 +44,14 @@ every worker, then awaits each best-effort final `stopped` under
 `final_status_timeout`, all under an overall `wait_for(overall_timeout)` with a
 hard `task.cancel()` escape hatch so a dead API cannot hang exit.
 
+These timeouts are **global** (shared by all runtimes). M8.2B live
+verification showed the original mock-tuned values (3s / 8s) were too tight
+for a Docker-backed worker, so the defaults are now DeepStream-safe —
+`final_status_timeout_seconds=15`, `overall_shutdown_timeout_seconds=25`,
+`deepstream_process_stop_timeout_seconds=5` — and remain safe for mock
+(it exits well inside them; they are upper bounds, not delays). All stay
+env-overridable.
+
 ## DeepStream decode-probe runtime (M8.2B)
 
 `runtimes/base.Runtime` is the seam. `runtimes/deepstream_runtime/`

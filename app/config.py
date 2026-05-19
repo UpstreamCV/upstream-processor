@@ -40,8 +40,13 @@ class Settings(BaseSettings):
     http_write_timeout_seconds: float = 10.0
     http_pool_timeout_seconds: float = 5.0
 
-    final_status_timeout_seconds: float = 3.0
-    overall_shutdown_timeout_seconds: float = 8.0
+    # DeepStream-safe shutdown budget (M8.2B cleanup). Docker-backed workers
+    # need time for `docker stop` + subprocess cleanup + the final `stopped`
+    # status post; the old mock-tuned 3s/8s were too tight in the live run.
+    # These are upper bounds — the fast mock runtime exits well within them,
+    # so the larger default is safe for mixed runtimes. Env-overridable.
+    final_status_timeout_seconds: float = 15.0
+    overall_shutdown_timeout_seconds: float = 25.0
 
     backoff_initial_seconds: float = 1.0
     backoff_factor: float = 2.0
@@ -59,7 +64,7 @@ class Settings(BaseSettings):
     deepstream_image: str = "nvcr.io/nvidia/deepstream:7.1-samples-multiarch"
     deepstream_rtsp_transport: str = "tcp"
     deepstream_probe_timeout_seconds: float = 30.0
-    deepstream_process_stop_timeout_seconds: float = 10.0
+    deepstream_process_stop_timeout_seconds: float = 5.0
     deepstream_docker_network: str = "host"
 
 

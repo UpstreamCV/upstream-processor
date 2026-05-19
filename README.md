@@ -87,8 +87,10 @@ make run                     # python -m app.main
 | `UPSTREAM_DEEPSTREAM_IMAGE` | no | `nvcr.io/nvidia/deepstream:7.1-samples-multiarch` | DeepStream Docker image |
 | `UPSTREAM_DEEPSTREAM_RTSP_TRANSPORT` | no | `tcp` | `rtspsrc protocols=` |
 | `UPSTREAM_DEEPSTREAM_PROBE_TIMEOUT_SECONDS` | no | `30` | Bounded decode-probe duration cap |
-| `UPSTREAM_DEEPSTREAM_PROCESS_STOP_TIMEOUT_SECONDS` | no | `10` | Grace before SIGKILL of the decode subprocess |
+| `UPSTREAM_DEEPSTREAM_PROCESS_STOP_TIMEOUT_SECONDS` | no | `5` | Grace before SIGKILL of the decode subprocess |
 | `UPSTREAM_DEEPSTREAM_DOCKER_NETWORK` | no | `host` | Docker network (host → container `127.0.0.1` = streaming host) |
+| `UPSTREAM_FINAL_STATUS_TIMEOUT_SECONDS` | no | `15` | Per-worker budget for graceful stop + final `stopped` post (DeepStream-safe; mock exits faster) |
+| `UPSTREAM_OVERALL_SHUTDOWN_TIMEOUT_SECONDS` | no | `25` | Overall supervisor shutdown cap before workers are force-cancelled |
 
 The secret is a `SecretStr` and is never logged (a redaction filter on the log
 handler scrubs it, the header, and JWT-shaped strings as defence-in-depth).

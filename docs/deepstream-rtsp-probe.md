@@ -88,3 +88,10 @@ supervisor-managed worker — `app/runtimes/deepstream_runtime/` +
 `UPSTREAM_FORCE_PACKAGE_ID=deepstream.decode_probe.v0` (see README /
 `docs/local-dev.md` M8.2B checklist). Still decode only — no inference,
 Triton, tracking, nvdsanalytics, or observations.
+
+**M8.2B cleanup:** live verification showed DeepStream needs a longer
+shutdown budget than mock. Defaults are now DeepStream-safe —
+`FINAL_STATUS_TIMEOUT_SECONDS=15`, `OVERALL_SHUTDOWN_TIMEOUT_SECONDS=25`,
+`DEEPSTREAM_PROCESS_STOP_TIMEOUT_SECONDS=5` — so future inference tests do
+not rely on ad hoc env overrides. No behavior change to inference /
+observations (not implemented). Env overrides still supported.

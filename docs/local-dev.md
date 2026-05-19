@@ -75,6 +75,17 @@ streaming host. The DeepStream image (~9 GB) is cached there from M8.2A.
 [ ] No secret or full RTSP URL appears in logs
 ```
 
+### M8.2B cleanup — shutdown defaults
+
+Live verification needed bigger shutdown timeouts than the mock defaults, so
+they are now first-class defaults (no env override needed for a clean
+DeepStream stop): `UPSTREAM_FINAL_STATUS_TIMEOUT_SECONDS=15`,
+`UPSTREAM_OVERALL_SHUTDOWN_TIMEOUT_SECONDS=25`,
+`UPSTREAM_DEEPSTREAM_PROCESS_STOP_TIMEOUT_SECONDS=5`. Still env-overridable;
+mock runtime exits well inside these (upper bounds, not delays). No
+inference/observation/API change — readiness cleanup before the M8.2C1
+inference smoke test.
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

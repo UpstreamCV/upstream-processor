@@ -4,6 +4,36 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P1/M8.2B cleanup: DeepStream shutdown defaults
+
+### Summary
+M8.2B live verification needed env overrides for clean DeepStream shutdown
+(the M8.1/mock defaults were too tight for a Docker-backed worker). Made the
+deployment-safe values first-class so future inference tests don't rely on
+ad hoc overrides.
+
+### What changed
+- `app/config.py`: `final_status_timeout_seconds` 3.0→**15.0**;
+  `overall_shutdown_timeout_seconds` 8.0→**25.0**;
+  `deepstream_process_stop_timeout_seconds` 10.0→**5.0**.
+  These are global/shared; documented as DeepStream-safe and still fine for
+  mock (upper bounds, not delays). Env overrides unchanged.
+- `.env.example`: added the three vars with a "shutdown budget" comment.
+- README / architecture / local-dev / deepstream-rtsp-probe: noted the new
+  defaults.
+- `tests/test_config.py`: assert the new defaults + env-override still works.
+
+### Not changed
+No inference, no observations, no API-contract change, no runtime
+architecture change. Mock + DeepStream tests use `fast_settings` overrides
+and are unaffected. Deployment/readiness cleanup before M8.2C1 inference
+smoke test.
+
+### Testing/checks
+`uv run pytest -q`, `ruff check`, `ruff format --check`, `mypy app` — all green.
+
+---
+
 ## 2026-05-19 - P1/M8.2B: Minimal DeepStream Runtime Worker
 
 ### Summary

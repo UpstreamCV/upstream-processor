@@ -33,3 +33,22 @@ def test_secret_is_not_revealed_by_repr_or_str() -> None:
 
 def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
+
+
+def test_deepstream_safe_shutdown_defaults() -> None:
+    # M8.2B cleanup: DeepStream-safe defaults (env unset in conftest).
+    s = get_settings()
+    assert s.final_status_timeout_seconds == 15.0
+    assert s.overall_shutdown_timeout_seconds == 25.0
+    assert s.deepstream_process_stop_timeout_seconds == 5.0
+
+
+def test_shutdown_timeouts_are_env_overridable(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("UPSTREAM_FINAL_STATUS_TIMEOUT_SECONDS", "7")
+    monkeypatch.setenv("UPSTREAM_OVERALL_SHUTDOWN_TIMEOUT_SECONDS", "11")
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_PROCESS_STOP_TIMEOUT_SECONDS", "2")
+    get_settings.cache_clear()
+    s = Settings()  # type: ignore[call-arg]
+    assert s.final_status_timeout_seconds == 7.0
+    assert s.overall_shutdown_timeout_seconds == 11.0
+    assert s.deepstream_process_stop_timeout_seconds == 2.0
