@@ -15,19 +15,26 @@
 # mktemp dir under /tmp and shredded on exit; all printed output is redacted.
 # The container is --rm; nothing persistent is modified.
 #
-# NOTE: the DeepStream image is large (~20 GB). If it is not cached locally
-# you must opt in to a pull with CONFIRM_PULL=1.
+# Blackwell note: DeepStream 7.1 (TensorRT 10.3) FAILS to build a TensorRT
+# engine on RTX 5070 Ti / Blackwell sm_120 ("Unsupported SM: 0xc00", core
+# dump). DeepStream 8.0 (TensorRT 10.9 / CUDA 12.8) builds and runs nvinfer
+# successfully on the same GPU — so the default below is 8.0. Override
+# DEEPSTREAM_IMAGE to test any other tag. See docs/deepstream-inference-smoke.md.
+#
+# NOTE: the DeepStream image is large (DS 8.0 ~33 GB). If it is not cached
+# locally you must opt in to a pull with CONFIRM_PULL=1.
 #
 # Usage:
 #   scripts/probe_deepstream_inference.sh "rtsp://127.0.0.1:18554/sess_xxxx"
 #   or:  RTSP_URL="rtsp://..." scripts/probe_deepstream_inference.sh
 # Env:
-#   DEEPSTREAM_IMAGE  (default below — override to test a Blackwell-capable tag)
+#   DEEPSTREAM_IMAGE  (default below — override to test another tag)
 #   PROBE_SECONDS     (default 120 — must cover TensorRT engine build + run)
 #   CONFIRM_PULL=1    (allow pulling the multi-GB image if not cached)
 #
 # Exit codes:
-#   0  inference actually ran (engine built + frames/PERF + detections)
+#   0  inference ran (engine built/loaded + frames/PERF; detections, or
+#      detections inconclusive — see [INCONCLUSIVE-DET] in output)
 #   1  inference failed (TensorRT/CUDA/SM block, RTSP error, no frames, ...)
 #   2  bad usage
 #   3  image not cached and CONFIRM_PULL!=1
@@ -35,7 +42,7 @@
 set -uo pipefail
 
 URL="${1:-${RTSP_URL:-}}"
-DEEPSTREAM_IMAGE="${DEEPSTREAM_IMAGE:-nvcr.io/nvidia/deepstream:7.1-samples-multiarch}"
+DEEPSTREAM_IMAGE="${DEEPSTREAM_IMAGE:-nvcr.io/nvidia/deepstream:8.0-samples-multiarch}"
 PROBE_SECONDS="${PROBE_SECONDS:-120}"
 
 redact() { sed -E 's#(rtsp://[^/ ]*/)[A-Za-z0-9_.:-]+#\1sess_<redacted>#g'; }
@@ -155,32 +162,50 @@ KITTI_FRAMES="$(find "$WORK/kitti" -type f -name '*.txt' 2>/dev/null | wc -l | t
 DETECTIONS="$(cat "$WORK"/kitti/*.txt 2>/dev/null | wc -l | tr -d ' ')"
 
 echo "-- key log lines (redacted) --"
-grep -aiE 'unsupported sm|internal error|\[trt\]|cuda error|deserialize|engine.*(built|fail)|serialized|PERF|playing|ERROR|could not|core' \
+grep -aiE 'unsupported sm|internal error|\[trt\]|cuda error|serialize cuda engine|engine.*(built|fail)|serialized|PERF|playing|ERROR|could not|core|App run successful' \
   "$WORK/run.log" 2>/dev/null | redact | tail -25 | sed 's/^/  /'
 echo "  docker_exit=$DEXIT  kitti_frames=$KITTI_FRAMES  detection_lines=$DETECTIONS"
 
 # --- classify -------------------------------------------------------------
-if grep -aqiE 'Unsupported SM|Unsupported SM:' "$WORK/run.log"; then
-  echo "FAIL TensorRT cannot build an engine for this GPU's SM architecture"
-  echo "     (Blackwell sm_120 / compute 12.0 needs a newer DeepStream image"
-  echo "      whose bundled TensorRT >= 10.7 and CUDA >= 12.8 — see"
-  echo "      docs/deepstream-inference-smoke.md)."
+# NOTE: "deserialize ... failed, try rebuild" is the NORMAL cold-start path
+# (no prebuilt engine -> nvinfer deserialize-misses then builds fresh); it is
+# NOT a failure. nvinfer may also persist the built engine next to the ONNX
+# (DS 8.0) rather than at our model-engine-file path, so engine-file presence
+# is NOT a reliable success signal. Real signals only:
+
+# Hard GPU/TensorRT architecture block (the DS 7.1 / Blackwell sm_120 case).
+if grep -aqiE 'Unsupported SM|buildSerializedNetwork:.*Error|failed to build (cuda|network) engine|core dump' "$WORK/run.log"; then
+  echo "FAIL TensorRT cannot build an engine for this GPU (e.g. 'Unsupported"
+  echo "     SM: 0xc00' = Blackwell sm_120). Use a DeepStream image whose"
+  echo "     TensorRT supports this GPU (DS 8.0 = TRT 10.9 works on sm_120;"
+  echo "     DS 7.1 = TRT 10.3 does not). See docs/deepstream-inference-smoke.md."
   exit 1
 fi
-if grep -aqiE 'failed to build network|buildSerializedNetwork.*Error|deserialize backend context.*failed.*try rebuild' "$WORK/run.log" \
-   && [ ! -s "$WORK/trafficcamnet_b1_gpu0_int8.engine" ]; then
-  echo "FAIL TensorRT engine build failed (see log above)"
+
+# Engine built or loaded? (build-and-serialize, or a successful deserialize)
+ENGINE_OK=0
+if grep -aqiE 'serialize cuda engine to file:.*successfully|Engine serialized|deserialized trt engine|Use deserialized engine model|Loaded engine' \
+     "$WORK/run.log"; then
+  ENGINE_OK=1
+fi
+[ -s "$WORK/trafficcamnet_b1_gpu0_int8.engine" ] && ENGINE_OK=1
+
+if [ "$ENGINE_OK" -ne 1 ]; then
+  echo "FAIL nvinfer did not build or load a TensorRT engine (see log above)."
   exit 1
 fi
+
 if [ "$KITTI_FRAMES" -gt 0 ] && [ "$DETECTIONS" -gt 0 ]; then
-  echo "OK   nvinfer ran on the live RTSP stream — TensorRT engine built and"
-  echo "     produced detections ($DETECTIONS objects across $KITTI_FRAMES frames)"
+  echo "OK   nvinfer ran on the live RTSP stream — TensorRT engine built/loaded"
+  echo "     and produced detections ($DETECTIONS objects across $KITTI_FRAMES frames)"
   exit 0
 fi
-if grep -aqiE 'PERF:.*fps' "$WORK/run.log" && [ -s "$WORK/trafficcamnet_b1_gpu0_int8.engine" ]; then
-  echo "OK   engine built and pipeline ran with PERF/FPS (no objects in view)"
+if grep -aqiE 'PERF: +[1-9][0-9]*\.[0-9]+|App run successful' "$WORK/run.log"; then
+  echo "OK   engine built/loaded and the pipeline ran (PERF/FPS) but produced"
+  echo "     0 detections — inference PATH works; the scene/model may not match."
+  echo "     Re-run against a scene with detectable objects. [INCONCLUSIVE-DET]"
   exit 0
 fi
-echo "FAIL inference did not run (no engine + frames + detections). Likely an"
-echo "     RTSP/source error or an engine/model problem — see log above."
+echo "FAIL inference did not run (engine built but no frames/PERF). Likely an"
+echo "     RTSP/source error — see log above."
 exit 1

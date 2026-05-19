@@ -96,10 +96,12 @@ shutdown budget than mock. Defaults are now DeepStream-safe —
 not rely on ad hoc env overrides. No behavior change to inference /
 observations (not implemented). Env overrides still supported.
 
-**M8.2C1-A inference smoke (2026-05-19):** the Blackwell concern above is now
-**confirmed real for inference**. nvinfer ran but TensorRT 10.3 in
-`deepstream:7.1-samples-multiarch` cannot build an engine on the RTX 5070 Ti
-(`Unsupported SM: 0xc00` = sm_120, then core dump). Decode still works
-(NVDEC bypasses TensorRT). Inference needs a newer DeepStream image
-(TensorRT ≥ 10.7, CUDA ≥ 12.8). Full write-up + reusable probe:
-`docs/deepstream-inference-smoke.md` / `scripts/probe_deepstream_inference.sh`.
+**M8.2C1-A inference smoke (2026-05-19):** the Blackwell concern above was
+**confirmed real on DeepStream 7.1** (TensorRT 10.3 → `Unsupported SM: 0xc00`
+= sm_120, core dump) but is **resolved on DeepStream 8.0**
+(`deepstream:8.0-samples-multiarch`, TensorRT 10.9 / CUDA 12.8): nvinfer
+builds the engine on the RTX 5070 Ti and runs TrafficCamNet on the live RTSP
+stream (~30 fps, detections via KITTI). **M8.2C1-A passed; next M8.2C1-B.**
+The inference probe's default image is now 8.0. Full write-up + reusable
+probe: `docs/deepstream-inference-smoke.md` /
+`scripts/probe_deepstream_inference.sh`.
