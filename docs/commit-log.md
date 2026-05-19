@@ -4,6 +4,53 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P1/M8.2C1-A: DeepStream 8.0 inference smoke PASSED on Blackwell
+
+### Summary
+Retried the M8.2C1-A inference probe on `deepstream:8.0-samples-multiarch`
+(DeepStream 8.0.0, **TensorRT 10.9.0.34**, **CUDA 12.8.1**). The Blackwell
+sm_120 block is **gone**: nvinfer built a TensorRT engine on the RTX 5070 Ti
+(`serialize cuda engine to file: ...successfully`, ~30 s cold), ran at ~30
+fps on the live RTSP stream, and TrafficCamNet produced **1571 detections
+across 1728 KITTI frames** (class `person`). Clean SIGINT/timeout exit
+(`App run successful`), no `Unsupported SM`, no core dump. **M8.2C1-A is
+passed; next is M8.2C1-B.** Decode worker (M8.2B) unaffected. Still manual
+probe only — no worker change, pyds, metadata, or observations.
+
+### What changed
+- `scripts/probe_deepstream_inference.sh` — default image bumped 7.1 → **8.0**
+  (7.1 proven non-functional for inference on Blackwell); DEEPSTREAM_IMAGE
+  still overridable. **Classifier fixed**: the cold-start
+  `deserialize ... failed, try rebuild` line is the normal no-prebuilt-engine
+  path and is no longer treated as failure; engine-build success is detected
+  via `serialize cuda engine to file: ...successfully` (nvinfer persists the
+  engine next to the ONNX, not at our model-engine-file path, so file
+  presence is not a reliable signal); added an `[INCONCLUSIVE-DET]` exit-0
+  branch for engine-built-but-zero-detections (scene/model mismatch).
+- `docs/deepstream-inference-smoke.md` — verdict now PASS on 8.0; 7.1 kept as
+  root-cause history; combined 7.1/8.0 evidence table; outcome → M8.2C1-B.
+- `docs/commit-log.md`, `docs/deepstream-rtsp-probe.md` — updated.
+
+### Not changed
+No inference runtime worker, pyds, NvDsBatchMeta, metadata adapter,
+observations, Triton, tracking, dashboard. App behaviour untouched. Probe is
+read-only w.r.t. UpStream; processor secret sourced server-side (SSM/API
+host), never printed/committed; no raw stream key committed.
+
+### Testing/checks
+`bash -n scripts/*.sh` clean; `uv run pytest -q` 53/53; ruff/format/mypy
+unaffected (no Python changed). Live on crowdcountS2: SSM eligible-sessions
+HTTP 200 COUNT=1; `ffprobe` exit 0; DS 8.0 manual run + fixed script run both
+built the engine and produced detections; no leftover containers; temp dirs
+removed/shredded.
+
+### Follow-up TODOs
+- M8.2C1-B: supervisor-managed inference worker, DeepStream image pinned to
+  8.0 (TRT ≥ 10.7 / CUDA ≥ 12.8). Metadata/observations remain later
+  milestones.
+
+---
+
 ## 2026-05-19 - P1/M8.2C1-A: DeepStream nvinfer inference smoke probe (blocked: Blackwell)
 
 ### Summary
