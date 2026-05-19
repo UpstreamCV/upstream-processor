@@ -1,0 +1,15 @@
+{
+  "packages": [
+    {
+      "package_id": "mock.detect.v0",
+      "display_name": "Mock Detection v0",
+      "runtime": "mock",
+      "description": "Fake processor package used to prove UpStream processor handoff.",
+      "outputs": [
+        "processor.mock_frame_seen",
+        "processor.mock_heartbeat",
+        "processor.mock_detection"
+      ]
+    }
+  ]
+}
