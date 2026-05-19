@@ -4,6 +4,46 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P1/M8.2C1-A: DeepStream nvinfer inference smoke probe (blocked: Blackwell)
+
+### Summary
+Manual-only probe to answer "can a DeepStream container run nvinfer on the
+live RTSP stream on the RTX 5070 Ti?" Answer on `deepstream:7.1-samples-multiarch`:
+**no.** nvinfer initialized but TensorRT 10.3 cannot build an engine for
+Blackwell — `IBuilder::buildSerializedNetwork: Error Code 1: Internal Error
+(Unsupported SM: 0xc00)` (compute 12.0 = sm_120), then core dump. Decode
+(M8.2A/B) works on the same image because NVDEC bypasses TensorRT. Active
+validated stream confirmed (h264 1280x720@30, `validation.passed=true`);
+`ffprobe` clean. No runtime/worker change, no observations.
+
+### What changed
+- `docs/deepstream-inference-smoke.md` — new. Verdict, evidence table,
+  TensorRT-vs-Blackwell explanation, recommended next image (DeepStream 8.x /
+  TensorRT ≥ 10.7 / CUDA ≥ 12.8), how-to.
+- `scripts/probe_deepstream_inference.sh` — new. RTSP→nvstreammux→nvinfer
+  (bundled TrafficCamNet INT8)→fakesink via `deepstream-app`, no display;
+  forces a fresh engine build (the SM-arch test); KITTI dump = detection
+  evidence (no pyds). Temp config in a shredded `mktemp` dir, RTSP redacted,
+  `CONFIRM_PULL=1` gate, exits non-zero on the SM block / any inference fail.
+
+### Not changed
+No inference runtime worker, pyds, NvDsBatchMeta, metadata adapter,
+observations, Triton, tracking. App behaviour untouched. Probe is read-only
+w.r.t. UpStream; processor secret sourced server-side (SSM/API host), never
+printed/committed; no raw stream key committed.
+
+### Testing/checks
+`bash -n scripts/*.sh` clean; `uv run pytest -q` 53/53; ruff/mypy unaffected
+(no Python changed). Live: SSM eligible-sessions HTTP 200 COUNT=1; crowdcountS2
+`ffprobe` exit 0; deepstream-app reproduced `Unsupported SM: 0xc00`.
+
+### Follow-up TODOs
+- Re-run `scripts/probe_deepstream_inference.sh` with
+  `DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream:8.x-samples-multiarch` against
+  an active stream. Only if it passes → M8.2C1-B inference worker.
+
+---
+
 ## 2026-05-19 - P1/M8.2B cleanup: DeepStream shutdown defaults
 
 ### Summary
