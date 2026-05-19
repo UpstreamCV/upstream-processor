@@ -52,3 +52,35 @@ def test_shutdown_timeouts_are_env_overridable(monkeypatch) -> None:  # type: ig
     assert s.final_status_timeout_seconds == 7.0
     assert s.overall_shutdown_timeout_seconds == 11.0
     assert s.deepstream_process_stop_timeout_seconds == 2.0
+
+
+def test_deepstream_image_defaults_to_8_0() -> None:
+    # M8.2C1-B: 8.0 is the single default (7.1 fails inference on Blackwell).
+    s = get_settings()
+    assert s.deepstream_image == "nvcr.io/nvidia/deepstream:8.0-samples-multiarch"
+
+
+def test_deepstream_image_is_env_overridable(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv(
+        "UPSTREAM_DEEPSTREAM_IMAGE", "nvcr.io/nvidia/deepstream:7.1-samples-multiarch"
+    )
+    get_settings.cache_clear()
+    s = Settings()  # type: ignore[call-arg]
+    assert s.deepstream_image == "nvcr.io/nvidia/deepstream:7.1-samples-multiarch"
+
+
+def test_deepstream_inference_defaults() -> None:
+    s = get_settings()
+    assert s.deepstream_inference_timeout_seconds == 60.0
+    assert s.deepstream_inference_output_dir == ""
+    assert s.deepstream_inference_model == "trafficcamnet"
+    assert s.deepstream_keep_temp_files is False
+
+
+def test_deepstream_inference_env_overridable(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_INFERENCE_TIMEOUT_SECONDS", "90")
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_KEEP_TEMP_FILES", "true")
+    get_settings.cache_clear()
+    s = Settings()  # type: ignore[call-arg]
+    assert s.deepstream_inference_timeout_seconds == 90.0
+    assert s.deepstream_keep_temp_files is True

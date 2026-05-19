@@ -4,6 +4,67 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P1/M8.2C1-B: supervisor-managed DeepStream inference worker
+
+### Summary
+The M8.2C1-A-proven DeepStream 8.0 nvinfer pipeline now runs under the
+existing WorkerManager as the `deepstream.inference_probe.v0` package. New
+`DeepStreamInferenceProcessManager` owns a per-run temp work dir
+(deepstream-app + PGIE config + KITTI dir, bind-mounted into the DS8
+container) and runs the bounded `deepstream-app` RTSP→nvstreammux→nvinfer
+(TrafficCamNet INT8)→fakesink pipeline. `DeepStreamWorker` gained a
+mode (from the package's `supports`): `decode_probe` (M8.2B, unchanged) or
+`inference_probe`. Status `starting→attached→processing→stopped`, or
+`failed` with a redacted message + `deepstream_unsupported_sm`/
+`deepstream_trt_error`/`deepstream_exit` code. Detection evidence
+(KITTI frame/detection counts + engine-built/PERF log markers) is
+status/log-only — **no observations, no pyds, no metadata extraction**.
+Default DeepStream image bumped 7.1 → 8.0 (7.1 fails inference on Blackwell).
+Implementation complete + unit-tested; **live verification pending**.
+
+### Files touched
+- `app/runtimes/deepstream_runtime/inference.py` (new) — pure builders
+  (`build_pgie_config`, `build_app_config`, `build_inference_docker_command`)
+  + `DeepStreamInferenceProcessManager` (temp dir, `kitti_stats()`, cleanup
+  unless `keep_temp_files`, redacted logging).
+- `app/runtimes/deepstream_runtime/worker.py` — `_mode`, mode-aware
+  `_default_pm_factory`, `run()` dispatch, `_drive_decode()` (verbatim move,
+  unchanged behaviour) + `_drive_inference()`, `_infer_payload`,
+  `_kitti_stats`; `_post_best_effort` gained `payload`.
+- `app/packages/package_registry.json` — `deepstream.inference_probe.v0`
+  (`supports.inference_probe`); mock + decode entries unchanged.
+- `app/config.py` — `deepstream_image` default → 8.0; new
+  `deepstream_inference_timeout_seconds` (60),
+  `deepstream_inference_output_dir` (""), `deepstream_inference_model`
+  ("trafficcamnet"), `deepstream_keep_temp_files` (False).
+- `tests/test_deepstream_inference.py` (new, 14 tests) +
+  `tests/test_config.py` / `tests/test_package_resolver.py` additions.
+- README / .env.example / docs/architecture / docs/local-dev (M8.2C1-B live
+  checklist) / docs/deepstream-inference-smoke / docs/deepstream-rtsp-probe /
+  `app/runtimes/deepstream_runtime/README.md`.
+
+### Not changed
+No API contract change. No pyds, pad probes, MetadataSource, metadata
+adapter, observations, tracking, nvtracker, nvdsanalytics, line crossing,
+zones, Triton, dashboard, package catalog, billing. Mock runtime and M8.2B
+decode behaviour unchanged (decode loop moved verbatim into `_drive_decode`).
+upstream-agent / api-server / streaming-server / dashboard untouched.
+
+### Testing/checks
+`uv run pytest -q` **70 passed** (53 prior + 17 new); `ruff check`,
+`ruff format --check`, `mypy app`, `bash -n scripts/*.sh` all clean. No
+Docker/GPU in the suite (scripted `ProcessManager` double feeds the exact
+M8.2C1-A log lines; real PM temp-dir cleanup tested with a monkeypatched
+subprocess).
+
+### Follow-up TODOs
+- Live verification on crowdcountS2 with an active stream
+  (`UPSTREAM_FORCE_PACKAGE_ID=deepstream.inference_probe.v0`,
+  `UPSTREAM_DEEPSTREAM_IMAGE=...8.0-samples-multiarch`).
+- Later milestones: pyds / NvDsBatchMeta / metadata adapter / observations.
+
+---
+
 ## 2026-05-19 - P1/M8.2C1-A: DeepStream 8.0 inference smoke PASSED on Blackwell
 
 ### Summary

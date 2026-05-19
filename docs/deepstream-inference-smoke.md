@@ -91,12 +91,26 @@ image while inference does not.
 
 M8.2C1-A is **passed on DeepStream 8.0**: nvinfer builds a TensorRT engine
 on Blackwell sm_120, frames flow at ~30 fps, and TrafficCamNet produces
-detections on the live RTSP stream. **Next: M8.2C1-B** — bring this proven
-manual pipeline under the supervisor as an inference worker (still no pyds /
-NvDsBatchMeta / metadata adapter / observations; those are later milestones).
-The DeepStream image pin for that work must be **8.0** (or newer with
-TensorRT ≥ 10.7 / CUDA ≥ 12.8) — **7.1 is not usable for inference on
-Blackwell**. The M8.2B decode-only worker is unaffected.
+detections on the live RTSP stream. The DeepStream image pin for inference
+must be **8.0** (or newer with TensorRT ≥ 10.7 / CUDA ≥ 12.8) — **7.1 is not
+usable for inference on Blackwell**. The M8.2B decode-only worker is
+unaffected.
+
+**M8.2C1-B (implemented):** this proven manual pipeline now runs under the
+supervisor as the `deepstream.inference_probe.v0` package
+(`DeepStreamWorker` inference mode + `DeepStreamInferenceProcessManager`,
+default image DeepStream 8.0). The bounded `deepstream-app` config, PGIE
+config and KITTI dir are generated into a per-run temp dir (raw RTSP URL
+only there + in argv, never logged/committed, removed on stop). Status:
+`starting → attached → processing → stopped` (or `failed` with a redacted
+message + `deepstream_unsupported_sm`/`deepstream_trt_error` code on a
+TensorRT/SM failure); payload carries `inference_enabled`,
+`inference_engine_built`, `model`, `image`, `fps_processed`, and KITTI
+`detection_frames_count`/`detection_count`. Still **no observations, no pyds,
+no NvDsBatchMeta, no metadata adapter** — KITTI is status/debug evidence
+only, not metadata extraction. Implementation complete + unit-tested;
+**live verification pending until explicitly run** (see the M8.2C1-B
+checklist in `docs/local-dev.md`).
 
 ## How to run
 

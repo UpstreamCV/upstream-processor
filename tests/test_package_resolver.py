@@ -21,6 +21,15 @@ def test_resolves_deepstream_decode_probe_package() -> None:
     assert spec.supports.get("decode_only") is True
 
 
+def test_resolves_deepstream_inference_probe_package() -> None:
+    spec = resolve("deepstream.inference_probe.v0")
+    assert spec.package_id == "deepstream.inference_probe.v0"
+    assert spec.runtime == "deepstream"
+    assert spec.outputs == ()  # inference only — no observations
+    assert spec.supports.get("inference_probe") is True
+    assert spec.supports.get("decode_only") is None  # distinct from decode probe
+
+
 def test_rejects_unknown_package() -> None:
     with pytest.raises(PackageResolutionError, match="unknown package_id"):
         resolve("does.not.exist")
