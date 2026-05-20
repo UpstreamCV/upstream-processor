@@ -227,6 +227,11 @@ class DeepStreamWorker(Runtime):
         self._pm: ProcessManager | None = None
         self._stop = asyncio.Event()
         self._state = WorkerState.INIT
+        # Set only while ``_drive_metadata_probe`` is running, so
+        # ``request_stop`` can close the bridge queue directly and wake a
+        # consumer parked in ``asyncio.to_thread(queue.Queue.get)`` without
+        # waiting for the reader's next poll iteration.
+        self._metadata_queue: BoundedBridgeQueue | None = None
         self._backoff = Backoff(
             initial=settings.backoff_initial_seconds,
             factor=settings.backoff_factor,
@@ -245,7 +250,16 @@ class DeepStreamWorker(Runtime):
         return self._state
 
     def request_stop(self) -> None:
+        """Idempotent: sets the stop event AND closes the active metadata
+        bridge queue if one exists. Closing the queue wakes any consumer
+        parked in ``asyncio.to_thread(queue.Queue.get)`` immediately
+        (otherwise the consumer would only wake when the reader's next
+        poll iteration sees ``self._stop`` and closes the queue in its
+        ``finally``)."""
         self._stop.set()
+        queue = self._metadata_queue
+        if queue is not None:
+            queue.close()
 
     @property
     def _mode(self) -> str:
@@ -573,6 +587,45 @@ class DeepStreamWorker(Runtime):
             p["app_summary"] = last_app_summary
         return p
 
+    async def _finalize_metadata_probe(
+        self,
+        *,
+        queue: BoundedBridgeQueue,
+        counters: _MetadataCounters,
+        reader_state: _MetadataReaderState,
+    ) -> None:
+        """Terminal cleanup for the metadata probe. Called from a shielded
+        ``finally`` so it runs to completion even if the worker task is
+        being cancelled (e.g., supervisor force-stop after the per-worker
+        budget). Idempotent: closes the queue, stops the PM, posts the
+        terminal status. ``DeepStreamMetadataProcessManager.stop()`` is
+        itself idempotent so a second call (from the outer ``run()``'s
+        ``except`` handlers) is a no-op."""
+        queue.close()
+        await self._safe_stop_pm()
+        rc = self._pm.returncode if self._pm else None
+        payload = self._metadata_payload(
+            counters=counters,
+            queue_stats=_queue_stats_dict(queue),
+            last_app_summary=reader_state.last_summary,
+        )
+        graceful = reader_state.hard_fail_code is None and (
+            self._stop.is_set() or rc in _CLEAN_EXIT_CODES
+        )
+        if graceful:
+            self._state = WorkerState.STOPPED
+            await self._post_best_effort("stopped", payload=payload)
+        else:
+            self._state = WorkerState.FAILED
+            await self._post_best_effort(
+                "failed",
+                error_code=reader_state.hard_fail_code or "deepstream_exit",
+                error_message=(
+                    f"metadata process rc={rc}; last_error={reader_state.last_err or 'n/a'}"
+                ),
+                payload=payload,
+            )
+
     async def _drive_metadata_probe(self) -> None:
         assert self._pm is not None
 
@@ -585,6 +638,10 @@ class DeepStreamWorker(Runtime):
             maxsize=int(self._settings.deepstream_metadata_queue_maxsize),
             drop_policy=policy,
         )
+        # Expose the queue to ``request_stop`` so a SIGINT-driven stop wakes
+        # the consumer immediately (instead of waiting for the reader's next
+        # poll iteration to close the queue from its own ``finally``).
+        self._metadata_queue = queue
         source = BridgeQueueMetadataSource(queue)
         counters = _MetadataCounters()
         reader_state = _MetadataReaderState()
@@ -673,36 +730,27 @@ class DeepStreamWorker(Runtime):
                         ),
                     )
 
-        # Run reader + consumer concurrently.
-        results = await asyncio.gather(_reader(), _consumer(), return_exceptions=True)
-        for r in results:
-            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
-                # Surface unexpected failure but keep cleanup going.
-                _log.exception("metadata-probe task crashed", exc_info=r)
-
-        await self._safe_stop_pm()
-        rc = self._pm.returncode if self._pm else None
-        payload = self._metadata_payload(
-            counters=counters,
-            queue_stats=_queue_stats_dict(queue),
-            last_app_summary=reader_state.last_summary,
-        )
-        graceful = reader_state.hard_fail_code is None and (
-            self._stop.is_set() or rc in _CLEAN_EXIT_CODES
-        )
-        if graceful:
-            self._state = WorkerState.STOPPED
-            await self._post_best_effort("stopped", payload=payload)
-        else:
-            self._state = WorkerState.FAILED
-            await self._post_best_effort(
-                "failed",
-                error_code=reader_state.hard_fail_code or "deepstream_exit",
-                error_message=(
-                    f"metadata process rc={rc}; last_error={reader_state.last_err or 'n/a'}"
-                ),
-                payload=payload,
-            )
+        # Run reader + consumer concurrently. Cleanup is in a shielded
+        # ``finally`` so docker stop + workdir cleanup + the terminal
+        # status post happen even if the worker task is cancelled (e.g.,
+        # supervisor force-stop after the per-worker budget expires).
+        try:
+            results = await asyncio.gather(_reader(), _consumer(), return_exceptions=True)
+            for r in results:
+                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                    # Surface unexpected failure but keep cleanup going.
+                    _log.exception("metadata-probe task crashed", exc_info=r)
+        finally:
+            try:
+                await asyncio.shield(
+                    self._finalize_metadata_probe(
+                        queue=queue,
+                        counters=counters,
+                        reader_state=reader_state,
+                    )
+                )
+            finally:
+                self._metadata_queue = None
 
     # --- helpers ----------------------------------------------------------
 

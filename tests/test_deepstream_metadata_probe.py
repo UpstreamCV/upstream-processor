@@ -465,3 +465,230 @@ def test_metadata_pm_unknown_model_raises(tmp_path) -> None:  # type: ignore[no-
     )
     with pytest.raises(ValueError, match="unknown deepstream inference model"):
         pm._prepare_work_dir()
+
+
+# --- P2 cleanup: shutdown hardening -------------------------------------
+
+
+class _SlowReadlinePM(FakeMetadataPM):
+    """A PM whose ``readline`` parks forever until ``stop`` is called.
+
+    Lets us prove that ``request_stop`` wakes the consumer immediately
+    (by closing the queue from the worker side) rather than waiting for
+    the reader's next poll iteration. Also tracks ``stop_call_count`` for
+    idempotency."""
+
+    def __init__(
+        self,
+        seed_lines: list[str] | None = None,
+        *,
+        exit_code: int = 124,
+    ) -> None:
+        super().__init__(seed_lines or [], exit_code=exit_code)
+        self.stop_call_count = 0
+        self.queue_closed_at_stop: bool | None = None
+        # When the test wants to inspect queue state when stop() is called,
+        # it sets ``observe_worker`` to the worker instance.
+        self.observe_worker: object | None = None
+        self._stop_event = asyncio.Event()
+
+    async def readline(self) -> str | None:
+        await asyncio.sleep(0)
+        if self._lines:
+            return self._lines.pop(0)
+        if self.stopped:
+            return None
+        # Park until stop() signals via the event (no busy-loop).
+        await self._stop_event.wait()
+        self._rc = self.exit_code
+        return None
+
+    async def stop(self) -> None:
+        self.stop_call_count += 1
+        self._stop_event.set()
+        # Snapshot: was the worker's metadata bridge queue already closed
+        # by the time PM.stop was invoked?  (request_stop should have
+        # closed it BEFORE the worker reached _safe_stop_pm.)
+        worker = self.observe_worker
+        if worker is not None and self.queue_closed_at_stop is None:
+            q = getattr(worker, "_metadata_queue", None)
+            if q is not None:
+                self.queue_closed_at_stop = q.stats().closed
+        self.stopped = True
+        if self._rc is None:
+            self._rc = self.exit_code
+
+
+async def test_request_stop_closes_queue_synchronously(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """``request_stop`` must close the metadata queue immediately (no
+    await), so a consumer parked in ``asyncio.to_thread(queue.Queue.get)``
+    wakes within milliseconds — not after the reader's next poll."""
+    api = FakeApi()
+    pm = _SlowReadlinePM(seed_lines=[_frame_line(frame_num=0, objects=[_person_object()])])
+    w = _worker(api, fast_settings, pm)
+    pm.observe_worker = w
+    task = asyncio.create_task(w.run())
+
+    # Wait until _drive_metadata_probe has built the queue and started
+    # gather(). The queue attribute is set synchronously inside the
+    # driver before reader/consumer kick off.
+    for _ in range(200):
+        if w._metadata_queue is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert w._metadata_queue is not None
+    queue = w._metadata_queue
+    assert queue.stats().closed is False  # not yet closed
+
+    # request_stop must close the queue immediately (sync, no await).
+    w.request_stop()
+    assert queue.stats().closed is True
+
+    # Worker shuts down promptly (reader/consumer woken, PM stop runs).
+    await asyncio.wait_for(task, timeout=2.0)
+    assert w.state is WorkerState.STOPPED
+    assert pm.stopped is True
+    # PM.stop was called AFTER the queue was already closed.
+    assert pm.queue_closed_at_stop is True
+    # Queue handle was cleared after the driver finished.
+    assert w._metadata_queue is None
+    assert api.observations == []
+
+
+async def test_request_stop_wakes_consumer_with_no_more_metadata(  # type: ignore[no-untyped-def]
+    fast_settings,
+) -> None:
+    """If no metadata is in flight when request_stop fires, the consumer
+    is parked on the queue; close() must wake it so the worker can finish
+    and post stopped (instead of hanging until the reader's poll cycle)."""
+    api = FakeApi()
+    pm = _SlowReadlinePM(seed_lines=[])  # no metadata at all
+    w = _worker(api, fast_settings, pm)
+    pm.observe_worker = w
+    task = asyncio.create_task(w.run())
+
+    for _ in range(200):
+        if w._metadata_queue is not None:
+            break
+        await asyncio.sleep(0.01)
+    w.request_stop()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    seq = api.status_sequence()
+    assert seq[0] == "starting"
+    assert seq[-1] == "stopped"  # graceful even with no metadata arrived
+    assert "attached" not in seq  # we never got a valid frame
+    assert pm.stopped is True
+    assert api.observations == []
+
+
+async def test_pm_stop_is_idempotent(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Calling ``DeepStreamMetadataProcessManager.stop()`` twice does
+    not raise, does not re-issue ``docker stop``, and leaves the work
+    dir gone after the first call."""
+    docker_stop_invocations: list[tuple[object, ...]] = []
+
+    class _StopperProc:
+        async def wait(self) -> int:
+            return 0
+
+    class _RunningProc:
+        def __init__(self) -> None:
+            self.returncode: int | None = 0
+            self.stdout = None
+
+        async def wait(self) -> int:
+            return 0
+
+        def terminate(self) -> None:  # pragma: no cover - already done
+            pass
+
+        def kill(self) -> None:  # pragma: no cover
+            pass
+
+    async def _fake_exec(*args: object, **_k: object):  # type: ignore[no-untyped-def]
+        if args and args[0] == "docker" and len(args) > 1 and args[1] == "stop":
+            docker_stop_invocations.append(args)
+            return _StopperProc()
+        return _RunningProc()
+
+    monkeypatch.setattr(meta_mod.asyncio, "create_subprocess_exec", _fake_exec)
+    pm = DeepStreamMetadataProcessManager(
+        rtsp_url=_URL,
+        image="upstream-deepstream:8.0-pyds-v1.2.2",
+        network="host",
+        rtsp_transport="tcp",
+        probe_timeout_seconds=5,
+        stop_timeout_seconds=0.01,
+        model="trafficcamnet",
+        output_base_dir=str(tmp_path),
+        keep_temp_files=False,
+        sample_limit=3,
+        stream_session_id="abc-123",
+        width=1280,
+        height=720,
+    )
+    await pm.start()
+    wd = pm._work_dir
+    assert wd is not None and wd.is_dir()
+
+    await pm.stop()
+    assert not wd.exists()
+    assert pm._work_dir is None  # cleanup nulls it for idempotency
+    assert len(docker_stop_invocations) == 1
+    assert pm._stopped is True
+
+    # Second call: no exception, no extra docker stop, still no work dir.
+    await pm.stop()
+    assert len(docker_stop_invocations) == 1  # not re-invoked
+    assert pm._work_dir is None
+
+
+async def test_pm_keep_temp_files_preserves_workdir(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class _SP:
+        async def wait(self) -> int:
+            return 0
+
+    class _RP:
+        def __init__(self) -> None:
+            self.returncode: int | None = 0
+            self.stdout = None
+
+        async def wait(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+    async def _fake_exec(*args: object, **_k: object):  # type: ignore[no-untyped-def]
+        if args and args[0] == "docker" and len(args) > 1 and args[1] == "stop":
+            return _SP()
+        return _RP()
+
+    monkeypatch.setattr(meta_mod.asyncio, "create_subprocess_exec", _fake_exec)
+    pm = DeepStreamMetadataProcessManager(
+        rtsp_url=_URL,
+        image="upstream-deepstream:8.0-pyds-v1.2.2",
+        network="host",
+        rtsp_transport="tcp",
+        probe_timeout_seconds=5,
+        stop_timeout_seconds=0.01,
+        model="trafficcamnet",
+        output_base_dir=str(tmp_path),
+        keep_temp_files=True,
+        sample_limit=3,
+        stream_session_id="abc-123",
+        width=1280,
+        height=720,
+    )
+    await pm.start()
+    wd = pm._work_dir
+    assert wd is not None and wd.is_dir()
+    await pm.stop()
+    # keep_temp_files=True must preserve the dir AND not null out the path
+    # (operator may want to inspect contents post-run).
+    assert wd.exists()
+    assert pm._work_dir is wd

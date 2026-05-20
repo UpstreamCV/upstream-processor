@@ -69,6 +69,14 @@ Files:
     `has_confidence` / `has_tracker_id` / `sample_count` / `queue_stats`
     (`accepted` / `dropped` / `dropped_newest` / `dropped_oldest` /
     `consumed` / `current_size` / `closed`) + optional `app_summary`.
+    **Shutdown (P2 cleanup hardening):** `request_stop()` synchronously
+    closes the bridge queue (waking a parked `to_thread` consumer
+    immediately), and the driver's inner `gather` is wrapped in a
+    `finally` that `asyncio.shield`'s a `_finalize_metadata_probe` —
+    docker stop + workdir cleanup + terminal status post run to
+    completion even if the worker task is cancelled.
+    `DeepStreamMetadataProcessManager.stop()` and `_cleanup_work_dir()`
+    are idempotent.
 
 **No observations** in any mode. **No `ObservationWriter`** is wired up
 anywhere in `app/`. The metadata probe runs `pyds` but is still a probe:

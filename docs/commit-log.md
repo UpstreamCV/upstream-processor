@@ -4,6 +4,95 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P2 cleanup: metadata worker shutdown hardening
+
+### Summary
+Pure reliability fix for the supervisor-managed metadata probe worker
+shipped in `dcc61c3`. The live verification exposed three shutdown
+issues; none changed the metadata extraction path or the API contract,
+all are addressed here. **No feature behaviour change. No new package,
+no new env vars, no new observations, no nvtracker, no API change.**
+
+### Root cause analysis
+1. `request_stop()` only set `self._stop`. The metadata consumer is
+   parked in `asyncio.to_thread(queue.Queue.get)` and only wakes when
+   the bridge queue is closed. The reader closed the queue in its
+   `finally`, but only after its next 0.5 s poll iteration saw the
+   stop flag — i.e. up to 0.5 s of consumer parking on every stop.
+2. `_safe_stop_pm()` and the terminal status post were AFTER the inner
+   `asyncio.gather`. If the worker task was cancelled (supervisor
+   force-stop after the per-worker budget), the gather raised
+   CancelledError and the cleanup tail was skipped — leaving docker
+   containers + `/tmp/upstream-p2-meta.*` workdirs behind.
+3. `DeepStreamMetadataProcessManager.stop()` was not idempotent. The
+   outer `run()` `except CancelledError` handler calls `_safe_stop_pm`
+   again, which retried `docker stop` on an already-removed container.
+
+### What changed
+- `app/runtimes/deepstream_runtime/worker.py`:
+  - New instance attribute `_metadata_queue: BoundedBridgeQueue | None`,
+    set only while `_drive_metadata_probe` is running.
+  - `request_stop()` overridden to set the stop event AND
+    **synchronously** call `self._metadata_queue.close()` if a queue is
+    active. Closing the queue pushes its close-sentinel, which wakes any
+    consumer parked in `asyncio.to_thread(queue.Queue.get)` within
+    milliseconds.
+  - `_drive_metadata_probe()` now wraps the inner `gather()` in a
+    `try / finally`, and the finally `await asyncio.shield(...)` a new
+    `_finalize_metadata_probe()` helper that closes the queue,
+    `_safe_stop_pm()`s the PM, and posts the terminal status. Shielding
+    means docker stop + workdir cleanup + the final status post all
+    complete even when the outer task is cancelled.
+  - `_metadata_queue` is cleared in the outermost `finally` so subsequent
+    `request_stop` calls are no-ops.
+- `app/runtimes/deepstream_runtime/metadata_probe.py`:
+  - `DeepStreamMetadataProcessManager` gained a `_stopped` guard so a
+    second `stop()` call short-circuits. The guarded path still calls
+    `_cleanup_work_dir()` defensively (in case the first call was
+    cancelled before reaching its `finally`).
+  - `_cleanup_work_dir()` nulls `_work_dir` after `shutil.rmtree`, so it
+    is fully idempotent regardless of how many times it's called.
+- `docs/local-dev.md` — P2 metadata-probe live-verification checklist:
+  - **PID discovery fix**: capture the real python PID via
+    `pgrep -f "/tmp/upstream-live-p2/venv/bin/python -m app\.main" -n`
+    instead of `$!` (which records the nohup wrapper that exits
+    promptly after `exec`). The first live run SIGINT'd a dead wrapper
+    PID, which made it look like SIGINT was being ignored.
+  - Documented the new SIGINT→wait→SIGTERM-backstop loop and the
+    operator-side cleanup verification.
+- `tests/test_deepstream_metadata_probe.py` — 4 new tests:
+  - `test_request_stop_closes_queue_synchronously`: snapshots
+    `_metadata_queue.stats().closed` immediately after `request_stop()`,
+    proving the close is synchronous, AND verifies the PM observed the
+    queue already-closed when `stop()` was called (cleanup ordering).
+  - `test_request_stop_wakes_consumer_with_no_more_metadata`: parked
+    consumer wakes via close, worker reaches `stopped` even with zero
+    metadata frames in flight.
+  - `test_pm_stop_is_idempotent`: a second `stop()` does not re-issue
+    `docker stop` and leaves the workdir cleaned.
+  - `test_pm_keep_temp_files_preserves_workdir`: `keep_temp_files=True`
+    intentionally retains the dir + path attribute for operator inspection.
+
+### Not changed
+NO change to the decode-probe (M8.2B) or inference-probe (M8.2C1-B)
+workers. NO new package, NO new env vars, NO API contract change. NO
+ObservationWriter, NO `POST /observations`, NO nvtracker, NO
+nvdsanalytics, NO line crossing, NO zones, NO dashboard overlay, NO
+metadata adapter. The pyds container's in-container app is unchanged;
+the manual P2 pyds probe in `scripts/` is unchanged.
+
+### Testing/checks
+`uv run pytest -q` **130 passed** (126 prior + 4 new). `ruff check`,
+`ruff format --check`, `mypy app`, `bash -n scripts/*.sh` all clean.
+
+### Follow-up TODOs
+- **P3 — Tracker Metadata Probe**: add `nvtracker` to the pipeline so
+  `NeutralObjectMetadata.tracker_id` is populated and `has_tracker_id`
+  lights up. Required before any line crossing / dwell-time observation
+  in P4.
+
+---
+
 ## 2026-05-19 - P2: supervisor-managed metadata probe worker
 
 ### Summary

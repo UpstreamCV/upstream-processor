@@ -179,18 +179,66 @@ policies, single-consumer scope).
 Run on the GPU/streaming host (crowdcountS2). The pyds-derived image
 `upstream-deepstream:8.0-pyds-v1.2.2` must already be built (see the
 manual P2 probe milestone — `scripts/probe_deepstream_pyds_metadata.sh
-CONFIRM_BUILD=1 …` will build it). Status: implementation complete +
-unit-tested; **live verification pending until explicitly run** (do not
-claim live-verified otherwise).
+CONFIRM_BUILD=1 …` will build it). The first live run (commit `dcc61c3`)
+proved metadata flows end-to-end under supervisor control; the
+shutdown-hardening cleanup (P2 cleanup commit) makes SIGINT work
+reliably and ensures temp dirs are cleaned.
+
+### Launch (records the *real* python PID, not the nohup wrapper)
+
+```sh
+# rsync the repo + build venv as in the prior P2 / M8.2C1-B live tests.
+# Place the webhook secret yourself (the auto-mode classifier blocks
+# automating prod-secret transfer):
+umask 077
+mkdir -p /tmp/upstream-live-p2
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p2/secret.env
+chmod 600 /tmp/upstream-live-p2/secret.env
+
+cd /tmp/upstream-live-p2/repo
+set -a; . /tmp/upstream-live-p2/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p2_metadata_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.metadata_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=60 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p2/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p2/run.log 2>&1 &
+sleep 1
+# IMPORTANT: capture the REAL python PID via pgrep, NOT `$!`. `$!` is the
+# subshell/nohup wrapper PID, which exits promptly after exec(); the long-
+# lived python lives at a slightly higher PID. The P2 live verification
+# initially missed this and ended up SIGTERMing a dead wrapper.
+pgrep -f "/tmp/upstream-live-p2/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p2/processor.pid
+cat /tmp/upstream-live-p2/processor.pid
+```
+
+### Stop (SIGINT first; SIGTERM only as a backstop)
+
+```sh
+PID="$(cat /tmp/upstream-live-p2/processor.pid)"
+kill -INT "$PID"
+# With the P2 cleanup shutdown hardening, SIGINT should bring the
+# processor down within the supervisor's overall_shutdown budget
+# (default 25 s). The metadata worker now closes its bridge queue on
+# request_stop and shields _safe_stop_pm so docker stop + workdir
+# cleanup run even under cancellation.
+for i in $(seq 1 30); do
+  ps -p "$PID" >/dev/null 2>&1 || break
+  sleep 1
+done
+ps -p "$PID" >/dev/null 2>&1 && kill -TERM "$PID"
+```
+
+### Lifecycle checklist
 
 ```
 [ ] Start a valid upstream-agent stream
 [ ] Wait for validation_status=true
 [ ] eligible-sessions returns one session
-[ ] Run upstream-processor with:
-      UPSTREAM_FORCE_PACKAGE_ID=deepstream.metadata_probe.v0
-      UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2
-      UPSTREAM_PROCESSOR_ID=proc_p2_metadata_live
 [ ] Worker starts (log: "package override active",
     "deepstream worker ... mode=metadata_probe",
     "deepstream metadata start: image=... pyds-v1.2.2 model=trafficcamnet")
@@ -206,16 +254,28 @@ claim live-verified otherwise).
     metadata_enabled=true, frames_seen, frames_with_objects,
     objects_seen, class_counts, label_counts, has_bbox, has_confidence,
     queue_stats)
-[ ] Stop processor (SIGINT) — or the bounded probe self-exits at the
-    timeout
-[ ] pyds container stops cleanly (docker stop; no lingering container)
+[ ] SIGINT to the *real* PID (see above)
+[ ] Processor exits within ~25 s (no SIGTERM required after cleanup hardening)
+[ ] pyds container stops cleanly (docker stop; no lingering `upstream-dsm-*`)
 [ ] Status posts `stopped`
 [ ] processor_statuses row: runtime=deepstream,
     package_id=deepstream.metadata_probe.v0
 [ ] No observations are posted (`processor.*` types absent for this run)
 [ ] No raw RTSP URL, stream key, secret, Authorization or Bearer in logs
-[ ] Temp work dir cleaned up (unless KEEP_TEMP_FILES=true);
-    no __pycache__ leftovers (PYTHONDONTWRITEBYTECODE=1)
+[ ] Temp work dir cleaned (no /tmp/upstream-p2-meta.* leftovers unless
+    KEEP_TEMP_FILES=true); no __pycache__ leftovers
+    (PYTHONDONTWRITEBYTECODE=1 set on the container)
+```
+
+### Cleanup (operator)
+
+```sh
+# Verify nothing lingers.
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "deepstream|metadata|upstream-dsm" || true
+# Belt and suspenders — these should already be gone after a clean stop.
+rm -rf /tmp/upstream-p2-meta.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p2
 ```
 
 The probe is bounded by `UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS`
