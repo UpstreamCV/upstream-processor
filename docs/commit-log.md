@@ -4,6 +4,128 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P4-B: Line-Crossing Observation Write Path
+
+### Summary
+Closes the loop the P4-A / P4-A.5 milestones designed: the
+DeepStream analytics worker now turns each ``objLCCumCnt`` increment
+into one ``processor.line_crossing`` row in the api-server's
+``observations`` table via the existing
+``POST /v1/internal/processor/observations``. Coordinated across two
+repos (this commit covers the processor side; the api-server side
+lands separately as ``feat: allow processor line crossing
+observations``). Event-only — ROI occupancy, zone events, dwell,
+direction all remain deferred per the P4-A.5 taxonomy.
+
+### What changed (api-server side, separate repo)
+- ``src/upstream_api/schemas/processor.py`` — ``ProcessorObservationType``
+  Literal widened with ``"processor.line_crossing"``. No DB
+  migration (``observations.type`` is plain ``text``, no CHECK).
+- ``tests/test_processor.py`` — adds
+  ``test_observation_line_crossing_accepted``; existing
+  ``test_observation_invalid_type_rejected`` is unchanged.
+
+### What changed (this repo)
+- ``app/observations/schemas.py`` — ``ObservationType`` Literal +
+  ``OBSERVATION_TYPES`` tuple gain ``"processor.line_crossing"``.
+- ``app/observations/observation_taxonomy.py`` — taxonomy row's
+  ``status`` flips from ``proposed_first_api_add`` to
+  ``api_supported``.
+- ``app/runtimes/deepstream_runtime/worker.py``:
+  - ``DeepStreamWorker.__init__`` accepts optional
+    ``writer: ObservationWriter | None``.
+  - New ``_emit_line_crossings`` helper extracts
+    ``frame.source["analytics"]["line_crossing_cumulative"]``, hands
+    it to ``LineCrossingState.absorb_cumulative(...)``, and emits
+    one ``processor.line_crossing`` observation per returned event
+    via ``ObservationWriter.emit``.
+  - ``_drive_metadata_probe`` instantiates ``LineCrossingState`` +
+    pre-builds the ``deepstream_source_block`` once per worker when
+    in analytics mode with a writer present; non-analytics modes
+    ignore the writer.
+  - Per-emit error handling: ``ApiSessionGoneError`` propagates
+    (outer ``run()`` ends quietly); ``ApiValidationError`` is logged
+    + counted (wire-contract drift; do not crash);
+    ``TRANSIENT_API_ERRORS`` is logged + counted. No retry loop in
+    v0 — the deterministic ``idempotency_key`` makes future retry
+    safe to add.
+  - ``_MetadataCounters`` gains ``observations_emitted``,
+    ``line_crossing_observations_emitted``,
+    ``observation_write_errors``, ``last_observation_at``.
+  - ``_metadata_payload`` surfaces those fields only when a writer
+    is wired (``observations_enabled=true``); otherwise
+    ``observations_enabled=false`` and the counters are omitted.
+- ``app/supervisor/worker_manager.py`` — ``build_worker`` passes the
+  same writer it gives ``MockWorker`` into ``DeepStreamWorker``.
+- ``tests/test_deepstream_line_crossing_emit.py`` (new, 15 tests):
+  WorkerManager wires the writer; 0→1 emits one; 0→1→2 emits two
+  with distinct deterministic idempotency keys; repeated /
+  rewound cumulative emits nothing while watermark holds; payload
+  top-level is runtime-neutral (DeepStream vocabulary only under
+  ``source`` / ``debug``); no ROI occupancy writes; tracker- /
+  metadata-only modes don't emit; ``writer=None`` is safe + status
+  payload signals ``observations_enabled=False``; transient API
+  error path ends in ``stopped`` with counters surfaced + no
+  stream-key leakage; emit call surface matches the wire contract.
+- Updated test invariants:
+  - ``tests/test_observation_adapter_contract.py``:
+    ``test_candidate_types_not_in_server_whitelist_yet`` replaced
+    by ``test_line_crossing_now_in_server_whitelist`` +
+    ``test_roi_occupancy_still_not_in_server_whitelist``.
+  - ``tests/test_observation_taxonomy.py``:
+    ``test_exactly_one_type_proposed_for_first_api_add`` relaxed
+    to ``test_at_most_one_type_proposed_for_first_api_add``;
+    ``test_first_api_add_is_line_crossing`` replaced by
+    ``test_line_crossing_is_now_api_supported``.
+
+### Idempotency / dedupe
+- Client-side ``LineCrossingState.last_cumulative_by_line`` plus a
+  bounded ``recently_emitted_keys`` set. Deterministic key:
+  ``sess:<session_id>:processor.line_crossing:<line_id>:<cumulative_count>``.
+- No server-side ``idempotency_key`` column yet (would be a P4-C
+  optional change). Today duplicates are impossible within a
+  container lifetime; the cumulative counter resets when the
+  container restarts every ~180 s but the key stays unique per
+  ``(session_id, line, cumulative_count)`` so a future server
+  UNIQUE constraint is safe to add later.
+
+### Container boundary unchanged
+The pyds container still doesn't talk to the API. The webhook
+secret stays in the outer worker. Adapter + writer run in the host
+asyncio consumer loop, not inside docker.
+
+### Status payload addition (analytics + writer)
+```
+"observations_enabled": true,
+"observations_emitted_count": <int>,
+"line_crossing_observations_emitted": <int>,
+"observation_write_errors_count": <int>,
+"last_observation_at": "<iso8601>" | null
+```
+
+Tracker / metadata / decode / inference modes are unchanged; their
+payloads do NOT advertise observation fields.
+
+### Out of scope (next milestones)
+- ``processor.roi_occupancy`` write path (P4-C).
+- ``processor.zone_entered`` / ``zone_exited`` / ``dwell_exceeded``
+  (P4-C+; need a new ``ZoneMembershipState`` adapter).
+- Server-side ``idempotency_key`` column + UNIQUE.
+- Dashboard-driven line geometry — still hand-authored in
+  ``build_analytics_config``.
+- Direction debounce, track-update sampling, frame-summary telemetry.
+
+### Tests
+- This repo: 230 passing (214 prior + 16 net new from line-crossing
+  + invariant rework). ruff + ruff-format + ``mypy app`` clean.
+- api-server: 253 passing (252 prior + 1 new). ruff + ruff-format +
+  ``mypy src`` clean.
+- Live verification on crowdcountS2 is the operator step in
+  ``docs/local-dev.md`` — depends on the api-server change being
+  deployed first.
+
+---
+
 ## 2026-05-20 - P4-A.5: Observation Taxonomy + Emission Policy
 
 ### Summary

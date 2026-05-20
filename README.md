@@ -216,22 +216,41 @@ UPSTREAM_PROCESSOR_ID=proc_p35_analytics_live \
 uv run upstream-processor
 ```
 
+## P4-B scope (first DeepStream-backed observation type)
+
+- The api-server's `ProcessorObservationType` Literal is widened to
+  include `processor.line_crossing`. No DB migration
+  (`observations.type` is plain `text`). All other observation
+  types stay rejected at the schema layer.
+- `DeepStreamWorker` (analytics mode only) instantiates a
+  `LineCrossingState` per session, feeds each frame's
+  `frame.source.analytics.line_crossing_cumulative` through it, and
+  posts one `processor.line_crossing` observation per integer
+  increment via the existing `ObservationWriter`. Payload top-level
+  is runtime-neutral; DeepStream vocabulary lives under `source` /
+  `debug`; `idempotency_key` lives in `payload` (client-side dedupe
+  for now; server-side UNIQUE constraint deferred).
+- Status payload gains `observations_enabled`,
+  `observations_emitted_count`,
+  `line_crossing_observations_emitted`,
+  `observation_write_errors_count`, `last_observation_at`. Tracker
+  / metadata / decode / inference modes are unchanged.
+- The pyds container still does not call the API.
+
 ## What it deliberately does NOT do (yet)
 
-The DeepStream analytics probe (P3.5) runs `nvinfer` + `nvtracker` +
-`nvdsanalytics` and produces neutral metadata with **real stable
-tracker IDs** plus **ROI / line-crossing / direction events**, but it
-is still a **probe** — the worker validates frames, accumulates
-counters, and surfaces them in the status payload (`processing` lines
-on `/v1/internal/processor/status`). It does NOT yet write
-observations. Explicitly out of scope: **`ObservationWriter`
-integration**, **`POST /observations`**, the final metadata adapter,
-dashboard-driven ROI / line geometry (the analytics config is
-hand-authored in `build_analytics_config`), rules / events, dashboard
-UI, package catalog, billing, Triton/nvinferserver, YOLO/custom
-models, multi-stream batching. API contracts are unchanged. The
-`mock` runtime, the M8.2B decode probe, the M8.2C1-B inference probe,
-the P2 metadata probe, and the P3 tracker probe are unchanged; M8.1's
+The P4-B write path is **line-crossing only**. Explicitly out of
+scope: **`processor.roi_occupancy`** (P4-C),
+**`processor.zone_entered`** / **`zone_exited`** /
+**`dwell_exceeded`** (need a new `ZoneMembershipState` adapter),
+**server-side `idempotency_key` column + UNIQUE constraint**,
+**dashboard-driven ROI / line geometry** (P4-B uses P3.5's
+hand-authored line), **rules / events / webhooks**, **dashboard
+UI**, **package catalog**, **billing**, **Triton/nvinferserver**,
+**YOLO/custom models**, **multi-stream batching**. API contracts
+are otherwise unchanged. The `mock` runtime, the M8.2B decode
+probe, the M8.2C1-B inference probe, the P2 metadata probe, and
+the P3 tracker probe are unchanged; M8.1's
 `internal_rtsp_url`-is-never-read rule still holds for the mock
 runtime.
 

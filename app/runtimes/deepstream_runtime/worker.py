@@ -31,6 +31,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -45,7 +46,12 @@ from app.errors import (
 )
 from app.observations.bridge_queue import BoundedBridgeQueue, DropPolicy
 from app.observations.metadata_models import NeutralFrameMetadata
+from app.observations.observation_adapter import (
+    LineCrossingState,
+    deepstream_source_block,
+)
 from app.observations.schemas import EligibleSession
+from app.observations.writer import ObservationWriter
 from app.packages.resolver import PackageSpec
 from app.redact import redact_rtsp, scrub_rtsp_in_text
 from app.runtimes.base import Runtime, WorkerState
@@ -183,6 +189,14 @@ class _MetadataCounters:
     analytics_labels: set[str] = field(default_factory=set)
     analytics_labels_sample: list[str] = field(default_factory=list)
     analytics_labels_sample_limit: int = 20
+    # P4-B observation-emit counters. Populated only when the worker has
+    # an ObservationWriter AND the analytics mode is active. Surfaced in
+    # the status payload so an operator can confirm writes flowed without
+    # querying the api-server.
+    observations_emitted: int = 0
+    line_crossing_observations_emitted: int = 0
+    observation_write_errors: int = 0
+    last_observation_at: datetime | None = None
 
     def absorb(self, frame: NeutralFrameMetadata) -> None:
         self.frames_seen += 1
@@ -304,12 +318,19 @@ class DeepStreamWorker(Runtime):
         settings: Settings,
         api: ProcessorApi,
         package: PackageSpec,
+        writer: ObservationWriter | None = None,
         pm_factory: Callable[[], ProcessManager] | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._api = api
         self._package = package
+        # P4-B: only the analytics mode uses the writer (today, only for
+        # ``processor.line_crossing``). decode_probe / inference_probe /
+        # metadata_probe / tracker_probe modes ignore it. Optional so unit
+        # tests that exercise the non-analytics modes don't have to build
+        # a writer when they don't care.
+        self._writer = writer
         self._pm_factory = pm_factory or self._default_pm_factory
         self._pm: ProcessManager | None = None
         self._stop = asyncio.Event()
@@ -705,6 +726,26 @@ class DeepStreamWorker(Runtime):
             p["objects_with_line_metadata"] = counters.objects_with_line_metadata
             p["analytics_labels_count"] = len(counters.analytics_labels)
             p["analytics_labels_sample"] = list(counters.analytics_labels_sample)
+            # P4-B: observation-emit counters only land in the status
+            # payload when the worker actually has a writer (analytics
+            # + writer present). The flag stays False so an operator can
+            # tell the difference between "no writer wired" and "writer
+            # wired but no events yet". Counters are omitted when no
+            # writer is present, keeping the payload tight.
+            if self._writer is not None:
+                p["observations_enabled"] = True
+                p["observations_emitted_count"] = counters.observations_emitted
+                p["line_crossing_observations_emitted"] = (
+                    counters.line_crossing_observations_emitted
+                )
+                p["observation_write_errors_count"] = counters.observation_write_errors
+                p["last_observation_at"] = (
+                    counters.last_observation_at.isoformat()
+                    if counters.last_observation_at is not None
+                    else None
+                )
+            else:
+                p["observations_enabled"] = False
         if last_app_summary is not None:
             p["app_summary"] = last_app_summary
         return p
@@ -773,6 +814,25 @@ class DeepStreamWorker(Runtime):
         )
         reader_state = _MetadataReaderState()
 
+        # P4-B: only the analytics mode emits observations today, and only
+        # when the supervisor handed us a writer. Both branches build the
+        # state machine + the per-emit ``source`` block once so the
+        # consumer's hot path stays allocation-light.
+        observations_enabled = self._mode == _ANALYTICS_MODE and self._writer is not None
+        line_state: LineCrossingState | None = (
+            LineCrossingState(stream_session_id=self._session.session_id)
+            if observations_enabled
+            else None
+        )
+        source_block: dict[str, Any] = (
+            deepstream_source_block(
+                package_id=self._package.package_id,
+                tracker_algorithm=self._settings.deepstream_tracker_algorithm,
+            )
+            if observations_enabled
+            else {}
+        )
+
         async def _reader() -> None:
             assert self._pm is not None
             try:
@@ -823,6 +883,13 @@ class DeepStreamWorker(Runtime):
             processing = False
             async for frame in source:
                 counters.absorb(frame)
+                if line_state is not None:
+                    await self._emit_line_crossings(
+                        frame=frame,
+                        line_state=line_state,
+                        source_block=source_block,
+                        counters=counters,
+                    )
                 if not attached:
                     attached = True
                     self._state = WorkerState.ATTACHED
@@ -878,6 +945,88 @@ class DeepStreamWorker(Runtime):
                 )
             finally:
                 self._metadata_queue = None
+
+    # --- P4-B: per-frame line-crossing emission --------------------------
+
+    async def _emit_line_crossings(
+        self,
+        *,
+        frame: NeutralFrameMetadata,
+        line_state: LineCrossingState,
+        source_block: dict[str, Any],
+        counters: _MetadataCounters,
+    ) -> None:
+        """Pull the analytics frame-level ``line_crossing_cumulative``
+        block from one consumed frame, hand it to the adapter state, and
+        emit one ``processor.line_crossing`` observation per increment.
+
+        Caller has already gated on ``self._mode == _ANALYTICS_MODE`` and
+        ``self._writer is not None`` (line_state is only built in that
+        case), so this method assumes both. Transient write errors are
+        absorbed (mirroring ``_post``'s ``transient_ok=True`` shape).
+        ``ApiSessionGoneError`` propagates — same semantics as elsewhere
+        in the worker: the session is gone, end quietly via the outer
+        handler. ``ApiValidationError`` is logged + counted but does NOT
+        crash the consumer (a wire-contract drift between processor and
+        api-server is unrecoverable in flight; the next worker spawn
+        will use a fresh schema)."""
+        assert self._writer is not None  # gated by the caller
+        analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
+        if not isinstance(analytics, dict):
+            return
+        cumulative_by_line = analytics.get("line_crossing_cumulative")
+        if not isinstance(cumulative_by_line, dict) or not cumulative_by_line:
+            return
+        occurred_at = frame.frame.timestamp or now_utc()
+        # Coerce to ``dict[str, int]`` defensively — the producer should
+        # already match this, but the validation gate is permissive about
+        # the inner ``dict[str, Any]`` shape on ``frame.source``.
+        cumulative_clean: dict[str, int] = {
+            str(k): int(v) for k, v in cumulative_by_line.items() if isinstance(v, int | float)
+        }
+        if not cumulative_clean:
+            return
+        events = line_state.absorb_cumulative(
+            cumulative_by_line=cumulative_clean,
+            occurred_at=occurred_at,
+            source=source_block,
+            debug={
+                "frame_num": int(frame.frame.frame_num),
+                "geometry_source": "probe_default",
+                "raw_line_crossing_cumulative": dict(cumulative_clean),
+            },
+        )
+        for event in events:
+            try:
+                await self._writer.emit(
+                    stream_session_id=self._session.session_id,
+                    obs_type="processor.line_crossing",
+                    payload=event.to_payload(),
+                    package_id=self._package.package_id,
+                    observed_at=event.occurred_at,
+                )
+            except ApiSessionGoneError:
+                # Outer ``run()`` handler ends the worker quietly.
+                raise
+            except ApiValidationError as exc:
+                counters.observation_write_errors += 1
+                _log.error(
+                    "wire contract drift on observation emit for %s: %s",
+                    self.session_id,
+                    exc,
+                )
+                continue
+            except TRANSIENT_API_ERRORS as exc:
+                counters.observation_write_errors += 1
+                _log.warning(
+                    "transient observation emit for %s: %s",
+                    self.session_id,
+                    exc,
+                )
+                continue
+            counters.observations_emitted += 1
+            counters.line_crossing_observations_emitted += 1
+            counters.last_observation_at = event.occurred_at
 
     # --- helpers ----------------------------------------------------------
 

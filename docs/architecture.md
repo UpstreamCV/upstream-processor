@@ -928,26 +928,171 @@ pyds / api-server). Highlights:
 
 ### Next step (P4-B)
 
-**P4-B — Line-Crossing Observation Write Path** is the next
-milestone:
+**P4-B is now implemented** — see the **P4-B** section below.
 
-1. Open the api-server PR adding ``processor.line_crossing`` to
-   ``ProcessorObservationType``. No DB migration. Existing tests
-   pass with the wider Literal.
-2. In lock-step, add ``processor.line_crossing`` to this repo's
-   ``schemas.ObservationType`` / ``OBSERVATION_TYPES``. Flip the
-   taxonomy row's ``status`` from ``proposed_first_api_add`` to
-   ``api_supported``; the taxonomy invariant test will then move
-   the type from the deferred list into the supported list.
-3. Thread ``ObservationWriter`` into ``DeepStreamWorker.__init__``
-   (mirroring ``MockWorker``). Update ``WorkerManager.build_worker``.
-4. In ``DeepStreamWorker._drive_metadata_probe`` analytics mode,
-   instantiate ``LineCrossingState`` once per worker; feed each
-   consumed frame's
-   ``frame.source.analytics.line_crossing_cumulative`` through it;
-   ``await self._writer.emit(...)`` for each returned event.
-5. Live-verify on crowdcountS2: operator crosses the line twice,
-   exactly 2 ``processor.line_crossing`` rows appear in the
-   ``observations`` table with deterministic ``idempotency_key``
-   values in ``payload``, zero rows on a steady scene.
-6. ROI occupancy stays deferred (P4-C).
+## P4-B — Line-Crossing Observation Write Path
+
+Closes the loop the previous P4 milestones designed: an operator
+crossing the configured midline now produces a discrete
+``processor.line_crossing`` row in the ``observations`` table via
+the existing ``ObservationWriter`` / ``POST /v1/internal/processor/
+observations`` path. Coordinated across two repos
+(``upstream-api-server`` widens the type whitelist; this repo wires
+the write path) and event-only — ROI occupancy, zone events, dwell,
+direction all remain deferred per the P4-A.5 taxonomy.
+
+### Lockstep schema widening (no DB migration)
+- **upstream-api-server**:
+  ``src/upstream_api/schemas/processor.py`` —
+  ``ProcessorObservationType`` Literal gains
+  ``"processor.line_crossing"``. ``observations.type`` is plain
+  ``text`` (verified at migration
+  ``20260518140000_processor_status_observations.sql``); no DDL is
+  needed. ``tests/test_processor.py`` gains
+  ``test_observation_line_crossing_accepted`` (pinned positive
+  case); the existing ``test_observation_invalid_type_rejected``
+  still uses ``processor.real_detection`` for the rejection path.
+- **upstream-processor**:
+  ``app/observations/schemas.py`` — ``ObservationType`` Literal +
+  ``OBSERVATION_TYPES`` tuple gain the same string. The taxonomy
+  row's ``status`` flips from ``proposed_first_api_add`` to
+  ``api_supported``; the P4-A.5 invariant tests now assert the
+  post-P4-B state (``test_at_most_one_type_proposed_for_first_api_add``,
+  ``test_line_crossing_is_now_api_supported``).
+
+The P4-A "candidate not in whitelist" regression for
+``processor.line_crossing`` is replaced by
+``test_line_crossing_now_in_server_whitelist``; the matching guard
+for ``processor.roi_occupancy`` survives unchanged
+(``test_roi_occupancy_still_not_in_server_whitelist``) so a future
+careless edit cannot silently widen the wrong type.
+
+### Writer integration in the DeepStream worker
+- ``DeepStreamWorker.__init__`` accepts an optional
+  ``writer: ObservationWriter | None``. Stored as ``self._writer``;
+  only used by the analytics mode driver.
+- ``WorkerManager.build_worker`` passes the same writer it gives
+  ``MockWorker``. No new instance is created — single chokepoint
+  preserved.
+- Non-analytics modes (decode / inference / metadata / tracker)
+  ignore the writer. Tests pin both that they ignore it and that
+  the optional ``writer=None`` path is safe (a misconfigured
+  supervisor can't crash the worker).
+
+### Adapter integration in the analytics consumer
+Inside ``_drive_metadata_probe``, when
+``self._mode == _ANALYTICS_MODE and self._writer is not None``:
+1. A ``LineCrossingState(stream_session_id=self._session.session_id)``
+   is constructed once.
+2. A ``deepstream_source_block(package_id=...,
+   tracker_algorithm=...)`` dict is built once.
+3. In the consumer loop, immediately after
+   ``counters.absorb(frame)``, the worker calls
+   ``await self._emit_line_crossings(frame, line_state,
+   source_block, counters)``. The helper extracts
+   ``frame.source["analytics"]["line_crossing_cumulative"]``
+   (skipping cleanly if absent / non-dict), validates the value
+   shape, and hands the dict to ``state.absorb_cumulative(...)``
+   along with ``occurred_at = frame.frame.timestamp or now_utc()``.
+4. For each returned ``LineCrossingEvent`` (one per integer
+   increment), the helper calls
+   ``await self._writer.emit(stream_session_id=...,
+   obs_type="processor.line_crossing",
+   payload=event.to_payload(), package_id=...,
+   observed_at=event.occurred_at)``.
+
+### Per-emit error handling (mirrors ``_post`` shape)
+- ``ApiSessionGoneError`` propagates — outer ``run()`` ends the
+  worker quietly, same as the rest of the worker.
+- ``ApiValidationError`` is logged and counted
+  (``counters.observation_write_errors``) but does NOT crash the
+  consumer. Wire-contract drift between the processor and
+  api-server is unrecoverable in flight; the next worker spawn
+  uses a fresh schema. **Important property**: the writer's
+  defensive ``OBSERVATION_TYPES`` guard prevents an accidentally-
+  un-widened processor from emitting the new type (would raise
+  ``ProcessorError``, also caught and counted).
+- Anything in ``TRANSIENT_API_ERRORS`` (connection /
+  rate-limit / contract / server) is logged + counted; the next
+  event tries again. No bounded retry / backoff in P4-B —
+  intentionally — because each integer increment already gets a
+  unique deterministic ``idempotency_key`` so a duplicate POST
+  (after a hypothetical client-side retry) would be safe once the
+  server gains a UNIQUE constraint. For now duplicates would
+  manifest as duplicate rows; P4-C can add that constraint if the
+  data shows it's needed.
+
+### Status-payload counters
+``_MetadataCounters`` gains:
+- ``observations_emitted: int``
+- ``line_crossing_observations_emitted: int``
+- ``observation_write_errors: int``
+- ``last_observation_at: datetime | None``
+
+``_metadata_payload`` surfaces them ONLY when the worker actually
+has a writer (analytics + writer). Otherwise the payload carries
+``"observations_enabled": False`` and omits the counters, keeping
+the tracker / metadata payloads tight. Operators can tell from one
+``processing`` post whether observations are flowing:
+
+```
+"observations_enabled": true,
+"observations_emitted_count": 2,
+"line_crossing_observations_emitted": 2,
+"observation_write_errors_count": 0,
+"last_observation_at": "2026-05-20T16:42:31.512+00:00"
+```
+
+### Container boundary unchanged
+The pyds container still does not call the UpStream API. The
+webhook secret stays in the outer worker process. ``ObservationWriter``
+runs in the asyncio consumer loop on the host; the container's
+only job is to walk ``NvDsAnalyticsFrameMeta`` and write JSON to
+stdout. A flaky API only stalls the consumer, never the GST
+pipeline.
+
+### Coverage
+- ``tests/test_deepstream_line_crossing_emit.py`` (15 new tests).
+  Highlights: ``WorkerManager.build_worker`` threads the writer
+  through; the lifecycle emits one observation on 0→1 and two on
+  0→1→2 with deterministic idempotency keys; repeated cumulative
+  emits nothing; counter rewind emits nothing while the
+  watermark holds and a later genuine increment emits one event;
+  payload top-level is runtime-neutral with DeepStream vocabulary
+  under ``source`` / ``debug``; no ``processor.roi_occupancy``
+  writes; tracker- and metadata-only modes don't emit; a worker
+  with ``writer=None`` is silent + surfaces
+  ``observations_enabled=False``; a transient
+  ``ApiServerError`` ends in ``stopped`` with the error count
+  surfaced + no stream-key leakage in any status payload; emit
+  call surface (obs_type / package_id / processor_id /
+  stream_session_id / observed_at) matches the wire contract.
+- ``tests/test_observation_adapter_contract.py`` —
+  ``test_candidate_types_not_in_server_whitelist_yet`` is replaced
+  by ``test_line_crossing_now_in_server_whitelist`` +
+  ``test_roi_occupancy_still_not_in_server_whitelist`` so the
+  half-and-half post-P4-B state is what's asserted.
+- ``tests/test_observation_taxonomy.py`` —
+  ``test_exactly_one_type_proposed_for_first_api_add`` relaxed to
+  ``test_at_most_one_type_proposed_for_first_api_add``;
+  ``test_first_api_add_is_line_crossing`` replaced by
+  ``test_line_crossing_is_now_api_supported``. The
+  ``test_no_processor_type_is_already_in_observation_types``
+  lock-step assertion did most of the work — it already enforced
+  that ``api_supported`` rows and ``OBSERVATION_TYPES`` widen
+  together.
+
+### Live verification
+See ``docs/local-dev.md`` for the operator checklist.
+
+### What's deliberately NOT in P4-B
+- ``processor.roi_occupancy`` (P4-C).
+- ``processor.zone_entered`` / ``zone_exited`` / ``dwell_exceeded``
+  (need ``ZoneMembershipState`` — design lives in
+  ``observation_taxonomy.py`` but no adapter implementation yet).
+- Server-side ``idempotency_key`` column + UNIQUE constraint.
+  Only needed if duplicate rows actually appear; client-side
+  state dedupes within a container lifetime.
+- Dashboard-driven line geometry — P4-B uses P3.5's hand-authored
+  central horizontal line.
+- Direction / track-update / telemetry types.

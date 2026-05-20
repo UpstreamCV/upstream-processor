@@ -90,7 +90,11 @@ INITIAL_TAXONOMY: tuple[ObservationSpec, ...] = (
     ObservationSpec(
         type="processor.line_crossing",
         category="event",
-        status="proposed_first_api_add",
+        # P4-B widened the api-server ``ProcessorObservationType`` Literal
+        # AND this repo's ``schemas.OBSERVATION_TYPES`` in lock-step. The
+        # invariant test ``test_no_processor_type_is_already_in_observation_types``
+        # would have fired if either side moved without the other.
+        status="api_supported",
         description=(
             "One discrete crossing of a configured line. Source is the "
             "nvdsanalytics frame-level objLCCumCnt counter; the adapter "

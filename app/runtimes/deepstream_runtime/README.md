@@ -118,13 +118,17 @@ Files:
     `DeepStreamMetadataProcessManager.stop()` and `_cleanup_work_dir()`
     are idempotent.
 
-**No observations** in any mode. **No `ObservationWriter`** is wired up
-anywhere in `app/`. The metadata / tracker / analytics probes run `pyds`
-(and, in analytics mode, `nvdsanalytics` on top of `nvtracker`) but are
-still probes: **no final metadata adapter, no rules/events, no
-dashboard-driven geometry, no Triton.** KITTI /
-`UPSTREAM_METADATA` output is debug evidence only — *not* final
-metadata extraction. The webhook secret never enters the pyds container
+**P4-B widens this:** the `analytics_probe` mode now emits
+`processor.line_crossing` observations (one per
+`objLCCumCnt` increment) via the existing `ObservationWriter`. The
+``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
+``tracker_probe`` modes are still observation-free. The pyds
+container still does not call the UpStream API; the adapter +
+writer run in the host asyncio consumer loop. Everything else is
+still probe: **no ROI occupancy / zone events / dwell / direction
+write paths yet, no rules/events, no dashboard-driven geometry, no
+Triton.** KITTI / `UPSTREAM_METADATA` output is debug evidence —
+*not* final metadata extraction. The webhook secret never enters the pyds container
 (the in-container app never calls UpStream APIs; status posting stays
 with the outer supervisor). Default images: **DeepStream 8.0** for
 decode/inference (`UPSTREAM_DEEPSTREAM_IMAGE`,

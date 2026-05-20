@@ -54,7 +54,16 @@ def build_worker(
     side-effect free (constructing a DeepStreamWorker does NOT touch Docker —
     the subprocess starts in ``run()``), so this is unit-testable."""
     if spec.runtime == "deepstream":
-        return DeepStreamWorker(session=session, settings=settings, api=api, package=spec)
+        # P4-B threads the same ObservationWriter used by MockWorker so the
+        # analytics mode can emit ``processor.line_crossing`` observations.
+        # Non-analytics DeepStream modes ignore the writer.
+        return DeepStreamWorker(
+            session=session,
+            settings=settings,
+            api=api,
+            package=spec,
+            writer=writer,
+        )
     return MockWorker(
         session=session,
         settings=settings,

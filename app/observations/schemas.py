@@ -27,12 +27,17 @@ ObservationType = Literal[
     "processor.mock_frame_seen",
     "processor.mock_heartbeat",
     "processor.mock_detection",
+    # P4-B: first real DeepStream-backed observation. Lock-step with
+    # ``upstream-api-server``'s ``ProcessorObservationType`` (any drift
+    # 422s the write at the server's pydantic layer).
+    "processor.line_crossing",
 ]
 
 OBSERVATION_TYPES: tuple[ObservationType, ...] = (
     "processor.mock_frame_seen",
     "processor.mock_heartbeat",
     "processor.mock_detection",
+    "processor.line_crossing",
 )
 
 
