@@ -48,6 +48,7 @@ from app.observations.bridge_queue import BoundedBridgeQueue, DropPolicy
 from app.observations.metadata_models import NeutralFrameMetadata
 from app.observations.observation_adapter import (
     LineCrossingState,
+    RoiOccupancyState,
     deepstream_source_block,
 )
 from app.observations.schemas import EligibleSession
@@ -195,6 +196,10 @@ class _MetadataCounters:
     # querying the api-server.
     observations_emitted: int = 0
     line_crossing_observations_emitted: int = 0
+    # P4-C: ROI occupancy emit counter (parallel to the line-crossing
+    # one). Errors increment the shared ``observation_write_errors``
+    # counter — the writer error path does not distinguish.
+    roi_occupancy_observations_emitted: int = 0
     observation_write_errors: int = 0
     last_observation_at: datetime | None = None
 
@@ -738,6 +743,11 @@ class DeepStreamWorker(Runtime):
                 p["line_crossing_observations_emitted"] = (
                     counters.line_crossing_observations_emitted
                 )
+                # P4-C: parallel ROI occupancy counter so operators can
+                # tell line vs ROI throughput apart from the status row.
+                p["roi_occupancy_observations_emitted"] = (
+                    counters.roi_occupancy_observations_emitted
+                )
                 p["observation_write_errors_count"] = counters.observation_write_errors
                 p["last_observation_at"] = (
                     counters.last_observation_at.isoformat()
@@ -814,13 +824,26 @@ class DeepStreamWorker(Runtime):
         )
         reader_state = _MetadataReaderState()
 
-        # P4-B: only the analytics mode emits observations today, and only
-        # when the supervisor handed us a writer. Both branches build the
-        # state machine + the per-emit ``source`` block once so the
-        # consumer's hot path stays allocation-light.
+        # P4-B/P4-C: only the analytics mode emits observations today,
+        # and only when the supervisor handed us a writer. Both branches
+        # build the state machines + the per-emit ``source`` block once
+        # so the consumer's hot path stays allocation-light.
         observations_enabled = self._mode == _ANALYTICS_MODE and self._writer is not None
         line_state: LineCrossingState | None = (
             LineCrossingState(stream_session_id=self._session.session_id)
+            if observations_enabled
+            else None
+        )
+        # P4-C: ROI occupancy state runs in parallel; emit policy is
+        # first-seen + on-change + ``min_interval_seconds`` heartbeat
+        # (never per-frame). The interval is env-overridable via
+        # ``UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`` (default 30s).
+        roi_state: RoiOccupancyState | None = (
+            RoiOccupancyState(
+                stream_session_id=self._session.session_id,
+                emit_on_change=True,
+                min_interval_seconds=self._settings.deepstream_roi_min_interval_seconds,
+            )
             if observations_enabled
             else None
         )
@@ -887,6 +910,13 @@ class DeepStreamWorker(Runtime):
                     await self._emit_line_crossings(
                         frame=frame,
                         line_state=line_state,
+                        source_block=source_block,
+                        counters=counters,
+                    )
+                if roi_state is not None:
+                    await self._emit_roi_occupancies(
+                        frame=frame,
+                        roi_state=roi_state,
                         source_block=source_block,
                         counters=counters,
                     )
@@ -1026,6 +1056,88 @@ class DeepStreamWorker(Runtime):
                 continue
             counters.observations_emitted += 1
             counters.line_crossing_observations_emitted += 1
+            counters.last_observation_at = event.occurred_at
+
+    # --- P4-C: per-frame ROI occupancy emission --------------------------
+
+    async def _emit_roi_occupancies(
+        self,
+        *,
+        frame: NeutralFrameMetadata,
+        roi_state: RoiOccupancyState,
+        source_block: dict[str, Any],
+        counters: _MetadataCounters,
+    ) -> None:
+        """Pull the analytics frame-level ``roi_counts`` block from one
+        consumed frame, hand it to the ROI adapter state, and emit one
+        ``processor.roi_occupancy`` observation per state-change /
+        first-seen / interval heartbeat.
+
+        Caller has already gated on ``self._mode == _ANALYTICS_MODE`` and
+        ``self._writer is not None`` (roi_state is only built in that
+        case), so this method assumes both. Error handling mirrors
+        ``_emit_line_crossings`` exactly: transient writer errors are
+        absorbed, ``ApiSessionGoneError`` propagates so the outer
+        ``run()`` handler ends quietly, ``ApiValidationError`` is logged
+        + counted (wire-contract drift; do not crash). The deterministic
+        ``idempotency_key`` on every event makes a future server-side
+        UNIQUE constraint safe to add."""
+        assert self._writer is not None  # gated by the caller
+        analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
+        if not isinstance(analytics, dict):
+            return
+        roi_counts = analytics.get("roi_counts")
+        if not isinstance(roi_counts, dict) or not roi_counts:
+            return
+        occurred_at = frame.frame.timestamp or now_utc()
+        # Coerce to ``dict[str, int]`` defensively — the producer should
+        # already match this shape, but ``frame.source`` is permissive
+        # about inner ``Any`` types.
+        roi_counts_clean: dict[str, int] = {
+            str(k): int(v) for k, v in roi_counts.items() if isinstance(v, int | float)
+        }
+        if not roi_counts_clean:
+            return
+        events = roi_state.absorb_roi_counts(
+            roi_counts=roi_counts_clean,
+            occurred_at=occurred_at,
+            source=source_block,
+            debug={
+                "frame_num": int(frame.frame.frame_num),
+                "geometry_source": "probe_default",
+                "raw_roi_counts": dict(roi_counts_clean),
+            },
+        )
+        for event in events:
+            try:
+                await self._writer.emit(
+                    stream_session_id=self._session.session_id,
+                    obs_type="processor.roi_occupancy",
+                    payload=event.to_payload(),
+                    package_id=self._package.package_id,
+                    observed_at=event.occurred_at,
+                )
+            except ApiSessionGoneError:
+                # Outer ``run()`` handler ends the worker quietly.
+                raise
+            except ApiValidationError as exc:
+                counters.observation_write_errors += 1
+                _log.error(
+                    "wire contract drift on ROI observation emit for %s: %s",
+                    self.session_id,
+                    exc,
+                )
+                continue
+            except TRANSIENT_API_ERRORS as exc:
+                counters.observation_write_errors += 1
+                _log.warning(
+                    "transient ROI observation emit for %s: %s",
+                    self.session_id,
+                    exc,
+                )
+                continue
+            counters.observations_emitted += 1
+            counters.roi_occupancy_observations_emitted += 1
             counters.last_observation_at = event.occurred_at
 
     # --- helpers ----------------------------------------------------------

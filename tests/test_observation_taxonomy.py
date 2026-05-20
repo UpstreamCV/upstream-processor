@@ -93,6 +93,15 @@ def test_line_crossing_is_now_api_supported() -> None:
     assert "processor.line_crossing" not in DEFERRED_TYPES
 
 
+def test_roi_occupancy_is_now_api_supported() -> None:
+    """P4-C flipped ``processor.roi_occupancy`` from ``deferred`` to
+    ``api_supported`` in lock-step with the api-server widening.
+    Parallel to ``test_line_crossing_is_now_api_supported``."""
+    assert "processor.roi_occupancy" in API_SUPPORTED_TYPES
+    assert "processor.roi_occupancy" not in PROPOSED_FIRST_API_ADD_TYPES
+    assert "processor.roi_occupancy" not in DEFERRED_TYPES
+
+
 def test_no_proposed_type_is_already_supported() -> None:
     """``proposed_first_api_add`` and ``api_supported`` are mutually
     exclusive — once a type is supported it must be flipped to

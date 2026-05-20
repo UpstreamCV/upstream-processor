@@ -216,31 +216,39 @@ UPSTREAM_PROCESSOR_ID=proc_p35_analytics_live \
 uv run upstream-processor
 ```
 
-## P4-B scope (first DeepStream-backed observation type)
+## P4-B + P4-C scope (first two DeepStream-backed observation types)
 
 - The api-server's `ProcessorObservationType` Literal is widened to
-  include `processor.line_crossing`. No DB migration
-  (`observations.type` is plain `text`). All other observation
-  types stay rejected at the schema layer.
+  include both `processor.line_crossing` (P4-B) and
+  `processor.roi_occupancy` (P4-C). No DB migration; all other
+  observation types stay rejected at the schema layer.
 - `DeepStreamWorker` (analytics mode only) instantiates a
-  `LineCrossingState` per session, feeds each frame's
-  `frame.source.analytics.line_crossing_cumulative` through it, and
-  posts one `processor.line_crossing` observation per integer
-  increment via the existing `ObservationWriter`. Payload top-level
-  is runtime-neutral; DeepStream vocabulary lives under `source` /
-  `debug`; `idempotency_key` lives in `payload` (client-side dedupe
-  for now; server-side UNIQUE constraint deferred).
+  `LineCrossingState` AND a `RoiOccupancyState` per session, each
+  fed by the corresponding `frame.source.analytics.*` block. The
+  two emit helpers run independently.
+- **Line crossing** (P4-B) — one observation per integer
+  increment of `objLCCumCnt`. Event-style.
+- **ROI occupancy** (P4-C) — one observation on first-seen, on
+  count change, and on a 30 s heartbeat interval
+  (`UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`, default 30s,
+  env-overridable). **Never per-frame.**
+  `payload.debug.emit_reason` records first/change/interval.
+- Payload top-level is runtime-neutral; DeepStream vocabulary
+  lives under `source` / `debug`; `idempotency_key` lives in
+  `payload` (client-side dedupe; server-side UNIQUE constraint
+  deferred).
 - Status payload gains `observations_enabled`,
   `observations_emitted_count`,
   `line_crossing_observations_emitted`,
+  `roi_occupancy_observations_emitted`,
   `observation_write_errors_count`, `last_observation_at`. Tracker
   / metadata / decode / inference modes are unchanged.
 - The pyds container still does not call the API.
 
 ## What it deliberately does NOT do (yet)
 
-The P4-B write path is **line-crossing only**. Explicitly out of
-scope: **`processor.roi_occupancy`** (P4-C),
+The P4-B/P4-C write paths are **line-crossing + ROI occupancy
+only**. Explicitly out of scope:
 **`processor.zone_entered`** / **`zone_exited`** /
 **`dwell_exceeded`** (need a new `ZoneMembershipState` adapter),
 **server-side `idempotency_key` column + UNIQUE constraint**,

@@ -54,12 +54,35 @@ def test_line_crossing_now_in_server_whitelist() -> None:
     assert CANDIDATE_LINE_CROSSING_TYPE in OBSERVATION_TYPES
 
 
-def test_roi_occupancy_still_not_in_server_whitelist() -> None:
-    """``processor.roi_occupancy`` is the next candidate (P4-C). MUST
-    NOT have been accidentally widened in P4-B. The adapter still
-    carries the ``RoiOccupancyState`` machine but no production write
-    path — this regression guards against an over-eager Literal edit."""
-    assert CANDIDATE_ROI_OCCUPANCY_TYPE not in OBSERVATION_TYPES
+def test_roi_occupancy_now_in_server_whitelist() -> None:
+    """P4-C widened the api-server + this repo's whitelist in
+    lock-step, so ``processor.roi_occupancy`` is now accepted by
+    ``ObservationWriter``. The adapter's ``RoiOccupancyState`` has
+    been the production write source since this commit."""
+    assert CANDIDATE_ROI_OCCUPANCY_TYPE in OBSERVATION_TYPES
+
+
+def test_zone_dwell_track_types_still_unsupported() -> None:
+    """P4-C widens exactly one type. The next candidates (zone
+    enter/exit, dwell, direction, track update, telemetry) MUST NOT
+    have been accidentally widened — this is the spiritual successor
+    to P4-B's ROI guard, now pointed at the next-deferred types."""
+    future_types = (
+        "processor.zone_entered",
+        "processor.zone_exited",
+        "processor.dwell_exceeded",
+        "processor.direction_detected",
+        "processor.track_state",
+        "processor.track_update",
+        "processor.detection_seen",
+        "processor.frame_summary",
+        "processor.scene_quality_warning",
+    )
+    for t in future_types:
+        assert t not in OBSERVATION_TYPES, (
+            f"{t!r} unexpectedly in OBSERVATION_TYPES — P4-C only widens "
+            "processor.roi_occupancy; other types stay deferred"
+        )
 
 
 def test_candidate_types_use_processor_dotted_namespace() -> None:
@@ -324,7 +347,8 @@ def test_event_payload_omits_optional_fields_when_absent() -> None:
 
 def test_roi_first_observation_always_emits() -> None:
     """Even a zero-count ROI on first sight should emit so the consumer
-    knows the ROI exists."""
+    knows the ROI exists. P4-C labels this case as ``emit_reason="first"``
+    in the event's debug dict."""
     state = RoiOccupancyState(
         stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
     )
@@ -333,6 +357,7 @@ def test_roi_first_observation_always_emits() -> None:
     assert events[0].roi_id == "entry-roi"
     assert events[0].total_count == 0
     assert events[0].sequence == 1
+    assert events[0].debug["emit_reason"] == "first"
 
 
 def test_roi_no_emit_when_unchanged_and_no_interval() -> None:
@@ -348,7 +373,8 @@ def test_roi_no_emit_when_unchanged_and_no_interval() -> None:
 
 
 def test_roi_emits_on_change() -> None:
-    """Total count went 1 → 2 between frames → one event."""
+    """Total count went 1 → 2 between frames → one event with
+    ``emit_reason="change"``."""
     state = RoiOccupancyState(
         stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
     )
@@ -359,11 +385,13 @@ def test_roi_emits_on_change() -> None:
     assert len(second) == 1
     assert second[0].total_count == 2
     assert second[0].sequence == 2  # second emit for this ROI
+    assert second[0].debug["emit_reason"] == "change"
 
 
 def test_roi_emits_on_interval_even_when_unchanged() -> None:
     """If the count hasn't moved but ``min_interval_seconds`` has
-    elapsed, emit a heartbeat-style snapshot."""
+    elapsed, emit a heartbeat-style snapshot labelled
+    ``emit_reason="interval"``."""
     state = RoiOccupancyState(
         stream_session_id=uuid4(), emit_on_change=False, min_interval_seconds=30.0
     )
@@ -379,6 +407,7 @@ def test_roi_emits_on_interval_even_when_unchanged() -> None:
     )
     assert len(later) == 1
     assert later[0].sequence == 2
+    assert later[0].debug["emit_reason"] == "interval"
 
 
 def test_roi_class_counts_threaded_through() -> None:
@@ -395,6 +424,49 @@ def test_roi_class_counts_threaded_through() -> None:
     body = events[0].to_payload()
     assert body["total_count"] == 3
     assert body["class_counts"] == {"person": 2, "car": 1}
+
+
+def test_roi_emit_reason_lives_in_debug_dict() -> None:
+    """The emit reason rides under ``debug.emit_reason``, NOT as a
+    top-level payload field — keeps the runtime-neutral surface clean
+    while still letting an operator inspect why a heartbeat fired."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=30.0
+    )
+    e1 = state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    e2 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=1)
+    )
+    e3 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=35)
+    )
+    bodies = [e[0].to_payload() for e in (e1, e2, e3)]
+    # Top-level body must NOT carry emit_reason.
+    for body in bodies:
+        assert "emit_reason" not in body
+        assert body["debug"]["emit_reason"] in ("first", "change", "interval")
+    # And: the three cases produced the three reasons in order.
+    assert bodies[0]["debug"]["emit_reason"] == "first"
+    assert bodies[1]["debug"]["emit_reason"] == "change"
+    assert bodies[2]["debug"]["emit_reason"] == "interval"
+
+
+def test_roi_emit_reason_does_not_overwrite_caller_debug() -> None:
+    """If the caller passes extra debug fields (frame_num,
+    raw_roi_counts, …), the adapter merges them with ``emit_reason``;
+    neither side drops the other's keys."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
+    )
+    events = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1},
+        occurred_at=_now(),
+        debug={"frame_num": 42, "geometry_source": "probe_default"},
+    )
+    body = events[0].to_payload()
+    assert body["debug"]["emit_reason"] == "first"
+    assert body["debug"]["frame_num"] == 42
+    assert body["debug"]["geometry_source"] == "probe_default"
 
 
 def test_roi_idempotency_key_increments_per_emit() -> None:

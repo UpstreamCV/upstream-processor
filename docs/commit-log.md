@@ -4,6 +4,126 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P4-C: ROI Occupancy Observation Write Path
+
+### Summary
+Closes P4-B's deferred item: the DeepStream analytics worker now also
+emits ``processor.roi_occupancy`` observations to the api-server's
+``observations`` table. Emit policy is **first-seen + on-change +
+30-second interval heartbeat** — never per-frame. The P4-B
+line-crossing path is unchanged and runs in parallel; the worker's
+two emit helpers operate independently and the status payload
+exposes both counters. Coordinated with the api-server commit
+``feat: allow processor ROI occupancy observations`` which widens
+the ``ProcessorObservationType`` Literal in lock-step. No DB
+migration.
+
+### What changed (api-server side, separate repo)
+- ``src/upstream_api/schemas/processor.py`` — Literal widened
+  with ``"processor.roi_occupancy"``.
+- ``tests/test_processor.py`` — new
+  ``test_observation_roi_occupancy_accepted``; existing
+  ``test_observation_line_crossing_accepted`` +
+  ``test_observation_invalid_type_rejected`` are unchanged.
+
+### What changed (this repo)
+- ``app/observations/schemas.py`` — ``ObservationType`` Literal +
+  ``OBSERVATION_TYPES`` tuple gain ``"processor.roi_occupancy"``.
+- ``app/observations/observation_taxonomy.py`` — flips the
+  ``processor.roi_occupancy`` row from ``deferred`` to
+  ``api_supported``.
+- ``app/observations/observation_adapter.py`` —
+  ``RoiOccupancyState._should_emit`` (was ``bool``) becomes
+  ``_classify_emit`` returning ``str | None`` (the emit reason or
+  None). ``absorb_roi_counts`` merges
+  ``{"emit_reason": <reason>}`` into the event's ``debug`` dict
+  so consumers can tell first / change / interval apart without
+  re-deriving. ``RoiOccupancyEvent`` itself unchanged.
+- ``app/config.py`` — adds
+  ``deepstream_roi_min_interval_seconds: float = 30.0`` so
+  operators can tune the heartbeat cadence and tests can override
+  it via ``fast_settings``.
+- ``app/runtimes/deepstream_runtime/worker.py``:
+  - Imports ``RoiOccupancyState``.
+  - ``_drive_metadata_probe`` instantiates ``roi_state`` next to
+    ``line_state`` when ``analytics_mode + writer`` is true.
+  - Consumer loop calls a new ``_emit_roi_occupancies(...)``
+    immediately after the existing line-crossing emit.
+  - The new helper mirrors ``_emit_line_crossings`` exactly:
+    pulls ``frame.source["analytics"]["roi_counts"]``
+    defensively, coerces to ``dict[str, int]``, hands to
+    ``roi_state.absorb_roi_counts(...)``, emits one
+    ``processor.roi_occupancy`` observation per returned event.
+    Error handling identical: ``ApiSessionGoneError`` propagates,
+    ``ApiValidationError`` / ``TRANSIENT_API_ERRORS`` are logged
+    + counted + continue.
+  - ``_MetadataCounters`` gains
+    ``roi_occupancy_observations_emitted: int = 0``.
+  - ``_metadata_payload`` surfaces the new counter alongside
+    ``line_crossing_observations_emitted``.
+- ``tests/test_deepstream_roi_occupancy_emit.py`` (new, 18 tests).
+- ``tests/test_observation_adapter_contract.py`` — six existing
+  ROI tests gain ``emit_reason`` assertions; two new tests pin
+  ``debug.emit_reason`` location + non-overwrite of caller debug;
+  the P4-B ``test_roi_occupancy_still_not_in_server_whitelist``
+  guard is replaced by
+  ``test_roi_occupancy_now_in_server_whitelist`` +
+  ``test_zone_dwell_track_types_still_unsupported`` (regression
+  on the next-deferred types).
+- ``tests/test_observation_taxonomy.py`` — new
+  ``test_roi_occupancy_is_now_api_supported``.
+- ``tests/test_deepstream_line_crossing_emit.py`` — P4-B's
+  ``test_roi_occupancy_still_unsupported_by_writer`` flips;
+  ``test_no_roi_occupancy_writes_in_p4b`` is renamed to
+  ``test_line_crossing_unchanged_by_p4c`` and asserts the line
+  emit count is unaffected.
+
+### Idempotency / dedupe
+- Same model as P4-B: client-side
+  ``RoiOccupancyState.sequence_by_roi`` + bounded internal
+  watermarks. Deterministic key
+  ``sess:<session_id>:processor.roi_occupancy:<roi_id>:<sequence>``
+  embedded in ``payload.idempotency_key``.
+- Sequence increments per emit (NOT per frame); 50 frames of an
+  unchanged ROI still produce only 1 emit + idempotency key
+  ending ``:1``.
+
+### Status payload addition (analytics + writer)
+```
+"observations_enabled": true,
+"observations_emitted_count": <int>,
+"line_crossing_observations_emitted": <int>,
+"roi_occupancy_observations_emitted": <int>,
+"observation_write_errors_count": <int>,
+"last_observation_at": "<iso8601>" | null
+```
+
+The two type-specific counters track independently so an operator
+can tell line- vs ROI-throughput apart from one status row.
+
+### Out of scope (next milestones)
+- ``processor.zone_entered`` / ``zone_exited`` /
+  ``dwell_exceeded`` (need a new ``ZoneMembershipState`` that
+  diffs per-track ROI membership across frames).
+- Per-class ROI breakdown (probe-side change to aggregate
+  per-object ``roiStatus`` lists).
+- Server-side ``idempotency_key`` column + UNIQUE constraint.
+- Dashboard-driven ROI geometry — still hand-authored in
+  ``build_analytics_config``.
+- Direction / track-update / telemetry types.
+
+### Tests
+- This repo: **252 passing** (230 prior + 22 net new: 18 ROI emit
+  + 2 emit_reason + 1 roi-api-supported + 1 zone/dwell guard).
+  ruff + ruff-format + ``mypy app`` clean.
+- api-server: **254 passing** (253 prior + 1 new). ruff +
+  ruff-format + ``mypy src`` clean.
+- Live verification on crowdcountS2 is an operator step in
+  ``docs/local-dev.md`` — depends on the api-server change being
+  deployed first.
+
+---
+
 ## 2026-05-20 - P4-B: Line-Crossing Observation Write Path
 
 ### Summary

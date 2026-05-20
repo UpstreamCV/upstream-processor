@@ -336,7 +336,8 @@ class RoiOccupancyState:
         events: list[RoiOccupancyEvent] = []
         for roi_id, total in roi_counts.items():
             class_counts = (class_counts_by_roi or {}).get(roi_id, {})
-            if not self._should_emit(roi_id, total, class_counts, occurred_at):
+            reason = self._classify_emit(roi_id, total, class_counts, occurred_at)
+            if reason is None:
                 continue
             seq = self.sequence_by_roi.get(roi_id, 0) + 1
             self.sequence_by_roi[roi_id] = seq
@@ -350,6 +351,12 @@ class RoiOccupancyState:
                 roi_id=roi_id,
                 sequence=seq,
             )
+            # P4-C: merge the emit reason into the event's debug dict so
+            # consumers can tell first / change / interval apart without
+            # re-deriving it. The caller's debug payload takes precedence
+            # if it sets ``emit_reason`` explicitly (no-op in practice;
+            # the worker never sets it).
+            merged_debug: dict[str, Any] = {"emit_reason": reason, **(debug or {})}
             events.append(
                 RoiOccupancyEvent(
                     type=CANDIDATE_ROI_OCCUPANCY_TYPE,
@@ -362,37 +369,42 @@ class RoiOccupancyState:
                     sequence=seq,
                     idempotency_key=key,
                     source=dict(source or {}),
-                    debug=dict(debug or {}),
+                    debug=merged_debug,
                 )
             )
         return events
 
-    def _should_emit(
+    def _classify_emit(
         self,
         roi_id: str,
         total: int,
         class_counts: dict[str, int],
         occurred_at: datetime,
-    ) -> bool:
+    ) -> str | None:
+        """Decide whether to emit for this ROI, and why.
+
+        Returns one of ``"first"`` / ``"change"`` / ``"interval"`` to
+        emit (the value rides in the event's ``debug.emit_reason`` so
+        operators can tell heartbeats from state changes at a glance),
+        or ``None`` to skip."""
         last = self.last_counts_by_roi.get(roi_id)
         snapshot: dict[str, int] = {
             "__total": int(total),
             **{str(k): int(v) for k, v in class_counts.items()},
         }
-        changed = last != snapshot
         if last is None:
             # First observation of this ROI in this state — always emit so
             # consumers know it exists.
-            return True
-        if self.emit_on_change and changed:
-            return True
+            return "first"
+        if self.emit_on_change and last != snapshot:
+            return "change"
         if self.min_interval_seconds is None:
-            return False
+            return None
         last_at = self.last_emit_at_by_roi.get(roi_id)
         if last_at is None:
-            return True
+            return "interval"
         elapsed = (occurred_at - last_at).total_seconds()
-        return elapsed >= float(self.min_interval_seconds)
+        return "interval" if elapsed >= float(self.min_interval_seconds) else None
 
 
 # --- ergonomic helper --------------------------------------------------

@@ -57,10 +57,13 @@ def test_line_crossing_now_in_observation_types_tuple() -> None:
     assert CANDIDATE_LINE_CROSSING_TYPE in OBSERVATION_TYPES
 
 
-def test_roi_occupancy_still_unsupported_by_writer() -> None:
-    """P4-B widens exactly one type. ROI occupancy is the P4-C
-    candidate; the writer's whitelist must NOT have moved."""
-    assert "processor.roi_occupancy" not in OBSERVATION_TYPES
+def test_roi_occupancy_now_supported_by_writer() -> None:
+    """P4-C widened the whitelist with ``processor.roi_occupancy``
+    (the ROI emit path lives in tests/test_deepstream_roi_occupancy_emit.py).
+    This is the line-crossing-test-file regression that the writer
+    accepts both types — line crossing keeps working, ROI is now also
+    legal."""
+    assert "processor.roi_occupancy" in OBSERVATION_TYPES
 
 
 # --- shared fixtures ---------------------------------------------------
@@ -280,10 +283,14 @@ async def test_payload_is_runtime_neutral_at_top_level(fast_settings) -> None:  
     assert body["debug"]["geometry_source"] == "probe_default"
 
 
-async def test_no_roi_occupancy_writes_in_p4b(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    """P4-B explicitly defers ROI occupancy. Even when the producer
-    emits frame-level ``roi_counts``, the worker must NOT post any
-    ROI observations — only line crossings."""
+async def test_line_crossing_unchanged_by_p4c(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """P4-C added a parallel ROI write path. The line-crossing path
+    must still emit independently — this test asserts that a frame
+    carrying BOTH a line-crossing increment AND a non-zero ROI count
+    still produces exactly one line-crossing observation (plus,
+    incidentally, ROI observations, but that's the other test
+    file's territory). Defends against an accidental rewrite of
+    ``_emit_line_crossings`` during P4-C work."""
     api = FakeApi()
     pm = FakeMetadataPM(
         [
@@ -297,18 +304,17 @@ async def test_no_roi_occupancy_writes_in_p4b(fast_settings) -> None:  # type: i
                 line_crossing_cumulative={"entry-line": 1},
                 roi_counts={"entry-roi": 1},
             ),
-            _frame_line(
-                frame_num=2,
-                roi_counts={"entry-roi": 2},
-            ),
         ],
         exit_code=124,
     )
     w = _analytics_worker(api, fast_settings, pm)
     await asyncio.wait_for(w.run(), timeout=3)
-    obs_types = {o.type for o in api.observations}
-    assert "processor.line_crossing" in obs_types
-    assert "processor.roi_occupancy" not in obs_types
+    obs_types = [o.type for o in api.observations]
+    # Exactly one line-crossing event (0 -> 1).
+    assert obs_types.count("processor.line_crossing") == 1
+    # ROI also emits in P4-C (two: first-seen at 0, then change to 1).
+    # Number is not the point of this test (covered in the ROI test
+    # file); just assert the line-crossing count is unchanged.
 
 
 # --- mode gating -------------------------------------------------------
