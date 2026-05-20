@@ -4,6 +4,135 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P3: Tracker Metadata Probe
+
+### Summary
+Splices `nvtracker` (NvTracker low-level IOU) into the pyds metadata
+pipeline so `NvDsObjectMeta.object_id` becomes a real stable tracker id
+across frames. New package `deepstream.tracker_probe.v0` selects the new
+mode in `DeepStreamWorker` (most-specific-wins ordering:
+tracker > metadata > inference > decode). Same supervisor, same pyds
+container image, same SIGINT-driven shutdown — only the GStreamer
+pipeline, the in-container CLI, and the status payload gain a small
+surface. **No observations.** No metadata adapter, no nvdsanalytics, no
+line crossing / zones, no API contract change.
+
+### What changed
+- `app/packages/package_registry.json` — new
+  `deepstream.tracker_probe.v0` (`supports.tracker_probe: true`),
+  separate from the four existing packages so operators can compare
+  `metadata_probe` (detection metadata, no tracker) vs `tracker_probe`
+  (detection metadata + stable tracker IDs) side by side.
+- `app/config.py` — five new env-overridable knobs:
+  `deepstream_tracker_lib_path`,
+  `deepstream_tracker_algorithm` (`iou` for v0),
+  `deepstream_tracker_width` (960), `deepstream_tracker_height` (544),
+  `deepstream_tracker_ids_sample_limit` (10).
+- `app/runtimes/deepstream_runtime/inference.py` — pure
+  `build_tracker_config(algorithm="iou")` helper: returns a
+  `%YAML:1.0` low-level config modelled on the DS 8.0 sample
+  `config_tracker_IOU.yml` (BaseConfig / TargetManagement /
+  TrajectoryManagement / DataAssociator). Unknown algorithms are
+  rejected up front with a clear `ValueError`.
+- `app/runtimes/deepstream_runtime/metadata_probe.py` — pure
+  `build_metadata_docker_command` accepts `tracker_enabled` +
+  `tracker_lib_path` / `tracker_width` / `tracker_height`; when set,
+  the inner `bash -lc` grows
+  `--tracker-config-path <wd>/tracker_config.yml --tracker-lib-path ...
+  --tracker-width N --tracker-height N`. The
+  `DeepStreamMetadataProcessManager` gained the same fields, writes
+  `tracker_config.yml` into the per-run temp dir alongside `pgie.txt` +
+  `pyds_metadata_app.py`, and flips the container name prefix from
+  `upstream-dsm-` to `upstream-dst-` for tracker runs so the two modes
+  are distinguishable in `docker ps`. Shutdown hardening (P2 cleanup)
+  applies unchanged.
+- `app/runtimes/deepstream_runtime/pyds_metadata_app.py` — optional
+  `nvtracker` element spliced between `nvinfer` and `nvvideoconvert`
+  when `--tracker-config-path` is set; the pad probe attaches to the
+  **tracker src pad** in that case (so `NvDsObjectMeta.object_id` is
+  populated). New CLI args: `--tracker-config-path`,
+  `--tracker-lib-path`, `--tracker-width`, `--tracker-height`. Same
+  near-zero-work probe (no HTTP, no async, no `ObservationWriter`).
+- `app/runtimes/deepstream_runtime/worker.py` — new
+  `_TRACKER_MODE = "tracker_probe"` and mode ordering
+  `tracker > metadata > inference > decode`. The default PM factory
+  for tracker mode passes the tracker knobs through. `_MetadataCounters`
+  gained `unique_tracker_ids: set[str]` and a FIFO-bounded
+  `tracker_ids_sample` (cap from settings). `_metadata_payload` adds
+  `tracker_enabled`, `tracker_algorithm`, `unique_tracker_ids_count`,
+  `tracker_ids_sample` in tracker mode; metadata-probe mode is
+  unchanged (no tracker fields), so operators can tell the two modes
+  apart from the status row alone.
+- `tests/test_package_resolver.py` — new resolver case for
+  `deepstream.tracker_probe.v0`.
+- `tests/test_deepstream_tracker_probe.py` — 13 new tests covering:
+  package resolution, mode dispatch
+  (tracker > metadata > inference > decode), `build_tracker_config`
+  shape + unknown-algorithm rejection, the docker command builder with
+  and without tracker args, the real PM's `tracker_config.yml` write +
+  cleanup + container-name prefix flip + pre-flight algorithm
+  validation, the full `tracker_probe` lifecycle with tracker_ids
+  `"101", "101", "102"` → `unique_tracker_ids_count = 2` and bounded
+  sample `["101", "102"]`, bounded sample under 6 unique IDs, and a
+  regression that `metadata_probe` mode does NOT add tracker fields.
+  No Docker / GPU / pyds / gi.
+- `.env.example`, `docs/architecture.md`, `docs/local-dev.md`,
+  `app/runtimes/deepstream_runtime/README.md` — document the new
+  package, knobs, payload shape, and live-verification checklist.
+
+### Tracker choice (and what we rejected)
+NvTracker low-level **IOU** is the v0 default:
+
+- No ReID model required (NvDCF / NvSORT / NvDeepSORT all need one);
+  zero extra files beyond what `libnvds_nvmultiobjecttracker.so` already
+  bundles.
+- Sufficient to prove the stable-ID path under a fixed-camera person
+  stream (the P3 live run confirmed: `tracker_id "2"` persisted across
+  1155 consecutive frames, `"5"` × 725, `"0"` × 370 — clearly real
+  association, not new IDs per frame).
+- We write our own `tracker_config.yml` (a small `%YAML:1.0` body in
+  `build_tracker_config`) into the per-run temp dir rather than
+  referencing the in-container sample path, so the runtime is
+  self-contained and tunables live in this repo.
+
+NvDCF / NvSORT / NvDeepSORT are explicitly NOT supported in v0 — the
+algorithm enum rejects them with a clear error so a typo doesn't load a
+config that needs a ReID model we haven't shipped.
+
+### Live verification
+Run on crowdcountS2 (RTX 5070 Ti, Blackwell sm_120) against a real
+validated upstream-agent stream:
+
+- Package override active for the session
+  (`forced=deepstream.tracker_probe.v0`).
+- Worker log: `mode=tracker_probe`, `model=trafficcamnet tracker=on`.
+- pyds container starts as `upstream-dst-2049fb2fac99` (tracker prefix).
+- In-container log: `[NvMultiObjectTracker] Initialized` (IOU config
+  loaded from `tracker_config.yml`).
+- Bounded probe cycle (180s): **2128** frames seen, **2010** with
+  detections, labels = `person × 2201, car × 1`, **7** unique tracker
+  ids (`"0".."6"`).
+- `tracker_id` stability across consecutive frames: `"2"` × 1155
+  frames, `"5"` × 725, `"0"` × 370, `"6"` × 210, `"4"` × 106, `"3"` × 3,
+  `"1"` × 1 (a tracker that wasn't doing real work would assign a new
+  id per frame — every count would be 1).
+- Status posts `starting → attached → processing → stopped`. Final
+  status: `clean shutdown` at 10:19:13.
+- Zero observations posted.
+- Zero leftover containers (`docker ps --filter name=upstream-dst-`),
+  zero leftover `/tmp/upstream-p3-tracker.*` dirs, secret file 600,
+  no raw RTSP / session id / Authorization / Bearer / srt:// in logs.
+
+### Out of scope (next milestones)
+- `ObservationWriter` integration + `POST /observations` (P4).
+- Final metadata adapter (P4).
+- `nvdsanalytics`, line crossing, zones (P3.5 if event semantics are
+  needed before observations).
+- Dashboard overlay.
+- NvDCF / NvSORT / NvDeepSORT tuning (future tracker-config work).
+
+---
+
 ## 2026-05-19 - P2 cleanup: metadata worker shutdown hardening
 
 ### Summary

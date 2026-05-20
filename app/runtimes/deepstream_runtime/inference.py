@@ -142,6 +142,53 @@ def build_app_config(
     )
 
 
+# --- P3 tracker-probe builders -----------------------------------------
+
+# v0 supports only the no-ReID IOU tracker (simplest stable-id proof; no
+# model file beyond what's bundled in libnvds_nvmultiobjecttracker.so).
+_KNOWN_TRACKER_ALGORITHMS = {"iou"}
+
+
+def build_tracker_config(algorithm: str = "iou") -> str:
+    """Low-level tracker YAML config for ``nvtracker``.
+
+    The DS 8.0 sample IOU config (``config_tracker_IOU.yml``) is the upstream
+    template; we ship our own minimal copy so the worker is self-contained
+    and tunables live in this repo. Required by ``nvtracker`` via the
+    ``ll-config-file`` property. Pure / side-effect free."""
+    algo = algorithm.strip().lower()
+    if algo not in _KNOWN_TRACKER_ALGORITHMS:
+        raise ValueError(
+            f"unknown deepstream tracker algorithm {algorithm!r}; "
+            f"v0 supports: {sorted(_KNOWN_TRACKER_ALGORITHMS)}"
+        )
+    # DS 8.0 nvtracker parses %YAML:1.0 (note the colon, not a space) — keep
+    # the prefix exactly. Sections / keys mirror the SDK sample.
+    return (
+        "%YAML:1.0\n"
+        "BaseConfig:\n"
+        "  minDetectorConfidence: 0\n"
+        "TargetManagement:\n"
+        "  preserveStreamUpdateOrder: 0\n"
+        "  maxTargetsPerStream: 150\n"
+        "  minIouDiff4NewTarget: 0.5\n"
+        "  probationAge: 4\n"
+        "  maxShadowTrackingAge: 38\n"
+        "  earlyTerminationAge: 1\n"
+        "TrajectoryManagement:\n"
+        "  useUniqueID: 0\n"
+        "DataAssociator:\n"
+        "  dataAssociatorType: 0\n"
+        "  associationMatcherType: 0\n"
+        "  checkClassMatch: 1\n"
+        "  minMatchingScore4Overall: 0.0\n"
+        "  minMatchingScore4SizeSimilarity: 0.0\n"
+        "  minMatchingScore4Iou: 0.0\n"
+        "  matchingScoreWeight4SizeSimilarity: 0.4\n"
+        "  matchingScoreWeight4Iou: 0.6\n"
+    )
+
+
 def build_inference_docker_command(
     *,
     work_dir: str,
