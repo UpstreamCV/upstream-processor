@@ -156,3 +156,67 @@ This is **not** the MetadataSource and **not** the metadata adapter — those
 land in the next milestones. KITTI/log output here is debug evidence only.
 Still **no observations, no pyds in `app/`, no pad probes in `app/`, no
 nvtracker, no nvdsanalytics, no Triton, no dashboard, no API change**.
+
+## P2 — `MetadataSource` Protocol + bounded bridge queue (`app/`)
+
+Promotes the **neutral metadata shape** the manual probe proved into typed
+``app/`` abstractions, so a future supervisor-managed pyds worker can
+produce structured metadata into a thread-safe queue and an asyncio
+consumer can drain it — without leaking pyds / Gst / DeepStream C structs
+into ``app/``, and without writing any observations yet.
+
+- **`app/observations/metadata_models.py`** — pydantic v2 models, all
+  ``extra="forbid"``:
+  - ``BoundingBoxPixels``, ``BoundingBoxNormalized``
+  - ``NeutralObjectMetadata`` — ``class_id`` / ``label?`` / ``confidence?``
+    / ``bbox_pixels?`` / ``bbox_normalized?`` / ``tracker_id?: str``.
+    ``tracker_id`` is ``str`` to stay JSON-safe across uint64 (JS
+    `Number.MAX_SAFE_INTEGER`).
+  - ``NeutralFrame`` — ``frame_num`` (NonNegativeInt) / ``width`` /
+    ``height`` / optional ``timestamp``.
+  - ``NeutralFrameMetadata`` — ``runtime`` / ``metadata_source`` /
+    optional ``stream_session_id`` / ``frame`` / ``objects[]`` /
+    ``source`` + ``debug`` dicts (DeepStream-specific extras stay here,
+    NOT as first-class fields, to keep the consumer side runtime-neutral).
+  - Helpers: ``bbox_normalized_from_pixels(...)`` (same rounding as the
+    probe) and ``tracker_id_from_pyds(raw_uint64)`` (maps
+    ``UNTRACKED_OBJECT_ID`` → ``None``, else ``str(raw)``).
+  These models accept the EXACT dict the manual probe emitted live — that
+  is asserted by ``tests/test_metadata_models.py::test_parses_real_probe_sample``.
+  They are **NOT** ``ObservationPayload`` (the final UpStream observation
+  schema lives in ``app/observations/schemas.py`` and is a P4 concern).
+
+- **`app/observations/bridge_queue.py`** — ``BoundedBridgeQueue`` +
+  ``DropPolicy`` (``DROP_NEWEST`` / ``DROP_OLDEST``) +
+  ``BridgeQueueStats``. Producer side is **non-blocking and thread-safe**
+  (``put_from_thread`` returns ``bool``); consumer side is awaitable
+  (``await q.get()`` returns the next ``NeutralFrameMetadata`` or
+  ``None`` when closed + drained). Implementation: an internal
+  ``queue.Queue`` (unbounded slot; we gate ``maxsize`` ourselves under a
+  ``threading.Lock`` so ``DROP_OLDEST`` can evict atomically) and
+  ``asyncio.to_thread`` for the async ``get`` path. A sentinel pushed on
+  ``close()`` unblocks any waiting consumer. Designed for **a single
+  async consumer** (the future supervisor worker); multi-consumer fan-out
+  is out of scope.
+
+- **`app/runtimes/metadata_source.py`** — ``MetadataSource`` Protocol
+  (``__aiter__ -> AsyncIterator[NeutralFrameMetadata]``,
+  ``@runtime_checkable``) + ``BridgeQueueMetadataSource``, the canonical
+  implementation that wraps a ``BoundedBridgeQueue``. Pyds/Gst/DeepStream
+  objects must not leak through this seam.
+
+Coverage: ``tests/test_metadata_models.py``,
+``tests/test_bridge_queue.py``, ``tests/test_metadata_source.py`` exercise
+construction, JSON round-trip, ``extra="forbid"`` at every level, both
+drop policies, close ordering, async-wakes-on-close, a real
+``threading.Thread`` producer + slow asyncio consumer with bounded
+memory + no deadlocks, and Protocol conformance. **No Docker, no GPU, no
+pyds/gi imports in tests.**
+
+Still **no `app/` runtime worker pyds integration, no pad probe in
+`app/`, no `ObservationWriter` integration, no `POST /observations`, no
+nvtracker, no nvdsanalytics, no line crossing / zones, no Triton, no
+dashboard, no API change**. The manual P2 probe in ``scripts/`` continues
+to be the standalone *runtime* proof; this milestone is purely the
+**`app/`-side seam** the next milestone (supervisor-managed metadata
+probe worker) will build on top of.

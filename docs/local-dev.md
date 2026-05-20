@@ -158,6 +158,22 @@ redacted form.
 counts here are debug evidence only. No observations, no pyds in `app/`,
 no tracking, no nvtracker, no nvdsanalytics, no Triton.
 
+## P2 — `MetadataSource` Protocol + bounded bridge queue (no live run)
+
+Pure code, no GPU/Docker, no live stream needed. The neutral shape the
+manual probe emits is now typed pydantic in
+`app/observations/metadata_models.py`
+(``NeutralFrameMetadata`` / ``NeutralFrame`` / ``NeutralObjectMetadata``
+/ ``BoundingBoxPixels`` / ``BoundingBoxNormalized``), with a thread-safe
+``BoundedBridgeQueue`` (``app/observations/bridge_queue.py``) and a
+runtime-checkable ``MetadataSource`` Protocol + ``BridgeQueueMetadataSource``
+(``app/runtimes/metadata_source.py``). Tests:
+``tests/test_metadata_models.py`` / ``tests/test_bridge_queue.py`` /
+``tests/test_metadata_source.py``. Run as part of ``make check`` —
+**no GPU host, no Docker, no live stream required.** See
+``docs/architecture.md`` for the design rationale (queue choice, drop
+policies, single-consumer scope).
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.
