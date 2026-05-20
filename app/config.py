@@ -140,6 +140,16 @@ class Settings(BaseSettings):
     # observed) surfaced in the status payload. Keep small.
     deepstream_analytics_labels_sample_limit: int = 20
 
+    # --- P4-C ROI occupancy emission policy --------------------------
+    # ROI counts arrive at frame rate (~30 fps) but we never want
+    # per-frame writes. The emit policy is on-first + on-change +
+    # interval-elapsed. ``min_interval_seconds`` is the heartbeat
+    # cadence when the count is unchanged (default 30s; lower for
+    # tests via ``fast_settings``, raise in production if status pings
+    # are noisy). Setting to 0 makes every unchanged frame emit — only
+    # safe for fakes/tests.
+    deepstream_roi_min_interval_seconds: float = 30.0
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

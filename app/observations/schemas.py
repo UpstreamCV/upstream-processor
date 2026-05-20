@@ -31,6 +31,8 @@ ObservationType = Literal[
     # ``upstream-api-server``'s ``ProcessorObservationType`` (any drift
     # 422s the write at the server's pydantic layer).
     "processor.line_crossing",
+    # P4-C: ROI occupancy snapshot (on-change OR interval, never per-frame).
+    "processor.roi_occupancy",
 ]
 
 OBSERVATION_TYPES: tuple[ObservationType, ...] = (
@@ -38,6 +40,7 @@ OBSERVATION_TYPES: tuple[ObservationType, ...] = (
     "processor.mock_heartbeat",
     "processor.mock_detection",
     "processor.line_crossing",
+    "processor.roi_occupancy",
 )
 
 

@@ -204,7 +204,11 @@ INITIAL_TAXONOMY: tuple[ObservationSpec, ...] = (
     ObservationSpec(
         type="processor.roi_occupancy",
         category="state",
-        status="deferred",
+        # P4-C widened the api-server ``ProcessorObservationType`` Literal
+        # AND this repo's ``OBSERVATION_TYPES`` in lock-step. The
+        # invariant test ``test_no_processor_type_is_already_in_observation_types``
+        # would have fired if either side moved without the other.
+        status="api_supported",
         description=(
             "Snapshot of how many tracked objects are currently inside "
             "an ROI, broken down by class. Emitted on change AND "

@@ -118,15 +118,24 @@ Files:
     `DeepStreamMetadataProcessManager.stop()` and `_cleanup_work_dir()`
     are idempotent.
 
-**P4-B widens this:** the `analytics_probe` mode now emits
-`processor.line_crossing` observations (one per
-`objLCCumCnt` increment) via the existing `ObservationWriter`. The
-``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
-``tracker_probe`` modes are still observation-free. The pyds
-container still does not call the UpStream API; the adapter +
+**P4-B and P4-C widen this:** the `analytics_probe` mode now
+emits **two** real DeepStream-backed observation types via the
+existing `ObservationWriter`:
+
+- `processor.line_crossing` (P4-B) — one per `objLCCumCnt`
+  increment. Event-style; no policy gating needed.
+- `processor.roi_occupancy` (P4-C) — emits on first-seen, on
+  count change, and on a 30 s heartbeat interval (env-overridable
+  via `UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`). **Never
+  per-frame.** ``payload["debug"]["emit_reason"]`` records which
+  policy branch fired.
+
+The ``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
+``tracker_probe`` modes remain observation-free. The pyds
+container still does not call the UpStream API; the adapters +
 writer run in the host asyncio consumer loop. Everything else is
-still probe: **no ROI occupancy / zone events / dwell / direction
-write paths yet, no rules/events, no dashboard-driven geometry, no
+still deferred: **no zone enter/exit / dwell / direction
+events yet, no rules/events, no dashboard-driven geometry, no
 Triton.** KITTI / `UPSTREAM_METADATA` output is debug evidence —
 *not* final metadata extraction. The webhook secret never enters the pyds container
 (the in-container app never calls UpStream APIs; status posting stays

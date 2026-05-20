@@ -571,6 +571,113 @@ rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
 rm -rf /tmp/upstream-live-p4b
 ```
 
+## Live verification checklist (P4-C — ROI occupancy observation writes)
+
+Same launch pattern as P4-B, plus the api-server's
+``processor.roi_occupancy`` Literal widening must be **deployed**
+(commit ``85a83b1`` or later in upstream-api-server). With both
+ends matched, an operator entering / leaving the configured central
+ROI produces ``processor.roi_occupancy`` rows in the
+``observations`` table — first-seen on cycle start, change on
+enter/exit, and a heartbeat at the 30 s interval if the count is
+unchanged. The P4-B line-crossing path runs unchanged in parallel.
+
+### Launch
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p4c
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p4c/secret.env
+chmod 600 /tmp/upstream-live-p4c/secret.env
+
+# rsync the repo into /tmp/upstream-live-p4c/repo and build a venv
+# (same recipe as P4-B).
+
+cd /tmp/upstream-live-p4c/repo
+set -a; . /tmp/upstream-live-p4c/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p4c_roi_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p4c/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p4c/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p4c/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p4c/processor.pid
+```
+
+### Operator script
+
+1. Start the processor with the stream up.
+2. **Stay outside the ROI** briefly (lets us see the first-seen
+   emit with ``total_count=0``).
+3. **Step into the central ROI** (20–80% width × 10–90% height of
+   the frame). Stay 5–10 s — a change-emit fires when the count
+   transitions to ≥1; subsequent frames inside the ROI do NOT
+   produce additional emits.
+4. **Step out** of the ROI; stay 5–10 s — a second change-emit
+   fires when the count returns to 0.
+5. **Stand still inside the ROI for ≥35 s** — a heartbeat emit
+   fires at the 30 s mark.
+6. SIGINT the processor.
+
+Expected: ≥3 ROI observations posted, all 200 OK; if you also
+crossed the midline, some ``processor.line_crossing`` rows too;
+zero 422s.
+
+### Lifecycle checklist
+
+```
+[ ] api-server is deployed with processor.roi_occupancy in the Literal
+[ ] Start a valid upstream-agent stream
+[ ] Wait for validation_status=true; eligible-sessions returns 1 row
+[ ] Worker starts (log: "deepstream worker ... mode=analytics_probe")
+[ ] pyds container `upstream-dsa-*` starts; engine builds (~30 s cold)
+[ ] First UPSTREAM_METADATA= frame with non-empty source.analytics.roi_counts
+[ ] First processor.roi_occupancy POST → 200 OK
+    (idempotency_key ends :entry-roi:1, debug.emit_reason=first)
+[ ] Operator steps into ROI; processor.roi_occupancy POST → 200 OK
+    (debug.emit_reason=change, total_count>=1)
+[ ] Operator steps out of ROI; processor.roi_occupancy POST → 200 OK
+    (debug.emit_reason=change, total_count=0)
+[ ] Operator stays still ≥35 s; heartbeat POST → 200 OK
+    (debug.emit_reason=interval)
+[ ] Steady scene between change-emits emits zero ROI observations
+[ ] Status payload carries
+    observations_enabled=true,
+    roi_occupancy_observations_emitted >= 3,
+    line_crossing_observations_emitted (independent count),
+    observation_write_errors_count == 0,
+    last_observation_at non-null
+[ ] processor_statuses row: runtime=deepstream,
+    package_id=deepstream.analytics_probe.v0
+[ ] observations table query:
+       select type, payload->>'idempotency_key',
+              payload->'debug'->>'emit_reason', observed_at
+       from observations
+       where processor_id = 'proc_p4c_roi_live'
+       order by created_at desc;
+    Returns >=3 rows of type=processor.roi_occupancy with distinct
+    idempotency_keys :entry-roi:1, :entry-roi:2, :entry-roi:3, …
+[ ] SIGINT to the real PID; processor exits within ~25 s
+[ ] pyds container stops cleanly
+[ ] Status posts `stopped`
+[ ] No raw RTSP URL, stream key, secret, Authorization or Bearer in logs
+[ ] Temp work dir cleaned (no /tmp/upstream-p35-analytics.* leftovers)
+```
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dsa|upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p4c
+```
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.
