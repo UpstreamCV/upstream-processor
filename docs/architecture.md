@@ -747,3 +747,207 @@ GPU / pyds / api-server) exercises:
 5. Defer ``processor.roi_occupancy`` to P4-C — the adapter state is
    ready, but production observability burden + class-count surface
    need a separate design pass.
+
+## P4-A.5 — Observation Taxonomy + Emission Policy
+
+Locks in **which** observation types UpStream will support, in **what
+order**, and under **what emission policy** — before any api-server
+widening or worker wiring happens. Lives as a typed table in
+``app/observations/observation_taxonomy.py``; ``docs/architecture.md``
+links to it but does not duplicate the data. The whole reason this
+milestone exists is to prevent observation naming from becoming a
+one-off as more types are added.
+
+### Three emission-policy categories
+Every ``processor.*`` type maps to exactly one of:
+
+- **event** — one-shot, fires on a discrete signal (line crossed,
+  zone entered, dwell threshold exceeded). Idempotency key encodes
+  WHICH event so two crossings produce two distinct keys.
+  No sampling, no rate-limiting — a missed event is a correctness
+  bug. ``LineCrossingState`` is the canonical implementation.
+- **state** — snapshot of a continuous quantity (count of objects
+  in an ROI, queue length, per-track lifecycle phase). Emit on
+  change OR after ``min_interval_seconds``. **Never** every frame.
+  ``RoiOccupancyState`` is the canonical implementation.
+- **telemetry** — high-volume diagnostic signal (per-track updates,
+  per-frame summaries, scene quality warnings). Always sampled.
+  Default off in production; opt-in via a config flag.
+
+The policy class is encoded as a ``Literal["event", "state",
+"telemetry"]`` on each ``ObservationSpec`` row so a careless future
+edit can't add an event without thinking about idempotency.
+
+### Initial type table
+Twelve types, all under the ``processor.*`` namespace
+(customer-facing names like ``person.crossed_line`` are a later
+adapter on top of these — out of scope here). Verbatim from
+``observation_taxonomy.py``:
+
+| Type | Category | Status | Notes |
+| --- | --- | --- | --- |
+| ``processor.line_crossing`` | event | **proposed_first_api_add** | P3.5-proven counter delta; no tracker needed |
+| ``processor.zone_entered`` | event | deferred | needs per-(track, zone) state |
+| ``processor.zone_exited`` | event | deferred | depends on ``zone_entered`` |
+| ``processor.dwell_exceeded`` | event | deferred | depends on both zone events |
+| ``processor.direction_detected`` | event | deferred | needs tracker + debounce |
+| ``processor.roi_occupancy`` | state | deferred | adapter state ready; volume policy needs live measurement |
+| ``processor.zone_occupancy`` | state | deferred | needs dashboard-driven geometry |
+| ``processor.queue_length`` | state | deferred | needs dashboard-driven geometry |
+| ``processor.track_state`` | state | deferred | per-track lifecycle |
+| ``processor.track_update`` | telemetry | deferred | per-track snapshots; sampled / debug-only |
+| ``processor.detection_seen`` | telemetry | deferred | per-class bucketed counts |
+| ``processor.frame_summary`` | telemetry | deferred | per-frame counter snapshot |
+| ``processor.scene_quality_warning`` | telemetry | deferred | probe-detected health signal |
+
+### First API addition (explicit decision)
+**Only ``processor.line_crossing`` widens the api-server
+``ProcessorObservationType`` ``Literal`` in P4-B.** Rationale:
+
+- P3.5 already proved the source signal works
+  (``objLCCumCnt`` ramped 0 → 1 → 2 on two live operator crossings).
+- Event category, so dedupe is straightforward (one event per
+  cumulative-count increment; no sampling decisions to make in flight).
+- Lowest volume of every proposed type — proves the write path
+  without flooding the ``observations`` table.
+- Does not require dashboard-driven geometry — P3.5's hand-authored
+  line is sufficient.
+
+ROI occupancy is **second**, in P4-C, after we have live measurements
+of how often the counter actually changes on a real camera (the
+per-frame ``objInROIcnt`` is updated continuously; emit volume
+depends on the scene). Zone events, dwell, and direction all need
+adapter state we haven't built; they sit in P4-C+. Telemetry types
+are opt-in and not on the critical path.
+
+### Payload + idempotency policy (one set of rules)
+Every type follows the same rules (encoded as taxonomy invariants
+in ``tests/test_observation_taxonomy.py``):
+
+1. **Top level is runtime-neutral.** No ``runtime`` / ``package_id``
+   / ``analytics_plugin`` / ``tracker_algorithm`` at the top of
+   ``payload``; those live under ``source``.
+2. **Universal keys.** Every payload carries ``idempotency_key``,
+   ``source``, ``debug`` (taxonomy ``payload_keys`` lists ONLY the
+   type-specific keys to keep rows skimmable).
+3. **Idempotency key shape:**
+   ``sess:<session_id>:<type>:<discriminator>``. The discriminator is
+   chosen per type so two distinct events of the same type get
+   distinct keys:
+   - line_crossing → ``<line_id>:<cumulative_count>``
+   - zone_entered → ``<zone_id>:<track_id>:<enter_sequence>``
+   - zone_exited → ``<zone_id>:<track_id>:<exit_sequence>``
+   - dwell_exceeded → ``<zone_id>:<track_id>:<dwell_session_id>:<threshold_seconds>``
+   - roi_occupancy → ``<roi_id>:<sequence>``
+   - track_state / track_update → ``<track_id>:<sequence|bucket_id>``
+   - frame_summary → ``<bucket_id>``
+4. **State idempotency keys MUST use a per-emit sequence or bucket
+   id, NEVER ``<frame_num>``.** Frame numbers explode under
+   continuous emission; sequences only advance when the adapter
+   actually emits.
+5. **Idempotency key lives in the body** (``payload.idempotency_key``)
+   until the api-server adds a first-class column. The pattern is
+   deterministic so a future server-side dedupe migration can
+   re-derive the key without coordinating with the processor.
+
+### Adapter state requirements (per stream, per worker)
+Implemented (P4-A):
+
+- ``LineCrossingState`` — ``last_cumulative_by_line``,
+  ``recently_emitted_keys``. Independent state per line. No event
+  for unchanged count. No event for counter rewind (watermark held).
+- ``RoiOccupancyState`` — ``last_counts_by_roi``,
+  ``last_emit_at_by_roi``, ``sequence_by_roi``. Emits on first
+  observation, on change, and on ``min_interval_seconds``; never
+  every frame.
+
+Designed but not yet implemented (deferred to P4-C+):
+
+- ``ZoneMembershipState`` — per-(track, zone) presence tracking.
+  Required for ``zone_entered`` / ``zone_exited``. Source is the
+  per-object ``NvDsAnalyticsObjInfo.roiStatus`` list, which P3.5
+  already surfaces under ``object.debug.analytics.roi_labels`` but
+  the worker does not yet diff between frames.
+- ``DwellState`` — ``active_zone_entries_by_tracker``,
+  ``emitted_thresholds_by_dwell_session``. Depends on
+  ``ZoneMembershipState`` for entry/exit events; cannot ship
+  standalone. Idempotency key includes a per-entry
+  ``dwell_session_id`` so re-entering the same zone after exit
+  starts a fresh threshold count.
+- ``TrackLifecycleState`` — per-tracker first-seen / last-seen
+  timestamps + emit sequence. For ``processor.track_state`` (state)
+  and ``processor.track_update`` (telemetry, sampled).
+- ``DirectionDebounceState`` — per-(track, direction-label) last-
+  emitted timestamp. Prevents a person walking back-and-forth from
+  flooding direction events.
+
+### Deferred types (explicit list)
+The taxonomy module's ``DEFERRED_TYPES`` tuple is the authoritative
+list. As of P4-A.5 it is: everything except
+``processor.line_crossing``. Each row in the taxonomy records why it
+is deferred and (where relevant) which other type(s) it depends on,
+so a future agent shipping zone events knows ``dwell_exceeded`` is
+trivially next.
+
+### What's deliberately NOT in P4-A.5
+- No widening of ``schemas.OBSERVATION_TYPES`` (still only the three
+  mock types; the taxonomy is allowed to describe types the server
+  doesn't accept yet).
+- No api-server PR.
+- No worker wiring; ``ObservationWriter`` still only flows mock
+  observations.
+- No live verification.
+- No customer-facing event names — those are an adapter on top of
+  ``processor.*``, a separate later milestone.
+
+### Coverage
+``tests/test_observation_taxonomy.py`` (24 tests, no Docker / GPU /
+pyds / api-server). Highlights:
+- Taxonomy non-empty, every type unique, every type under
+  ``processor.*``, every category / status value valid.
+- **Exactly one type** is marked ``proposed_first_api_add`` (the
+  load-bearing P4-A.5 decision) and that type is
+  ``processor.line_crossing``.
+- ``proposed_first_api_add`` and ``api_supported`` are mutually
+  exclusive.
+- ``api_supported`` rows must also be in
+  ``schemas.OBSERVATION_TYPES``; non-``api_supported`` rows must NOT
+  be. Keeps the local Literal whitelist and the taxonomy from
+  drifting.
+- Every ``CANDIDATE_*`` adapter constant has a matching taxonomy
+  row.
+- Every idempotency key pattern starts with
+  ``sess:<session_id>:processor.<thing>:``.
+- Every event-style key has a uniqueness token; no state key uses
+  ``<frame_num>``.
+- Zone-dependent types require zone geometry + tracker_id; dwell
+  has explicit ``dependencies`` on zone_entered / zone_exited.
+- ``ObservationSpec`` is frozen; ``payload_keys`` does NOT
+  redundantly include the universal ``idempotency_key`` / ``source``
+  / ``debug`` keys.
+
+### Next step (P4-B)
+
+**P4-B — Line-Crossing Observation Write Path** is the next
+milestone:
+
+1. Open the api-server PR adding ``processor.line_crossing`` to
+   ``ProcessorObservationType``. No DB migration. Existing tests
+   pass with the wider Literal.
+2. In lock-step, add ``processor.line_crossing`` to this repo's
+   ``schemas.ObservationType`` / ``OBSERVATION_TYPES``. Flip the
+   taxonomy row's ``status`` from ``proposed_first_api_add`` to
+   ``api_supported``; the taxonomy invariant test will then move
+   the type from the deferred list into the supported list.
+3. Thread ``ObservationWriter`` into ``DeepStreamWorker.__init__``
+   (mirroring ``MockWorker``). Update ``WorkerManager.build_worker``.
+4. In ``DeepStreamWorker._drive_metadata_probe`` analytics mode,
+   instantiate ``LineCrossingState`` once per worker; feed each
+   consumed frame's
+   ``frame.source.analytics.line_crossing_cumulative`` through it;
+   ``await self._writer.emit(...)`` for each returned event.
+5. Live-verify on crowdcountS2: operator crosses the line twice,
+   exactly 2 ``processor.line_crossing`` rows appear in the
+   ``observations`` table with deterministic ``idempotency_key``
+   values in ``payload``, zero rows on a steady scene.
+6. ROI occupancy stays deferred (P4-C).

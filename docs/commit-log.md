@@ -4,6 +4,94 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P4-A.5: Observation Taxonomy + Emission Policy
+
+### Summary
+Locks in which ``processor.*`` observation types UpStream will support,
+in what order, and under what emission policy — before any api-server
+widening or worker wiring happens. Adds a typed taxonomy table as the
+single source of truth and a strict invariant test suite that keeps
+the table, the P4-A adapter, and ``schemas.OBSERVATION_TYPES`` from
+drifting. Docs-and-data-only milestone; **no api-server change, no
+worker wiring, no production POST**.
+
+### What changed
+- `app/observations/observation_taxonomy.py` (new, ~270 lines):
+  - ``ObservationCategory`` Literal: ``event`` | ``state`` | ``telemetry``
+    (the three emission-policy classes).
+  - ``ObservationStatus`` Literal: ``api_supported`` |
+    ``proposed_first_api_add`` | ``deferred`` (drives the api-server
+    widening order).
+  - Frozen ``ObservationSpec`` dataclass with type / category / status
+    / description / payload_keys / idempotency_key_pattern /
+    source_signal + requirements flags + dependencies.
+  - ``INITIAL_TAXONOMY`` tuple — 13 ``processor.*`` types covering
+    line crossing (the first to ship), zone entered / exited /
+    dwell / direction, ROI / zone / queue occupancy, per-track
+    state / update, and telemetry-style frame summary / detection
+    seen / scene quality warning.
+  - Derived tuples ``API_SUPPORTED_TYPES``,
+    ``PROPOSED_FIRST_API_ADD_TYPES``, ``DEFERRED_TYPES`` so callers
+    don't need to filter the table.
+  - ``spec_for(type)`` and ``types_in_category(category)`` lookup
+    helpers.
+- `tests/test_observation_taxonomy.py` (new, 24 tests):
+  - Taxonomy non-empty, every type unique + ``processor.*`` namespace,
+    every category / status valid.
+  - **Exactly one** type marked ``proposed_first_api_add`` (the
+    load-bearing P4-A.5 decision) and it is
+    ``processor.line_crossing``.
+  - ``proposed_first_api_add`` and ``api_supported`` mutually
+    exclusive.
+  - Taxonomy ``api_supported`` flag must be in lock-step with
+    ``schemas.OBSERVATION_TYPES`` (drift fails the test).
+  - Both P4-A ``CANDIDATE_*`` adapter constants have matching
+    taxonomy rows.
+  - Every idempotency key pattern starts with
+    ``sess:<session_id>:processor.<thing>:`` and every event-style
+    key has a uniqueness token; state keys never use
+    ``<frame_num>``.
+  - Zone-dependent types require zone geometry + tracker_id;
+    ``dwell_exceeded`` has explicit ``dependencies`` on
+    ``zone_entered`` / ``zone_exited``.
+  - ``payload_keys`` does NOT redundantly include the universal
+    ``idempotency_key`` / ``source`` / ``debug``.
+  - ``ObservationSpec`` is frozen.
+- `docs/architecture.md`: adds the **P4-A.5 — Observation Taxonomy +
+  Emission Policy** section with the table, the first-API-addition
+  decision, payload + idempotency rules, adapter state requirements
+  (implemented + deferred), explicit deferred list, and the P4-B
+  next-step plan.
+- `docs/commit-log.md`: this entry.
+
+### Initial type table (status snapshot)
+- **proposed_first_api_add** (1): ``processor.line_crossing``
+- **deferred** (12): ``zone_entered``, ``zone_exited``,
+  ``dwell_exceeded``, ``direction_detected``, ``roi_occupancy``,
+  ``zone_occupancy``, ``queue_length``, ``track_state``,
+  ``track_update``, ``detection_seen``, ``frame_summary``,
+  ``scene_quality_warning``.
+- **api_supported** (0; the three ``processor.mock_*`` types in
+  ``schemas.OBSERVATION_TYPES`` live outside the
+  ``processor.<thing>`` taxonomy because they're test scaffolding).
+
+### Out of scope (next milestones)
+- ``processor.line_crossing`` API addition + worker wiring +
+  live-verify is **P4-B**.
+- ``processor.roi_occupancy`` API addition + adapter wiring is
+  **P4-C** (after we have live ROI volume measurements).
+- ``zone_entered`` / ``zone_exited`` / ``dwell_exceeded`` need a new
+  ``ZoneMembershipState`` adapter (per-(track, zone) presence diff).
+- Dashboard-driven ROI / line geometry is a separate later
+  milestone; P4-B uses P3.5's hand-authored line.
+
+### Tests
+- 214 passing (190 prior + 24 new taxonomy invariants). ruff +
+  ruff-format + ``mypy app`` clean. No Docker / GPU / pyds / API
+  network in tests.
+
+---
+
 ## 2026-05-20 - P4-A: Observation Adapter Contract Probe
 
 ### Summary
