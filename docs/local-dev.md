@@ -760,6 +760,92 @@ rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
 rm -rf /tmp/upstream-live-p4c-debounce
 ```
 
+## Live verification checklist (P4-D — zone entered / exited observations)
+
+P4-D adds ``processor.zone_entered`` and ``processor.zone_exited``.
+Two-repo coordination: the api-server widening (commit
+``11b81bd`` or later) must be **deployed** before the processor
+change ships — without it, every zone POST 422s. Per the brief,
+this is explicitly a smoke test, NOT a CV-accuracy test.
+
+### Launch
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p4d
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p4d/secret.env
+chmod 600 /tmp/upstream-live-p4d/secret.env
+
+cd /tmp/upstream-live-p4d/repo
+set -a; . /tmp/upstream-live-p4d/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p4d_zone_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES=5 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p4d/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p4d/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p4d/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p4d/processor.pid
+```
+
+### Operator script
+
+The central probe ROI is the rectangle 20–80% of frame width by
+10–90% of frame height. The operator can't see overlays during the
+live run, so keep movement simple and obvious:
+
+1. Start outside the ROI if possible. Stand still 5–10 s.
+2. Walk clearly into the center of the frame / ROI.
+3. Stand still inside ~5–10 s.
+4. Walk clearly out of the ROI.
+5. Stand still outside ~5–10 s.
+6. (Optional) Repeat once.
+7. SIGINT.
+
+### Expected
+
+- Ideally ~1 ``processor.zone_entered`` per stable inside
+  transition; ~1 ``processor.zone_exited`` per stable outside.
+- All POSTs **200 OK**; zero **422s**; zero non-2xx.
+- Short single-frame ROI label flaps do NOT produce false events.
+- Object disappearance does NOT produce zone_exited.
+- ``processor.line_crossing`` and ``processor.roi_occupancy``
+  observations still flow if crossings / count changes happen.
+- Clean shutdown; no leftover containers; no temp dirs; no
+  secrets / RTSP / Authorization / Bearer in run.log.
+
+### Accuracy classification rubric (operator-facing)
+
+Live results can look "wrong" for non-P4-D reasons. **Classify
+the issue before flagging P4-D**:
+
+| Symptom | Likely cause | Is P4-D failure? |
+| --- | --- | --- |
+| No events at all from a stable scene | Detection (TrafficCamNet missed) | No |
+| Burst of enters from a single person | Tracker (NvTracker re-assigned IDs each frame) | No |
+| Enter event for someone OUTSIDE the ROI | Analytics (geometry/labels mismatch) | No |
+| Exit event after one missing frame | Adapter (we have a regression on the absence-doesn't-emit invariant) | **Yes** |
+| Flood of enter/exit events from a stationary person | Adapter (debounce broken) | **Yes** |
+| Duplicate event with the same idempotency key | Adapter (sequence counter broken) | **Yes** |
+
+Only the **Adapter** column is a P4-D regression. Detection /
+tracker / analytics issues are expected at this stage with the
+sample TrafficCamNet model.
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dsa|upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p4d
+```
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

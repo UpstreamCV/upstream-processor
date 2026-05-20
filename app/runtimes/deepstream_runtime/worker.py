@@ -49,6 +49,7 @@ from app.observations.metadata_models import NeutralFrameMetadata
 from app.observations.observation_adapter import (
     LineCrossingState,
     RoiOccupancyState,
+    ZoneMembershipState,
     deepstream_source_block,
 )
 from app.observations.schemas import EligibleSession
@@ -200,6 +201,10 @@ class _MetadataCounters:
     # one). Errors increment the shared ``observation_write_errors``
     # counter — the writer error path does not distinguish.
     roi_occupancy_observations_emitted: int = 0
+    # P4-D: per-track zone transition counters. Same shared error
+    # counter; the worker error path doesn't distinguish per-type.
+    zone_entered_observations_emitted: int = 0
+    zone_exited_observations_emitted: int = 0
     observation_write_errors: int = 0
     last_observation_at: datetime | None = None
 
@@ -755,6 +760,17 @@ class DeepStreamWorker(Runtime):
                 p["roi_change_stability_frames"] = int(
                     self._settings.deepstream_roi_change_stability_frames
                 )
+                # P4-D: per-track zone transition counters + the
+                # configured membership stability threshold. ``_enabled``
+                # mirrors ``observations_enabled``'s shape — True when
+                # the analytics worker has a writer, regardless of
+                # whether any events have flowed yet.
+                p["zone_transition_observations_enabled"] = True
+                p["zone_entered_observations_emitted"] = counters.zone_entered_observations_emitted
+                p["zone_exited_observations_emitted"] = counters.zone_exited_observations_emitted
+                p["zone_membership_stability_frames"] = int(
+                    self._settings.deepstream_zone_membership_stability_frames
+                )
                 p["observation_write_errors_count"] = counters.observation_write_errors
                 p["last_observation_at"] = (
                     counters.last_observation_at.isoformat()
@@ -859,6 +875,20 @@ class DeepStreamWorker(Runtime):
             if observations_enabled
             else None
         )
+        # P4-D: per-track zone transitions. Same gate as line/ROI state;
+        # stability threshold from settings (default 5; tests override
+        # via ``fast_settings`` to 1). Disappearance does NOT emit
+        # zone_exited — see ``ZoneMembershipState``'s docstring.
+        zone_state: ZoneMembershipState | None = (
+            ZoneMembershipState(
+                stream_session_id=self._session.session_id,
+                membership_stability_frames=(
+                    self._settings.deepstream_zone_membership_stability_frames
+                ),
+            )
+            if observations_enabled
+            else None
+        )
         source_block: dict[str, Any] = (
             deepstream_source_block(
                 package_id=self._package.package_id,
@@ -929,6 +959,13 @@ class DeepStreamWorker(Runtime):
                     await self._emit_roi_occupancies(
                         frame=frame,
                         roi_state=roi_state,
+                        source_block=source_block,
+                        counters=counters,
+                    )
+                if zone_state is not None:
+                    await self._emit_zone_transitions(
+                        frame=frame,
+                        zone_state=zone_state,
                         source_block=source_block,
                         counters=counters,
                     )
@@ -1151,6 +1188,98 @@ class DeepStreamWorker(Runtime):
             counters.observations_emitted += 1
             counters.roi_occupancy_observations_emitted += 1
             counters.last_observation_at = event.occurred_at
+
+    # --- P4-D: per-track zone transition emission ------------------------
+
+    async def _emit_zone_transitions(
+        self,
+        *,
+        frame: NeutralFrameMetadata,
+        zone_state: ZoneMembershipState,
+        source_block: dict[str, Any],
+        counters: _MetadataCounters,
+    ) -> None:
+        """Walk each tracked object in the frame, hand its
+        ``roi_labels`` to ``ZoneMembershipState`` along with the set of
+        known zones (= keys of ``frame.source.analytics.roi_counts``),
+        and emit one ``processor.zone_entered`` / ``processor.zone_exited``
+        observation per committed transition.
+
+        Skips objects without a ``tracker_id`` (zone transitions are
+        meaningless without a stable identity) and objects whose
+        ``debug.analytics.roi_labels`` is missing or malformed. Bails
+        early if the frame has no ``roi_counts`` (no zones configured
+        for this frame). Error handling mirrors
+        ``_emit_roi_occupancies`` exactly: ``ApiSessionGoneError``
+        propagates so the outer ``run()`` ends quietly;
+        ``ApiValidationError`` / ``TRANSIENT_API_ERRORS`` are logged
+        + counted + continue."""
+        assert self._writer is not None  # gated by the caller
+        analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
+        if not isinstance(analytics, dict):
+            return
+        roi_counts = analytics.get("roi_counts")
+        if not isinstance(roi_counts, dict) or not roi_counts:
+            return
+        zone_set: set[str] = {str(k) for k in roi_counts}
+        occurred_at = frame.frame.timestamp or now_utc()
+        for obj in frame.objects:
+            if obj.tracker_id is None:
+                continue
+            obj_analytics = obj.debug.get("analytics") if isinstance(obj.debug, dict) else None
+            if not isinstance(obj_analytics, dict):
+                continue
+            raw_labels = obj_analytics.get("roi_labels")
+            if not isinstance(raw_labels, list):
+                continue
+            roi_labels: set[str] = {str(label) for label in raw_labels if isinstance(label, str)}
+            events = zone_state.absorb_object(
+                track_id=obj.tracker_id,
+                zone_set=zone_set,
+                roi_labels=roi_labels,
+                occurred_at=occurred_at,
+                class_id=obj.class_id,
+                class_label=obj.label,
+                source=source_block,
+                debug={
+                    "frame_num": int(frame.frame.frame_num),
+                    "geometry_source": "probe_default",
+                    "roi_labels": sorted(roi_labels),
+                },
+            )
+            for event in events:
+                try:
+                    await self._writer.emit(
+                        stream_session_id=self._session.session_id,
+                        obs_type=event.type,  # type: ignore[arg-type]
+                        payload=event.to_payload(),
+                        package_id=self._package.package_id,
+                        observed_at=event.occurred_at,
+                    )
+                except ApiSessionGoneError:
+                    raise
+                except ApiValidationError as exc:
+                    counters.observation_write_errors += 1
+                    _log.error(
+                        "wire contract drift on zone transition emit for %s: %s",
+                        self.session_id,
+                        exc,
+                    )
+                    continue
+                except TRANSIENT_API_ERRORS as exc:
+                    counters.observation_write_errors += 1
+                    _log.warning(
+                        "transient zone transition emit for %s: %s",
+                        self.session_id,
+                        exc,
+                    )
+                    continue
+                counters.observations_emitted += 1
+                if event.type == "processor.zone_entered":
+                    counters.zone_entered_observations_emitted += 1
+                else:
+                    counters.zone_exited_observations_emitted += 1
+                counters.last_observation_at = event.occurred_at
 
     # --- helpers ----------------------------------------------------------
 

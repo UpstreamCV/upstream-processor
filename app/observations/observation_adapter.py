@@ -52,10 +52,18 @@ from uuid import UUID
 # into ``schemas.ObservationType`` in lock-step with the api-server PR.
 CANDIDATE_LINE_CROSSING_TYPE = "processor.line_crossing"
 CANDIDATE_ROI_OCCUPANCY_TYPE = "processor.roi_occupancy"
+# P4-D zone transition types. The two are kept as separate constants
+# because their event payloads share zone_id / track_id / sequence but
+# the obs_type Literal is distinct (the api-server checks each on the
+# wire) and the idempotency-key namespace is per-transition-type.
+CANDIDATE_ZONE_ENTERED_TYPE = "processor.zone_entered"
+CANDIDATE_ZONE_EXITED_TYPE = "processor.zone_exited"
 
 CANDIDATE_OBSERVATION_TYPES: tuple[str, ...] = (
     CANDIDATE_LINE_CROSSING_TYPE,
     CANDIDATE_ROI_OCCUPANCY_TYPE,
+    CANDIDATE_ZONE_ENTERED_TYPE,
+    CANDIDATE_ZONE_EXITED_TYPE,
 )
 
 
@@ -505,6 +513,249 @@ def _strip_total(snapshot: dict[str, int]) -> dict[str, int]:
     compare last-vs-new snapshots without giving the total special
     treatment."""
     return {k: v for k, v in snapshot.items() if k != "__total"}
+
+
+# --- P4-D: per-track zone transitions ---------------------------------
+
+
+@dataclass(frozen=True)
+class ZoneTransitionEvent:
+    """One ``processor.zone_entered`` or ``processor.zone_exited`` event.
+
+    Distinct from ``LineCrossingEvent`` / ``RoiOccupancyEvent`` because
+    a zone transition is keyed per ``(track_id, zone_id)`` — the same
+    person walking in and out twice produces (enter, exit, enter, exit)
+    with monotonically-increasing per-(track, zone, type) sequence
+    numbers.
+
+    Top-level payload is runtime-neutral. DeepStream-specific provenance
+    sits under ``source``; raw frame numbers + the
+    ``"outside_to_inside"`` / ``"inside_to_outside"`` transition string
+    + ``stability_frames_required`` sit under ``debug``."""
+
+    type: str  # CANDIDATE_ZONE_ENTERED_TYPE | CANDIDATE_ZONE_EXITED_TYPE
+    stream_session_id: UUID
+    occurred_at: datetime
+    zone_id: str
+    zone_label: str
+    track_id: str
+    sequence: int
+    idempotency_key: str
+    class_id: int | None = None
+    class_label: str | None = None
+    source: dict[str, Any] = field(default_factory=dict)
+    debug: dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        """Body for the ``payload`` field of ``ObservationPayload``.
+        Optional fields (``class_id`` / ``class_label``) are omitted
+        when None so an analytics frame without classifier metadata
+        doesn't produce ``"class_id": null`` noise."""
+        body: dict[str, Any] = {
+            "zone_id": self.zone_id,
+            "zone_label": self.zone_label,
+            "track_id": self.track_id,
+            "sequence": int(self.sequence),
+            "idempotency_key": self.idempotency_key,
+            "source": dict(self.source),
+            "debug": dict(self.debug),
+        }
+        if self.class_id is not None:
+            body["class_id"] = int(self.class_id)
+        if self.class_label is not None:
+            body["class_label"] = self.class_label
+        return body
+
+
+def build_zone_entered_idempotency_key(
+    *,
+    stream_session_id: UUID,
+    zone_id: str,
+    track_id: str,
+    sequence: int,
+) -> str:
+    """Deterministic dedupe key for a single ``zone_entered`` event.
+
+    Format:
+    ``sess:<session_id>:processor.zone_entered:<zone_id>:<track_id>:<sequence>``.
+    The sequence is per-(track_id, zone_id, transition-type) so a
+    person who walks in, out, in, out produces enter:1, exit:1,
+    enter:2, exit:2 — the two transition types share zone/track
+    but namespace their sequences independently."""
+    return (
+        f"sess:{stream_session_id}:{CANDIDATE_ZONE_ENTERED_TYPE}:"
+        f"{zone_id}:{track_id}:{int(sequence)}"
+    )
+
+
+def build_zone_exited_idempotency_key(
+    *,
+    stream_session_id: UUID,
+    zone_id: str,
+    track_id: str,
+    sequence: int,
+) -> str:
+    """Pairs with ``build_zone_entered_idempotency_key`` — same key
+    structure, different type segment."""
+    return (
+        f"sess:{stream_session_id}:{CANDIDATE_ZONE_EXITED_TYPE}:"
+        f"{zone_id}:{track_id}:{int(sequence)}"
+    )
+
+
+@dataclass
+class ZoneMembershipState:
+    """Per-stream-per-worker adapter state for zone transition events.
+
+    Two emit conditions:
+
+    1. **Stable inside**: a tracked object whose ``roi_labels`` contains
+       a given zone for ``membership_stability_frames`` consecutive
+       observed frames → emit ``processor.zone_entered``.
+    2. **Stable outside** (after a stable inside): the same tracked
+       object observed WITHOUT the zone label for
+       ``membership_stability_frames`` consecutive frames →
+       emit ``processor.zone_exited``.
+
+    Important invariants:
+
+    - **Object disappearance does NOT emit zone_exited.** A tracker
+      dropping a frame can't be distinguished from a real exit, so we
+      only act on observed frames. Pending state survives an arbitrary
+      number of missing frames.
+    - **First-observed-outside is a no-op.** If we never saw the track
+      in this zone, we don't track an "outside" state for it; no
+      ``zone_exited`` event can fire until we've committed an inside.
+    - **Per-(track, zone, transition-type) sequence.** Re-entering a
+      zone after exiting it produces ``zone_entered`` with sequence=2
+      while ``zone_exited`` is still at sequence=1 — the two transition
+      types share zone/track but namespace their sequences
+      independently.
+
+    Backward compat: ``membership_stability_frames`` defaults to ``1``
+    so direct unit-test callers get immediate-transition behavior.
+    Production wiring sets it from
+    ``Settings.deepstream_zone_membership_stability_frames`` (default
+    5). Values < 1 are rejected at ``__post_init__``."""
+
+    stream_session_id: UUID
+    membership_stability_frames: int = 1
+    # Committed state per (track_id, zone_id). Missing key = never
+    # observed inside this zone for this track. True = stably inside.
+    # False = stably outside (only reachable after a prior True).
+    stable_membership: dict[tuple[str, str], bool] = field(default_factory=dict)
+    # Per-(track, zone) accumulator for the debounce.
+    pending_membership: dict[tuple[str, str], bool] = field(default_factory=dict)
+    pending_seen_frames: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Per-(track_id, zone_id, obs_type) emit counter — idempotency-key
+    # sequence. The two transition types each carry their own counter
+    # so a re-enter is :2 and a re-exit is also :2 (distinct keys
+    # because the obs_type segment of the key differs).
+    sequence_by_track_zone_transition: dict[tuple[str, str, str], int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.membership_stability_frames < 1:
+            raise ValueError(
+                f"membership_stability_frames must be >= 1; got {self.membership_stability_frames}"
+            )
+
+    def absorb_object(
+        self,
+        *,
+        track_id: str,
+        zone_set: set[str] | frozenset[str],
+        roi_labels: set[str] | frozenset[str],
+        occurred_at: datetime,
+        class_id: int | None = None,
+        class_label: str | None = None,
+        source: dict[str, Any] | None = None,
+        debug: dict[str, Any] | None = None,
+    ) -> list[ZoneTransitionEvent]:
+        """Update membership state for one observed object across the
+        currently-known zone set; emit transition events for any
+        membership change that has been stable for
+        ``membership_stability_frames`` frames.
+
+        Caller is responsible for filtering out objects without a
+        ``tracker_id``; this method assumes ``track_id`` is a non-empty
+        string. Caller also decides what counts as "the known zone
+        set" for this frame (typically the keys of
+        ``frame.source.analytics.roi_counts``)."""
+        events: list[ZoneTransitionEvent] = []
+        for zone_id in zone_set:
+            observed = zone_id in roi_labels
+            key = (track_id, zone_id)
+            committed = self.stable_membership.get(key)
+
+            # Case A: never observed inside this zone for this track,
+            # and not observed inside now. No state to track.
+            if committed is None and observed is False:
+                continue
+
+            # Case B: matches committed. Clear any pending state.
+            if observed == committed:
+                self.pending_membership.pop(key, None)
+                self.pending_seen_frames.pop(key, None)
+                continue
+
+            # Case C: differs from committed (or first-ever sighting
+            # in this zone). Update the pending accumulator.
+            pending = self.pending_membership.get(key)
+            if pending == observed:
+                self.pending_seen_frames[key] = self.pending_seen_frames.get(key, 0) + 1
+            else:
+                self.pending_membership[key] = observed
+                self.pending_seen_frames[key] = 1
+
+            if self.pending_seen_frames.get(key, 0) < self.membership_stability_frames:
+                continue
+
+            # Threshold met: commit + emit.
+            self.stable_membership[key] = observed
+            self.pending_membership.pop(key, None)
+            self.pending_seen_frames.pop(key, None)
+            obs_type = CANDIDATE_ZONE_ENTERED_TYPE if observed else CANDIDATE_ZONE_EXITED_TYPE
+            seq_key = (track_id, zone_id, obs_type)
+            seq = self.sequence_by_track_zone_transition.get(seq_key, 0) + 1
+            self.sequence_by_track_zone_transition[seq_key] = seq
+            if observed:
+                idem = build_zone_entered_idempotency_key(
+                    stream_session_id=self.stream_session_id,
+                    zone_id=zone_id,
+                    track_id=track_id,
+                    sequence=seq,
+                )
+                transition = "outside_to_inside"
+            else:
+                idem = build_zone_exited_idempotency_key(
+                    stream_session_id=self.stream_session_id,
+                    zone_id=zone_id,
+                    track_id=track_id,
+                    sequence=seq,
+                )
+                transition = "inside_to_outside"
+            merged_debug: dict[str, Any] = {
+                "transition": transition,
+                "stability_frames_required": self.membership_stability_frames,
+                **(debug or {}),
+            }
+            events.append(
+                ZoneTransitionEvent(
+                    type=obs_type,
+                    stream_session_id=self.stream_session_id,
+                    occurred_at=occurred_at,
+                    zone_id=zone_id,
+                    zone_label=zone_id,
+                    track_id=track_id,
+                    sequence=seq,
+                    idempotency_key=idem,
+                    class_id=class_id,
+                    class_label=class_label,
+                    source=dict(source or {}),
+                    debug=merged_debug,
+                )
+            )
+        return events
 
 
 # --- ergonomic helper --------------------------------------------------

@@ -121,7 +121,11 @@ INITIAL_TAXONOMY: tuple[ObservationSpec, ...] = (
     ObservationSpec(
         type="processor.zone_entered",
         category="event",
-        status="deferred",
+        # P4-D: api-server and processor schemas widened in lock-step.
+        # ZoneMembershipState debounces per-(track, zone) so single-frame
+        # ROI label flaps don't emit false transitions; disappearance
+        # does NOT emit zone_exited.
+        status="api_supported",
         description=(
             "Tracked object's first frame INSIDE a zone polygon. "
             "Distinct event per (zone, tracker_id, enter sequence) so "
@@ -134,14 +138,15 @@ INITIAL_TAXONOMY: tuple[ObservationSpec, ...] = (
         source_signal="per-object NvDsAnalyticsObjInfo.roiStatus transition (absent -> present)",
         requires_tracker_id=True,
         requires_zone_geometry=True,
-        # ROI membership transition tracking needs a per-(track, zone)
-        # last-state map that P3.5's per-frame roi_labels list does
-        # not currently maintain; that's a P4-C+ adapter addition.
     ),
     ObservationSpec(
         type="processor.zone_exited",
         category="event",
-        status="deferred",
+        # P4-D: see zone_entered comment above. zone_exited fires only
+        # when the same tracker_id is observed for N stable frames
+        # WITHOUT the zone label; total object disappearance is treated
+        # as detector/tracker miss, not an exit.
+        status="api_supported",
         description=(
             "Tracked object's first frame OUTSIDE a zone after having "
             "been inside it. Pairs with zone_entered."

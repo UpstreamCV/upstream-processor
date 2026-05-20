@@ -216,16 +216,19 @@ UPSTREAM_PROCESSOR_ID=proc_p35_analytics_live \
 uv run upstream-processor
 ```
 
-## P4-B + P4-C scope (first two DeepStream-backed observation types)
+## P4-B + P4-C + P4-D scope (four DeepStream-backed observation types)
 
 - The api-server's `ProcessorObservationType` Literal is widened to
-  include both `processor.line_crossing` (P4-B) and
-  `processor.roi_occupancy` (P4-C). No DB migration; all other
-  observation types stay rejected at the schema layer.
+  include `processor.line_crossing` (P4-B),
+  `processor.roi_occupancy` (P4-C), `processor.zone_entered`
+  (P4-D), and `processor.zone_exited` (P4-D). No DB migration; all
+  other observation types stay rejected at the schema layer.
 - `DeepStreamWorker` (analytics mode only) instantiates a
-  `LineCrossingState` AND a `RoiOccupancyState` per session, each
-  fed by the corresponding `frame.source.analytics.*` block. The
-  two emit helpers run independently.
+  `LineCrossingState`, a `RoiOccupancyState`, AND a
+  `ZoneMembershipState` per session. Each adapter state is fed by
+  the corresponding source-frame fields (frame-level analytics for
+  line/ROI; per-object `tracker_id` + `roi_labels` for zone). The
+  three emit helpers run independently.
 - **Line crossing** (P4-B) — one observation per integer
   increment of `objLCCumCnt`. Event-style.
 - **ROI occupancy** (P4-C) — one observation on first-seen, on
@@ -233,6 +236,13 @@ uv run upstream-processor
   (`UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`, default 30s,
   env-overridable). **Never per-frame.**
   `payload.debug.emit_reason` records first/change/interval.
+  P4-C cleanup adds a debounce
+  (`UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES`, default 5).
+- **Zone entered / exited** (P4-D) — per-track zone transitions.
+  Per `(track_id, zone_id)` debounce gated by
+  `UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES`
+  (default 5). Object disappearance does NOT emit `zone_exited`
+  — only an observed-with-no-label trajectory does.
 - Payload top-level is runtime-neutral; DeepStream vocabulary
   lives under `source` / `debug`; `idempotency_key` lives in
   `payload` (client-side dedupe; server-side UNIQUE constraint
@@ -241,16 +251,21 @@ uv run upstream-processor
   `observations_emitted_count`,
   `line_crossing_observations_emitted`,
   `roi_occupancy_observations_emitted`,
+  `zone_entered_observations_emitted`,
+  `zone_exited_observations_emitted`,
+  `zone_membership_stability_frames`,
   `observation_write_errors_count`, `last_observation_at`. Tracker
   / metadata / decode / inference modes are unchanged.
 - The pyds container still does not call the API.
 
 ## What it deliberately does NOT do (yet)
 
-The P4-B/P4-C write paths are **line-crossing + ROI occupancy
-only**. Explicitly out of scope:
-**`processor.zone_entered`** / **`zone_exited`** /
-**`dwell_exceeded`** (need a new `ZoneMembershipState` adapter),
+The P4-B/P4-C/P4-D write paths cover line crossing, ROI
+occupancy, and per-track zone transitions. Explicitly out of
+scope:
+**`processor.dwell_started`** / **`dwell_updated`** /
+**`dwell_exceeded`** (need a new `DwellState` adapter that builds
+on `ZoneMembershipState`),
 **server-side `idempotency_key` column + UNIQUE constraint**,
 **dashboard-driven ROI / line geometry** (P4-B uses P3.5's
 hand-authored line), **rules / events / webhooks**, **dashboard

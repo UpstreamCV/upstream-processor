@@ -62,14 +62,27 @@ def test_roi_occupancy_now_in_server_whitelist() -> None:
     assert CANDIDATE_ROI_OCCUPANCY_TYPE in OBSERVATION_TYPES
 
 
-def test_zone_dwell_track_types_still_unsupported() -> None:
-    """P4-C widens exactly one type. The next candidates (zone
-    enter/exit, dwell, direction, track update, telemetry) MUST NOT
-    have been accidentally widened — this is the spiritual successor
-    to P4-B's ROI guard, now pointed at the next-deferred types."""
+def test_zone_entered_now_in_server_whitelist() -> None:
+    """P4-D widened the api-server + this repo's whitelist in
+    lock-step with ``processor.zone_entered``. Pinned post-P4-D
+    state lock — a future demotion fails here."""
+    assert "processor.zone_entered" in OBSERVATION_TYPES
+
+
+def test_zone_exited_now_in_server_whitelist() -> None:
+    """Same as zone_entered; the two transition types ship together."""
+    assert "processor.zone_exited" in OBSERVATION_TYPES
+
+
+def test_dwell_track_telemetry_types_still_unsupported() -> None:
+    """P4-D widens exactly two types (zone_entered + zone_exited).
+    The next candidates (dwell variants, direction, track-state /
+    track-update, telemetry) MUST NOT have been accidentally widened —
+    this is the spiritual successor to the P4-C ROI guard, now
+    pointed at the still-deferred types."""
     future_types = (
-        "processor.zone_entered",
-        "processor.zone_exited",
+        "processor.dwell_started",
+        "processor.dwell_updated",
         "processor.dwell_exceeded",
         "processor.direction_detected",
         "processor.track_state",
@@ -80,8 +93,9 @@ def test_zone_dwell_track_types_still_unsupported() -> None:
     )
     for t in future_types:
         assert t not in OBSERVATION_TYPES, (
-            f"{t!r} unexpectedly in OBSERVATION_TYPES — P4-C only widens "
-            "processor.roi_occupancy; other types stay deferred"
+            f"{t!r} unexpectedly in OBSERVATION_TYPES — P4-D only widens "
+            "the two zone transition types; dwell / direction / track / "
+            "telemetry types stay deferred"
         )
 
 

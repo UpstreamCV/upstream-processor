@@ -170,6 +170,20 @@ class Settings(BaseSettings):
     # to override). Values < 1 are rejected at adapter construction.
     deepstream_roi_change_stability_frames: int = 5
 
+    # --- P4-D zone transition emission policy ------------------------
+    # Per-track zone transitions (processor.zone_entered /
+    # processor.zone_exited). State is keyed per (track_id, zone_id)
+    # and updated only on observed frames; total object disappearance
+    # is treated as a detector/tracker miss, not a real exit (no
+    # exit event is emitted from absence alone). A new membership
+    # value (inside or outside) must hold for this many consecutive
+    # OBSERVED frames before the transition commits and an event is
+    # emitted. Default 5 matches the ROI-occupancy debounce default —
+    # ~166 ms of stability at 30 fps. Setting to 1 reproduces
+    # immediate-transition behavior. Values < 1 fail at adapter
+    # construction.
+    deepstream_zone_membership_stability_frames: int = 5
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
