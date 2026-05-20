@@ -295,6 +295,17 @@ stays with the outer supervisor.
   ``deepstream_metadata_sample_limit`` (3). All env-overridable. Reuses
   ``deepstream_keep_temp_files`` and the existing shutdown-budget knobs.
 
+- **Shutdown ordering** (P2 cleanup hardening): ``request_stop()``
+  *synchronously* closes the bridge queue, so a consumer parked in
+  ``asyncio.to_thread(queue.Queue.get)`` wakes within milliseconds
+  instead of waiting for the reader's next 0.5 s poll. The driver wraps
+  the inner ``asyncio.gather`` in a ``try`` / ``finally`` and runs the
+  cleanup tail (close queue → ``_safe_stop_pm`` → terminal status post)
+  inside ``asyncio.shield(...)``, so docker stop + workdir cleanup + the
+  final status post complete even when the worker task is cancelled by
+  the supervisor's force-stop path. ``DeepStreamMetadataProcessManager.stop()``
+  and ``_cleanup_work_dir()`` are idempotent (a second call is a no-op).
+
 Coverage: ``tests/test_deepstream_metadata_probe.py`` exercises mode
 selection (and verifies decode/inference still resolve), the pure parser
 (frame / summary / other), the pure command builder

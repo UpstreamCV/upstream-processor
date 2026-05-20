@@ -123,6 +123,10 @@ class DeepStreamMetadataProcessManager:
         self._work_dir: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._returncode: int | None = None
+        # Idempotent-stop guard. Set on the first ``stop()`` so a second
+        # call (e.g., from the worker's outer ``except CancelledError``
+        # handler running after our shielded ``finally``) short-circuits.
+        self._stopped = False
 
     # --- temp work dir ---------------------------------------------------
 
@@ -144,10 +148,16 @@ class DeepStreamMetadataProcessManager:
         return work
 
     def _cleanup_work_dir(self) -> None:
+        """Idempotent: removes the temp work dir if one is present and
+        ``keep_temp_files`` is not set. Safe to call multiple times — the
+        second call is a no-op because we null ``_work_dir`` after rmtree.
+        Never references the RTSP URL."""
         if self._work_dir is None or self._keep_temp_files:
             return
         with contextlib.suppress(OSError):
             shutil.rmtree(self._work_dir, ignore_errors=True)
+        # Mark cleaned so a second call is a no-op (idempotency guard).
+        self._work_dir = None
 
     # --- ProcessManager protocol ---------------------------------------
 
@@ -190,6 +200,16 @@ class DeepStreamMetadataProcessManager:
         return data.decode("utf-8", "replace").rstrip("\n")
 
     async def stop(self) -> None:
+        """Idempotent: ``docker stop`` then SIGTERM/SIGKILL the subprocess
+        if still alive, then clean the temp work dir. A second call is a
+        no-op (cleanup ran on the first call; the container is gone)."""
+        if self._stopped:
+            # Defensive: still clean the work dir in case the first call
+            # was cancelled before reaching the ``finally``. ``_cleanup_work_dir``
+            # itself is idempotent.
+            self._cleanup_work_dir()
+            return
+        self._stopped = True
         try:
             if self._proc is not None:
                 try:
