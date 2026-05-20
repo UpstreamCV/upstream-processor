@@ -59,7 +59,13 @@ class NeutralObjectMetadata(BaseModel):
     ``tracker_id`` is ``str`` (not ``int``) because the upstream pyds value
     is uint64; some are larger than ``Number.MAX_SAFE_INTEGER`` for JS/JSON
     consumers, so the producer stringifies. ``UNTRACKED_OBJECT_ID`` MUST be
-    mapped to ``None`` by the producer (no tracker attached)."""
+    mapped to ``None`` by the producer (no tracker attached).
+
+    ``debug`` is a free-form dict for producer-specific extras that the
+    consumer side does NOT promote to first-class fields. P3.5 uses it
+    to carry per-object analytics (ROI / line-crossing / direction
+    labels) under ``debug["analytics"]`` without leaking
+    DeepStream-specific keys at the top level."""
 
     model_config = ConfigDict(extra="forbid")
     class_id: int
@@ -68,6 +74,7 @@ class NeutralObjectMetadata(BaseModel):
     bbox_pixels: BoundingBoxPixels | None = None
     bbox_normalized: BoundingBoxNormalized | None = None
     tracker_id: str | None = None
+    debug: dict[str, Any] = Field(default_factory=dict)
 
 
 class NeutralFrame(BaseModel):

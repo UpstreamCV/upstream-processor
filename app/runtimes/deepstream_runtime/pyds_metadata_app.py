@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P2 / P3 — supervisor-managed in-container pyds metadata app (DeepStream 8.0).
+"""P2 / P3 / P3.5 — supervisor-managed in-container pyds metadata app (DeepStream 8.0).
 
 **Runtime-only.** This module is intentionally NOT imported by any other
 ``app/`` code. It is bind-mounted into the DeepStream 8.0 + pyds container
@@ -10,13 +10,16 @@ the gi/pyds imports only resolve inside the container at run time.
 The pipeline mirrors the live-verified manual P2 pyds probe; in **P3
 tracker mode** (CLI ``--tracker-config-path`` set) an ``nvtracker`` element
 is spliced in between ``nvinfer`` and ``nvvideoconvert`` and the pad probe
-moves from ``nvinfer.src`` to ``tracker.src`` so ``NvDsObjectMeta.object_id``
-is a real stable tracker id across frames:
+moves from ``nvinfer.src`` to ``tracker.src``; in **P3.5 analytics mode**
+(CLI ``--analytics-config-path`` set) an ``nvdsanalytics`` element is
+also spliced in (after ``nvtracker``) and the pad probe moves once more
+to ``analytics.src`` so the SDK's ROI / line-crossing / overcrowding /
+direction metadata is attached when the probe walks the meta lists:
 
     rtspsrc(tcp, latency=200) -> rtph264depay -> h264parse ->
     nvv4l2decoder -> nvstreammux(batch=1, 1280x720, live-source=1) ->
     nvinfer(config=<pgie.txt>) -> [nvtracker(config=<tracker.yml>) ->]
-    nvvideoconvert -> fakesink
+    [nvdsanalytics(config=<analytics.txt>) ->] nvvideoconvert -> fakesink
 
 A pad probe walks
 ``pyds.gst_buffer_get_nvds_batch_meta -> NvDsFrameMeta -> NvDsObjectMeta``
@@ -24,8 +27,13 @@ and emits one structured line **per frame** on stdout:
 
     UPSTREAM_METADATA=<json>
 
-…matching ``NeutralFrameMetadata`` (validated outside the container).
-A single final summary line is emitted on shutdown:
+…matching ``NeutralFrameMetadata`` (validated outside the container). In
+analytics mode the probe additionally walks ``frame_user_meta_list``
+(``NVDS_FRAME_META_NVDSANALYTICS`` -> ``NvDsAnalyticsFrameMeta``) and
+``obj_user_meta_list`` (``NVDS_OBJ_META_NVDSANALYTICS`` ->
+``NvDsAnalyticsObjInfo``) and folds the resulting ROI / LC counters and
+per-object ROI / LC / direction labels into the frame's ``debug`` /
+``source`` fields. A single final summary line is emitted on shutdown:
 
     UPSTREAM_METADATA_SUMMARY=<json>
 
@@ -99,6 +107,15 @@ class _State:
         self.metadata_emitted = 0
         self.sample_limit = sample_limit
         self.stream_session_id: str | None = None
+        # P3.5 analytics. Populated only when nvdsanalytics ran.
+        self.has_analytics_metadata = False
+        self.roi_metadata_count = 0
+        self.line_metadata_count = 0
+        self.overcrowding_metadata_count = 0
+        self.direction_metadata_count = 0
+        self.objects_with_roi_metadata = 0
+        self.objects_with_line_metadata = 0
+        self.analytics_labels: set[str] = set()
 
 
 def _build_object_dict(obj_meta: Any, frame_w: int, frame_h: int) -> dict[str, Any]:
@@ -130,10 +147,125 @@ def _build_object_dict(obj_meta: Any, frame_w: int, frame_h: int) -> dict[str, A
     }
 
 
-def _make_pad_probe(state: _State, width: int, height: int) -> Any:
+def _extract_object_analytics(obj_meta: Any, state: _State) -> dict[str, Any] | None:
+    """Walk ``obj_meta.obj_user_meta_list`` for ``NVDS_OBJ_META_NVDSANALYTICS``
+    user-meta entries and return a small neutral dict, or ``None`` if no
+    analytics user-meta is attached. Updates counters on ``state``. Pure
+    pyds traversal — no I/O. Defensive: any unexpected pyds shape just
+    returns ``None`` (this is a probe, not a hot path that must never
+    silently miss a field)."""
+    user_list = getattr(obj_meta, "obj_user_meta_list", None)
+    if user_list is None:
+        return None
+    found: dict[str, Any] = {}
+    l_user = user_list
+    while l_user is not None:
+        try:
+            user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+        except (StopIteration, Exception):
+            break
+        try:
+            mt = int(user_meta.base_meta.meta_type)
+        except Exception:
+            mt = -1
+        if mt == int(pyds.NVDS_OBJ_META_NVDSANALYTICS):
+            try:
+                aobj = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)
+            except Exception:
+                aobj = None
+            if aobj is not None:
+                roi = [str(s) for s in (getattr(aobj, "roiStatus", None) or [])]
+                lc = [str(s) for s in (getattr(aobj, "lcStatus", None) or [])]
+                oc = [str(s) for s in (getattr(aobj, "ocStatus", None) or [])]
+                direction = str(getattr(aobj, "dirStatus", "") or "")
+                if roi:
+                    found["roi_labels"] = roi
+                    state.objects_with_roi_metadata += 1
+                    state.analytics_labels.update(roi)
+                if lc:
+                    found["line_labels"] = lc
+                    state.objects_with_line_metadata += 1
+                    state.analytics_labels.update(lc)
+                if oc:
+                    found["overcrowding_labels"] = oc
+                    state.analytics_labels.update(oc)
+                if direction:
+                    found["direction"] = direction
+                    state.analytics_labels.add(direction)
+                if found:
+                    state.has_analytics_metadata = True
+        try:
+            l_user = l_user.next
+        except StopIteration:
+            break
+    return found or None
+
+
+def _extract_frame_analytics(frame_meta: Any, state: _State) -> dict[str, Any] | None:
+    """Walk ``frame_meta.frame_user_meta_list`` for
+    ``NVDS_FRAME_META_NVDSANALYTICS`` user-meta entries and return the
+    cumulative / per-frame counters as a small dict (or ``None``).
+    Updates counters on ``state``."""
+    user_list = getattr(frame_meta, "frame_user_meta_list", None)
+    if user_list is None:
+        return None
+    summary: dict[str, Any] = {}
+    l_user = user_list
+    while l_user is not None:
+        try:
+            user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+        except (StopIteration, Exception):
+            break
+        try:
+            mt = int(user_meta.base_meta.meta_type)
+        except Exception:
+            mt = -1
+        if mt == int(pyds.NVDS_FRAME_META_NVDSANALYTICS):
+            try:
+                af = pyds.NvDsAnalyticsFrameMeta.cast(user_meta.user_meta_data)
+            except Exception:
+                af = None
+            if af is not None:
+                roi_raw = getattr(af, "objInROIcnt", {}) or {}
+                lcc_raw = getattr(af, "objLCCumCnt", {}) or {}
+                lcr_raw = getattr(af, "objLCCurrCnt", {}) or {}
+                oc_raw = getattr(af, "ocStatus", {}) or {}
+                roi_counts = {str(k): int(v) for k, v in roi_raw.items()}
+                lc_cum = {str(k): int(v) for k, v in lcc_raw.items()}
+                lc_cur = {str(k): int(v) for k, v in lcr_raw.items()}
+                oc = {str(k): bool(v) for k, v in oc_raw.items()}
+                if roi_counts:
+                    summary["roi_counts"] = roi_counts
+                    state.roi_metadata_count += 1
+                    state.analytics_labels.update(roi_counts.keys())
+                if lc_cum:
+                    summary["line_crossing_cumulative"] = lc_cum
+                    state.line_metadata_count += 1
+                    state.analytics_labels.update(lc_cum.keys())
+                if lc_cur:
+                    summary["line_crossing_current"] = lc_cur
+                    state.analytics_labels.update(lc_cur.keys())
+                if oc:
+                    summary["overcrowding_status"] = oc
+                    state.overcrowding_metadata_count += 1
+                    state.analytics_labels.update(oc.keys())
+                if summary:
+                    state.has_analytics_metadata = True
+        try:
+            l_user = l_user.next
+        except StopIteration:
+            break
+    return summary or None
+
+
+def _make_pad_probe(state: _State, width: int, height: int, analytics: bool) -> Any:
     """Pad probe callback. Near-zero work, no I/O beyond a single stdout
     line per frame (Python's stdout is line-buffered when piped, so the
-    outer asyncio reader drains it without blocking us)."""
+    outer asyncio reader drains it without blocking us). When
+    ``analytics`` is True, the probe also walks frame + per-object
+    user-meta for the SDK's ``NVDS_*_META_NVDSANALYTICS`` entries and
+    folds the result into the frame's ``source`` (frame-level) /
+    object's ``debug`` (object-level) free-form dicts."""
 
     def _probe(_pad: Any, info: Any, _user_data: Any) -> Any:
         buf = info.get_buffer()
@@ -176,6 +308,15 @@ def _make_pad_probe(state: _State, width: int, height: int) -> Any:
                     state.has_bbox = True
                 if obj_dict["tracker_id"] is not None:
                     state.has_tracker_id = True
+                if analytics:
+                    obj_ana = _extract_object_analytics(obj_meta, state)
+                    if obj_ana is not None and len(objects) < state.sample_limit:
+                        # NeutralObjectMetadata is extra="forbid" so we
+                        # cannot drop analytics fields at the top of the
+                        # object dict; we surface them in a debug dict
+                        # under a stable key the worker can introspect
+                        # without changing the canonical schema.
+                        obj_dict.setdefault("debug", {})["analytics"] = obj_ana  # type: ignore[index]
                 if len(objects) < state.sample_limit:
                     objects.append(obj_dict)
                 try:
@@ -197,6 +338,10 @@ def _make_pad_probe(state: _State, width: int, height: int) -> Any:
                 },
                 "objects": objects,
             }
+            if analytics:
+                fa = _extract_frame_analytics(frame_meta, state)
+                if fa is not None:
+                    frame_payload.setdefault("source", {})["analytics"] = fa
             sys.stdout.write(_META_PREFIX + json.dumps(frame_payload) + "\n")
             sys.stdout.flush()
             state.metadata_emitted += 1
@@ -241,11 +386,15 @@ def _build_pipeline(
     tracker_lib: str | None = None,
     tracker_width: int = 960,
     tracker_height: int = 544,
+    analytics_config: str | None = None,
 ) -> tuple[Any, Any]:
     """Build the GStreamer pipeline. When ``tracker_config`` is given, an
-    ``nvtracker`` element is added after ``nvinfer`` and the function returns
-    its src pad's owner so the caller attaches the pad probe there (so the
-    probe sees populated ``NvDsObjectMeta.object_id``)."""
+    ``nvtracker`` element is added after ``nvinfer``; when
+    ``analytics_config`` is also given, an ``nvdsanalytics`` element is
+    appended after ``nvtracker``. The function returns the **last
+    metadata-producing element** in the chain so the caller attaches the
+    pad probe to its src pad (so the probe sees the most-enriched
+    NvDsObjectMeta / NvDsUserMeta state)."""
     Gst.init(None)
     pipeline = Gst.Pipeline.new("upstream-pyds-metadata")
 
@@ -259,6 +408,13 @@ def _build_pipeline(
     ]
     if tracker_config:
         base_elems.append(("tracker", "nvtracker"))
+    # nvdsanalytics requires nvtracker to be in the pipeline (its meta is
+    # keyed off tracked objects); reject the configuration up front rather
+    # than silently dropping the analytics element.
+    if analytics_config and not tracker_config:
+        raise RuntimeError("analytics requires tracker; pass --tracker-config-path too")
+    if analytics_config:
+        base_elems.append(("analytics", "nvdsanalytics"))
     base_elems.extend([("conv", "nvvideoconvert"), ("sink", "fakesink")])
 
     elems: dict[str, Any] = {}
@@ -285,6 +441,8 @@ def _build_pipeline(
         if tracker_lib:
             elems["tracker"].set_property("ll-lib-file", tracker_lib)
         elems["tracker"].set_property("ll-config-file", tracker_config)
+    if analytics_config:
+        elems["analytics"].set_property("config-file", analytics_config)
     elems["sink"].set_property("sync", False)
     elems["sink"].set_property("async", False)
 
@@ -302,7 +460,12 @@ def _build_pipeline(
     if elems["dec"].get_static_pad("src").link(sinkpad) != Gst.PadLinkReturn.OK:
         raise RuntimeError("decoder -> streammux link failed")
     elems["mux"].link(elems["pgie"])
-    if tracker_config:
+    if tracker_config and analytics_config:
+        elems["pgie"].link(elems["tracker"])
+        elems["tracker"].link(elems["analytics"])
+        elems["analytics"].link(elems["conv"])
+        probe_element = elems["analytics"]
+    elif tracker_config:
         elems["pgie"].link(elems["tracker"])
         elems["tracker"].link(elems["conv"])
         probe_element = elems["tracker"]
@@ -341,6 +504,15 @@ def main() -> int:
     )
     ap.add_argument("--tracker-width", type=int, default=960)
     ap.add_argument("--tracker-height", type=int, default=544)
+    # P3.5: optional analytics. Requires --tracker-config-path. When set,
+    # nvdsanalytics is appended after nvtracker and the pad probe attaches
+    # to analytics.src so the SDK's frame/object NVDS_*_META_NVDSANALYTICS
+    # user-meta is visible.
+    ap.add_argument(
+        "--analytics-config-path",
+        default="",
+        help="Path to nvdsanalytics config (INI .txt); if set, nvdsanalytics is enabled.",
+    )
     args = ap.parse_args()
 
     if not args.rtsp:
@@ -357,11 +529,23 @@ def main() -> int:
     if tracker_config and tracker_lib and not os.path.isfile(tracker_lib):
         print(f"ERROR: tracker lib not found: {tracker_lib}", file=sys.stderr)
         return 2
+    analytics_config = args.analytics_config_path or None
+    if analytics_config and not os.path.isfile(analytics_config):
+        print(f"ERROR: analytics config not found: {analytics_config}", file=sys.stderr)
+        return 2
+    if analytics_config and not tracker_config:
+        print(
+            "ERROR: --analytics-config-path requires --tracker-config-path (nvdsanalytics "
+            "operates on tracked objects)",
+            file=sys.stderr,
+        )
+        return 2
 
     print(
         f"pyds metadata app starting url={_redact(args.rtsp)} "
         f"pgie={args.pgie_config} seconds={args.seconds} "
-        f"tracker={'on' if tracker_config else 'off'}",
+        f"tracker={'on' if tracker_config else 'off'} "
+        f"analytics={'on' if analytics_config else 'off'}",
         flush=True,
     )
 
@@ -378,12 +562,13 @@ def main() -> int:
             tracker_lib=tracker_lib,
             tracker_width=args.tracker_width,
             tracker_height=args.tracker_height,
+            analytics_config=analytics_config,
         )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    probe = _make_pad_probe(state, args.width, args.height)
+    probe = _make_pad_probe(state, args.width, args.height, analytics=bool(analytics_config))
     probe_element.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, probe, None)
 
     loop = GLib.MainLoop()
@@ -429,6 +614,16 @@ def main() -> int:
         "metadata_emitted": state.metadata_emitted,
         "samples_emitted": state.samples_emitted,
     }
+    if analytics_config:
+        summary["analytics_enabled"] = True
+        summary["has_analytics_metadata"] = state.has_analytics_metadata
+        summary["roi_metadata_count"] = state.roi_metadata_count
+        summary["line_metadata_count"] = state.line_metadata_count
+        summary["overcrowding_metadata_count"] = state.overcrowding_metadata_count
+        summary["direction_metadata_count"] = state.direction_metadata_count
+        summary["objects_with_roi_metadata"] = state.objects_with_roi_metadata
+        summary["objects_with_line_metadata"] = state.objects_with_line_metadata
+        summary["analytics_labels"] = sorted(state.analytics_labels)
     print(_SUMMARY_PREFIX + json.dumps(summary), flush=True)
     return 0 if state.frames_seen > 0 else 1
 

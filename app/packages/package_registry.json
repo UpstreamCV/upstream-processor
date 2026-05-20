@@ -50,6 +50,16 @@
       "supports": {
         "tracker_probe": true
       }
+    },
+    {
+      "package_id": "deepstream.analytics_probe.v0",
+      "display_name": "DeepStream Analytics Probe v0",
+      "runtime": "deepstream",
+      "description": "DeepStream 8.0 + pyds metadata probe with nvtracker AND nvdsanalytics enabled. Same pyds pad probe as deepstream.tracker_probe.v0 but inserts an nvdsanalytics element after nvtracker; the pad probe walks NvDsUserMeta on both frames (NVDS_FRAME_META_NVDSANALYTICS -> NvDsAnalyticsFrameMeta: objInROIcnt / objLCCumCnt / objLCCurrCnt / ocStatus) and objects (NVDS_OBJ_META_NVDSANALYTICS -> NvDsAnalyticsObjInfo: roiStatus / lcStatus / dirStatus / ocStatus) and surfaces analytics counters/labels in the worker status payload. v0 ships a hand-authored ROI + line-crossing config (1280x720); dashboard-driven geometry is a later milestone. Status/debug evidence only -- no observations, no metadata adapter, no rules/events, no API writes.",
+      "outputs": [],
+      "supports": {
+        "analytics_probe": true
+      }
     }
   ]
 }

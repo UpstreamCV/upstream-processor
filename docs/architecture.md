@@ -410,3 +410,118 @@ fields. ``tests/test_package_resolver.py`` adds a tracker-package case.
 Out of scope (still): ``ObservationWriter`` integration,
 ``POST /observations``, the final metadata adapter, ``nvdsanalytics``,
 line crossing, zones, Triton, dashboard, rules.
+
+## P3.5 — Analytics Metadata Probe
+
+Splices ``nvdsanalytics`` into the tracker pipeline so the SDK's ROI /
+line-crossing / overcrowding / direction metadata is attached to each
+``NvDsFrameMeta`` (under ``frame_user_meta_list``) and ``NvDsObjectMeta``
+(under ``obj_user_meta_list``); the pad probe walks both and folds the
+result into the worker status payload. v0 ships a hand-authored ROI +
+line config; dashboard-driven geometry is a later milestone. Still
+**no observations**.
+
+- **Package** — ``deepstream.analytics_probe.v0`` with
+  ``supports.analytics_probe: true``. Existing packages are untouched.
+  Mode dispatch in ``DeepStreamWorker._mode`` is now
+  ``analytics > tracker > metadata > inference > decode``.
+
+- **Pipeline shape** (P3.5 addition in **bold**):
+
+  ``rtspsrc(tcp, latency=200) → rtph264depay → h264parse →
+  nvv4l2decoder → nvstreammux(batch=1) → nvinfer(<pgie.txt>) →
+  nvtracker(<tracker_config.yml>) →
+  **nvdsanalytics(<analytics_config.txt>)** → nvvideoconvert →
+  fakesink``
+
+  Pad probe attaches to **``analytics.src``** (one element further down
+  than P3) so by the time it walks the meta lists, both the tracker has
+  populated ``object_id`` *and* nvdsanalytics has attached its
+  ``NVDS_*_META_NVDSANALYTICS`` user-meta to frames + tracked objects.
+
+- **Config builder** —
+  :func:`~app.runtimes.deepstream_runtime.inference.build_analytics_config`
+  returns an INI body modelled on the DS 8.0 sample
+  ``config_nvdsanalytics.txt`` but stripped to one ROI + one
+  line-crossing rule. v0 geometry: ROI is a central polygon spanning
+  20–80% of frame width and 10–90% of frame height; the line is
+  horizontal across the middle of that ROI (x ∈ 25–75%). Direction
+  reference points are seeded perpendicular to the line so "any
+  crossing" trips the LC event in ``mode=loose``. Frame dimensions are
+  validated up front (``ValueError`` on non-positive). Pure / side-effect
+  free.
+
+- **Process manager** —
+  :class:`~app.runtimes.deepstream_runtime.metadata_probe.DeepStreamMetadataProcessManager`
+  gains an ``analytics_enabled`` flag that requires
+  ``tracker_enabled`` (nvdsanalytics operates on tracked objects;
+  both the PM constructor and the pure docker command builder raise
+  ``ValueError`` if asked to enable analytics without tracker). When
+  set, ``_prepare_work_dir`` also writes ``analytics_config.txt`` into
+  the per-run temp dir; the container name prefix flips from
+  ``upstream-dst-`` to ``upstream-dsa-``. Cleanup, shutdown hardening,
+  RTSP redaction, and the docker stop chain are unchanged.
+
+- **In-container pyds app** —
+  ``pyds_metadata_app.py`` accepts an optional ``--analytics-config-path``
+  CLI arg; when set, it requires ``--tracker-config-path``, splices
+  ``nvdsanalytics`` after ``nvtracker``, and attaches the pad probe
+  to the analytics src pad. The probe walks
+  ``frame_meta.frame_user_meta_list`` for entries whose
+  ``user_meta.base_meta.meta_type == pyds.NVDS_FRAME_META_NVDSANALYTICS``
+  and casts the payload via ``pyds.NvDsAnalyticsFrameMeta.cast(...)``;
+  similarly for ``obj_meta.obj_user_meta_list`` →
+  ``pyds.NVDS_OBJ_META_NVDSANALYTICS`` →
+  ``pyds.NvDsAnalyticsObjInfo.cast(...)``. Frame-level fields surfaced:
+  ``objInROIcnt`` / ``objLCCumCnt`` / ``objLCCurrCnt`` / ``ocStatus``;
+  object-level: ``roiStatus`` / ``lcStatus`` / ``dirStatus`` /
+  ``ocStatus``. Frame-level analytics lands under
+  ``frame.source["analytics"]``; per-object analytics under
+  ``object.debug["analytics"]``. ``NeutralObjectMetadata`` gained a
+  ``debug: dict[str, Any]`` mirror of the frame-level field so the
+  schema stays ``extra="forbid"`` at every other level.
+
+- **Status payload** — when ``self._mode == "analytics_probe"`` the
+  payload (in addition to all metadata + tracker fields) carries:
+  ``analytics_enabled``, ``has_analytics_metadata``,
+  ``roi_metadata_count`` (frames with ROI user-meta),
+  ``line_metadata_count`` (frames with LC user-meta),
+  ``overcrowding_metadata_count``, ``direction_metadata_count``,
+  ``objects_with_roi_metadata``, ``objects_with_line_metadata``,
+  ``analytics_labels_count`` (total distinct ROI / LC / direction
+  labels observed), and ``analytics_labels_sample`` (FIFO-bounded by
+  ``UPSTREAM_DEEPSTREAM_ANALYTICS_LABELS_SAMPLE_LIMIT`` = 20). The
+  ``tracker_probe`` and ``metadata_probe`` modes are unchanged — they
+  do NOT advertise the analytics fields.
+
+- **Config** (``app/config.py``):
+  ``deepstream_analytics_labels_sample_limit`` (20).
+  Env-overridable. Reuses every existing pyds-image / tracker /
+  queue / sample / timeout knob.
+
+Coverage: ``tests/test_deepstream_analytics_probe.py`` (14 tests)
+exercises package resolution, mode dispatch (analytics wins over
+tracker / metadata; tracker / metadata still hold their own ground), the
+pure ``build_analytics_config`` helper (ROI + LC sections present,
+``ValueError`` on bad dimensions / empty labels), the docker command
+builder (rejects analytics-without-tracker; includes
+``--analytics-config-path`` when both flags are set), the real PM
+(``analytics_config.txt`` is written, ``upstream-dsa-`` container
+prefix, cleanup on stop, pre-flight ValueError on
+analytics-without-tracker), the full ``analytics_probe`` lifecycle
+(frames with per-object ROI / LC / direction + frame-level
+cumulative counts → ``has_analytics_metadata=True``,
+``unique_tracker_ids_count=1``, label sample
+``{"entry-roi", "entry-line", "dirSouth"}``), label-sample is FIFO-
+bounded under 5 distinct labels with limit=3 → first three kept, an
+analytics_probe run that surfaces ``analytics_enabled=True`` even when
+no nvdsanalytics meta arrived (scene didn't trigger events), a
+regression that ``tracker_probe`` mode does NOT add analytics fields,
+malformed analytics payloads don't crash the worker, and the
+``Unsupported SM`` redaction path still works in analytics mode.
+``tests/test_package_resolver.py`` adds an analytics-package case.
+**No Docker, no GPU, no pyds/gi anywhere in tests.**
+
+Out of scope (still): ``ObservationWriter`` integration,
+``POST /observations``, the final metadata adapter, dashboard-driven
+ROI / line geometry, rules / events, billing.

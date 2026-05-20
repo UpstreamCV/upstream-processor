@@ -4,6 +4,108 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P3.5: Analytics Metadata Probe
+
+### Summary
+Splices `nvdsanalytics` into the tracker pipeline so the SDK's ROI /
+line-crossing / overcrowding / direction metadata is attached to
+`NvDsFrameMeta` (frame-level `objInROIcnt` / `objLCCumCnt` / `ocStatus`)
+and `NvDsObjectMeta` (per-object `roiStatus` / `lcStatus` /
+`dirStatus`); the pyds pad probe walks `frame_user_meta_list` /
+`obj_user_meta_list`, folds the result under `frame.source["analytics"]`
+and `object.debug["analytics"]`, and the worker surfaces bounded
+counters + a sample of distinct labels in the status payload. New
+package `deepstream.analytics_probe.v0` selects the mode via
+most-specific-wins ordering (analytics > tracker > metadata > inference
+> decode). v0 ships a hand-authored ROI + line-crossing config aimed
+at 1280×720; dashboard-driven geometry is a later milestone. **No
+observations, no metadata adapter, no rules/events, no API contract
+change.**
+
+### What changed
+- `app/packages/package_registry.json` — new
+  `deepstream.analytics_probe.v0` (`supports.analytics_probe: true`).
+- `app/config.py` — `deepstream_analytics_labels_sample_limit` (20).
+- `app/runtimes/deepstream_runtime/inference.py` — pure
+  `build_analytics_config(frame_width, frame_height, roi_label,
+  line_label)` returning an INI body with one `[roi-filtering-stream-0]`
+  + one `[line-crossing-stream-0]` section. Central rectangle ROI
+  (20-80% × 10-90% of frame), horizontal line across the middle of the
+  ROI (x ∈ 25-75%), direction reference perpendicular to the line in
+  `mode=loose`. Rejects non-positive dimensions / empty labels.
+- `app/runtimes/deepstream_runtime/metadata_probe.py` —
+  `analytics_enabled` flag on the docker command builder and the
+  `DeepStreamMetadataProcessManager`; both raise `ValueError` if asked
+  to enable analytics without tracker (nvdsanalytics operates on
+  tracked objects). When set, `_prepare_work_dir` also writes
+  `analytics_config.txt` into the per-run temp dir; container name
+  prefix flips from `upstream-dst-` to `upstream-dsa-`. The
+  in-container app additionally gets `--analytics-config-path`.
+- `app/runtimes/deepstream_runtime/pyds_metadata_app.py` — optional
+  `nvdsanalytics` element appended after `nvtracker` when
+  `--analytics-config-path` is set (requires `--tracker-config-path`),
+  the pad probe attaches to `analytics.src`, and the probe walks
+  `frame_user_meta_list` /  `obj_user_meta_list` for
+  `NVDS_*_META_NVDSANALYTICS` user-meta via
+  `pyds.NvDsAnalyticsFrameMeta.cast(...)` /
+  `pyds.NvDsAnalyticsObjInfo.cast(...)`. Frame-level analytics
+  (`objInROIcnt`, `objLCCumCnt`, `objLCCurrCnt`, `ocStatus`) land under
+  `frame.source["analytics"]`; per-object (`roiStatus`, `lcStatus`,
+  `dirStatus`, `ocStatus`) under `object.debug["analytics"]`. Summary
+  line gains analytics counters too.
+- `app/observations/metadata_models.py` — `NeutralObjectMetadata`
+  gained `debug: dict[str, Any] = Field(default_factory=dict)` so the
+  per-object analytics blob has a typed home without leaking
+  DeepStream-specific keys at the top level.
+- `app/runtimes/deepstream_runtime/worker.py` — `_ANALYTICS_MODE`,
+  mode dispatch ordering (analytics > tracker > metadata > inference >
+  decode), `_default_pm_factory` flips `tracker_enabled` +
+  `analytics_enabled` for analytics mode. `_MetadataCounters` gains
+  analytics counters (`has_analytics_metadata`, `roi_metadata_count`,
+  `line_metadata_count`, `overcrowding_metadata_count`,
+  `direction_metadata_count`, `objects_with_roi_metadata`,
+  `objects_with_line_metadata`, `analytics_labels: set[str]`,
+  `analytics_labels_sample: list[str]` (FIFO-bounded)). The status
+  payload helper adds the analytics fields only in `analytics_probe`
+  mode; metadata / tracker payloads are unchanged.
+- `tests/test_package_resolver.py` — analytics-package resolver case.
+- `tests/test_deepstream_analytics_probe.py` — 14 new tests
+  (no Docker / GPU / pyds / gi).
+- `.env.example`, `docs/architecture.md`, `docs/local-dev.md`,
+  `docs/commit-log.md`, `app/runtimes/deepstream_runtime/README.md`,
+  `README.md` — documentation.
+
+### Analytics config + pyds research (in-container)
+- Sample config: `/opt/nvidia/deepstream/deepstream-8.0/sources/apps/
+  sample_apps/deepstream-nvdsanalytics-test/config_nvdsanalytics.txt`
+  (INI; `[property]`, `[roi-filtering-stream-N]`,
+  `[line-crossing-stream-N]`, `[overcrowding-stream-N]`,
+  `[direction-detection-stream-N]`).
+- Plugin: `nvdsanalytics` GStreamer element, library
+  `/opt/nvidia/deepstream/deepstream/lib/gst-plugins/
+  libnvdsgst_dsanalytics.so`. No `ll-lib-file` knob needed (analytics
+  is single-implementation).
+- Python API confirmed via `python3 -c "import pyds; ..."` in the
+  DS 8.0 + pyds container:
+  - `pyds.NvDsAnalyticsFrameMeta` exposes `objCnt`, `objInROIcnt`,
+    `objLCCumCnt`, `objLCCurrCnt`, `ocStatus`, `unique_id` + `cast`.
+  - `pyds.NvDsAnalyticsObjInfo` exposes `roiStatus`, `lcStatus`,
+    `ocStatus`, `dirStatus`, `objStatus`, `unique_id` + `cast`.
+  - `pyds.NVDS_FRAME_META_NVDSANALYTICS` /
+    `pyds.NVDS_OBJ_META_NVDSANALYTICS` are the user-meta type tags.
+  - `NvDsFrameMeta.frame_user_meta_list` /
+    `NvDsObjectMeta.obj_user_meta_list` walk the user-meta linked
+    lists, casting each entry via `pyds.NvDsUserMeta.cast(...)`.
+
+### Out of scope (next milestones)
+- `ObservationWriter` integration + `POST /observations` (P4).
+- Final metadata adapter (P4).
+- Dashboard-driven ROI / line geometry (operator-authored zone /
+  line config, currently hand-rolled in `build_analytics_config`).
+- Rules / events on top of the analytics counters.
+
+---
+
 ## 2026-05-20 - P3: Tracker Metadata Probe
 
 ### Summary
