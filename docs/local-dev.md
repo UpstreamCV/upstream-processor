@@ -488,6 +488,89 @@ rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
 rm -rf /tmp/upstream-live-p3.5
 ```
 
+## Live verification checklist (P4-B — line-crossing observation writes)
+
+Same launch pattern as P3.5, but **now the api-server must have the
+``processor.line_crossing`` Literal widening deployed** (commit
+``88eabbc`` in ``upstream-api-server`` or later). With both ends
+matched, an operator crossing the configured midline produces real
+``processor.line_crossing`` rows in the ``observations`` table — one
+per integer increment of ``objLCCumCnt`` — with a deterministic
+``idempotency_key`` inside ``payload``.
+
+### Launch
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p4b
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p4b/secret.env
+chmod 600 /tmp/upstream-live-p4b/secret.env
+
+# rsync the repo into /tmp/upstream-live-p4b/repo and build a venv with
+# python3.12 -m venv + pip install -e . (same recipe as P3.5).
+
+cd /tmp/upstream-live-p4b/repo
+set -a; . /tmp/upstream-live-p4b/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p4b_line_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p4b/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p4b/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p4b/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p4b/processor.pid
+```
+
+### Lifecycle checklist
+
+```
+[ ] api-server is deployed with processor.line_crossing in the Literal
+[ ] Start a valid upstream-agent stream (camera scene must contain at
+    least one TrafficCamNet class so a person on the line is detected)
+[ ] Wait for validation_status=true; eligible-sessions returns 1 row
+[ ] Worker starts (log: "deepstream worker ... mode=analytics_probe")
+[ ] pyds container `upstream-dsa-*` starts; engine builds (~30 s cold)
+[ ] In-container log: `[NvMultiObjectTracker] Initialized`,
+    nvdsanalytics parsed `analytics_config.txt`
+[ ] Operator crosses the configured midline twice
+[ ] frame.source.analytics.line_crossing_cumulative ramps 0 → 1 → 2
+    in the docker logs
+[ ] Status posts starting → attached → processing with payload
+    carrying observations_enabled=true, observations_emitted_count,
+    line_crossing_observations_emitted (both >= 2 by end of cycle),
+    observation_write_errors_count == 0, last_observation_at non-null
+[ ] processor_statuses row: runtime=deepstream,
+    package_id=deepstream.analytics_probe.v0
+[ ] observations table query:
+       select type, payload->>'idempotency_key', observed_at
+       from observations
+       where processor_id = 'proc_p4b_line_live'
+       order by created_at desc;
+    Returns exactly 2 rows of type=processor.line_crossing with
+    idempotency_keys ending :entry-line:1 and :entry-line:2
+[ ] Steady scene (a second 180 s cycle with no crossings) emits zero
+    additional rows
+[ ] SIGINT to the real PID; processor exits within ~25 s
+    (clean shutdown line)
+[ ] pyds container stops cleanly (no lingering `upstream-dsa-*`)
+[ ] Status posts `stopped`
+[ ] No raw RTSP URL, stream key, secret, Authorization or Bearer in logs
+[ ] Temp work dir cleaned (no /tmp/upstream-p35-analytics.* leftovers)
+```
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dsa|upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p4b
+```
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

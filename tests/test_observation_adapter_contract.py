@@ -34,6 +34,7 @@ import pytest
 from app.observations.observation_adapter import (
     CANDIDATE_LINE_CROSSING_TYPE,
     CANDIDATE_OBSERVATION_TYPES,
+    CANDIDATE_ROI_OCCUPANCY_TYPE,
     LineCrossingState,
     RoiOccupancyState,
     build_line_crossing_idempotency_key,
@@ -45,15 +46,20 @@ from app.observations.schemas import OBSERVATION_TYPES
 # --- type registry guards ---------------------------------------------
 
 
-def test_candidate_types_not_in_server_whitelist_yet() -> None:
-    """P4-A is a probe: the adapter MUST NOT be using a type string the
-    deployed server already accepts, or we'd risk a real POST landing
-    in production. P4-B widens both ends in lockstep."""
-    for t in CANDIDATE_OBSERVATION_TYPES:
-        assert t not in OBSERVATION_TYPES, (
-            f"{t!r} unexpectedly in OBSERVATION_TYPES — "
-            "the schemas widening should happen in P4-B with the matching api-server PR"
-        )
+def test_line_crossing_now_in_server_whitelist() -> None:
+    """P4-B widened the api-server ``ProcessorObservationType`` Literal
+    and this repo's ``schemas.OBSERVATION_TYPES`` tuple in lock-step,
+    so ``processor.line_crossing`` is now accepted by ``ObservationWriter``.
+    Test pins that post-P4-B state — a future demotion fails here."""
+    assert CANDIDATE_LINE_CROSSING_TYPE in OBSERVATION_TYPES
+
+
+def test_roi_occupancy_still_not_in_server_whitelist() -> None:
+    """``processor.roi_occupancy`` is the next candidate (P4-C). MUST
+    NOT have been accidentally widened in P4-B. The adapter still
+    carries the ``RoiOccupancyState`` machine but no production write
+    path — this regression guards against an over-eager Literal edit."""
+    assert CANDIDATE_ROI_OCCUPANCY_TYPE not in OBSERVATION_TYPES
 
 
 def test_candidate_types_use_processor_dotted_namespace() -> None:

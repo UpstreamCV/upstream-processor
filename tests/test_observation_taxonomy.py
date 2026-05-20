@@ -70,19 +70,27 @@ def test_every_status_is_valid() -> None:
 # --- P4-A.5's load-bearing decision ------------------------------------
 
 
-def test_exactly_one_type_proposed_for_first_api_add() -> None:
-    """P4-A.5 explicitly chose ONE type to lead the api-server
-    widening (processor.line_crossing). Multiple types here would
-    mean the next milestone is doing more than one thing."""
-    assert len(PROPOSED_FIRST_API_ADD_TYPES) == 1, (
-        "P4-A.5 picks exactly one type to add to the api-server "
-        "first; multiple would mean a wider P4-B than the brief allows"
+def test_at_most_one_type_proposed_for_first_api_add() -> None:
+    """The processing layer widens the api-server one type at a time;
+    multiple ``proposed_first_api_add`` rows would mean a future
+    milestone is doing more than one thing. After P4-B the count is
+    zero (processor.line_crossing flipped to ``api_supported``); the
+    next P4-C milestone may re-populate the slot with the next
+    candidate (likely ``processor.roi_occupancy``)."""
+    assert len(PROPOSED_FIRST_API_ADD_TYPES) <= 1, (
+        "the processing layer adds one type to the api-server at a "
+        f"time; got {list(PROPOSED_FIRST_API_ADD_TYPES)!r}"
     )
 
 
-def test_first_api_add_is_line_crossing() -> None:
-    """The whole point of P4-A.5 is that this is the next type."""
-    assert PROPOSED_FIRST_API_ADD_TYPES == ("processor.line_crossing",)
+def test_line_crossing_is_now_api_supported() -> None:
+    """P4-B flipped ``processor.line_crossing`` from
+    ``proposed_first_api_add`` to ``api_supported`` in lock-step with
+    the api-server widening. This test is the post-P4-B state lock —
+    a future edit that demotes the type fails here."""
+    assert "processor.line_crossing" in API_SUPPORTED_TYPES
+    assert "processor.line_crossing" not in PROPOSED_FIRST_API_ADD_TYPES
+    assert "processor.line_crossing" not in DEFERRED_TYPES
 
 
 def test_no_proposed_type_is_already_supported() -> None:
