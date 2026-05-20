@@ -4,6 +4,90 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-21 - P4-D: Zone Entered / Zone Exited Observations
+
+### Summary
+Combines P3's stable ``tracker_id`` with P3.5's per-object ROI
+labels to emit per-track zone transition events. When the same
+tracked object is stably inside an ROI for N frames, emit
+``processor.zone_entered``; when the same tracked object is
+observed without the ROI label for N frames, emit
+``processor.zone_exited``. **Object disappearance does NOT emit
+zone_exited** — a tracker drop-frame is indistinguishable from a
+real exit, so absence is treated as silent. Coordinated two-repo
+change (api-server widens the Literal first; processor adds the
+adapter + worker emit path in lockstep).
+
+### What changed
+- **upstream-api-server** (separate commit `feat: allow processor
+  zone transition observations`): widens
+  ``ProcessorObservationType`` with the two strings; adds two
+  positive tests + ``test_future_observation_types_still_rejected``
+  guarding dwell / direction / track / telemetry. No DB
+  migration.
+- **upstream-processor**:
+  - ``app/observations/schemas.py`` — widen ``ObservationType``
+    Literal + ``OBSERVATION_TYPES`` tuple.
+  - ``app/observations/observation_taxonomy.py`` — flip both
+    ``processor.zone_entered`` and ``processor.zone_exited`` rows
+    from ``deferred`` to ``api_supported``.
+  - ``app/observations/observation_adapter.py``:
+    - new ``CANDIDATE_ZONE_*`` constants in the tuple;
+    - new ``ZoneTransitionEvent`` frozen dataclass + two
+      idempotency-key builders;
+    - new ``ZoneMembershipState`` dataclass (~150 lines): per
+      ``(track_id, zone_id)`` committed + pending debounce + per
+      ``(track_id, zone_id, transition_type)`` sequence counter.
+      First-observed-outside is a no-op (Case A). Inside-flap
+      clears pending (Case B). Transitions accumulate then commit
+      + emit when stable (Case C). Disappearance never decrements
+      / never times out / never emits.
+  - ``app/config.py`` — new
+    ``deepstream_zone_membership_stability_frames: int = 5``
+    (env-overridable via
+    ``UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES``).
+  - ``app/runtimes/deepstream_runtime/worker.py``:
+    - imports ``ZoneMembershipState``;
+    - instantiates ``zone_state`` parallel to ``line_state`` and
+      ``roi_state``;
+    - new ``_emit_zone_transitions`` consumer-loop helper mirrors
+      ``_emit_roi_occupancies`` (same error-handling, same writer
+      contract, same counters surface);
+    - ``_MetadataCounters`` gains
+      ``zone_entered_observations_emitted`` /
+      ``zone_exited_observations_emitted``;
+    - analytics status payload gains
+      ``zone_transition_observations_enabled``, the two per-type
+      counters, and ``zone_membership_stability_frames``.
+  - ``.env.example`` — documents the new knob.
+  - ``tests/conftest.py`` — ``fast_settings`` adds
+    ``deepstream_zone_membership_stability_frames=1`` so existing
+    tests get immediate-transition behavior without per-test
+    overrides.
+
+### Tests
+- **307 passing** in upstream-processor (267 prior + 40 net new).
+  ruff + ruff-format + ``mypy app`` clean.
+- **257 passing** in upstream-api-server (254 prior + 3 new).
+
+### Accuracy caveat
+TrafficCamNet misses frames; nvtracker drops/reassigns IDs;
+nvdsanalytics labels flap. **P4-D is judged by adapter correctness
+given the metadata it sees, not by scene accuracy.** Live
+verification is a smoke test. When live results look messy,
+classify cause as detection / tracker / analytics / adapter —
+only adapter is a P4-D regression.
+
+### Out of scope (next milestones)
+- Dwell observations (P4-E). Builds on ``ZoneMembershipState``'s
+  ``stable_membership`` map.
+- Object-disappearance-emits-exit policy.
+- Per-zone configurable thresholds.
+- Server-side idempotency column.
+- Direction / track-update / telemetry types.
+
+---
+
 ## 2026-05-20 - P4-C Cleanup: ROI Debounce / Hysteresis
 
 ### Summary

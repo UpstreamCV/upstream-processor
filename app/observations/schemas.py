@@ -33,6 +33,13 @@ ObservationType = Literal[
     "processor.line_crossing",
     # P4-C: ROI occupancy snapshot (on-change OR interval, never per-frame).
     "processor.roi_occupancy",
+    # P4-D: per-track zone transitions. Stable outside-to-inside emits
+    # zone_entered; stable inside-to-outside emits zone_exited. Both
+    # gated by ``UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES``
+    # (default 5) so jitter doesn't flood; object disappearance does
+    # NOT emit zone_exited.
+    "processor.zone_entered",
+    "processor.zone_exited",
 ]
 
 OBSERVATION_TYPES: tuple[ObservationType, ...] = (
@@ -41,6 +48,8 @@ OBSERVATION_TYPES: tuple[ObservationType, ...] = (
     "processor.mock_detection",
     "processor.line_crossing",
     "processor.roi_occupancy",
+    "processor.zone_entered",
+    "processor.zone_exited",
 )
 
 

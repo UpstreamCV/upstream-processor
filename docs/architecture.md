@@ -1340,3 +1340,185 @@ On each frame:
   ``interval``).
 - No retry / backoff loop around writer.emit.
 - ``processor.line_crossing`` behavior unchanged.
+
+## P4-D — Zone Entered / Zone Exited Observations
+
+Combines the two raw signals from P3 + P3.5 — stable ``tracker_id``
+and per-object ``debug.analytics.roi_labels`` — into per-track zone
+transition events. When the same tracked object is stably inside a
+zone for N frames, emit ``processor.zone_entered``. When the same
+tracked object is observed stably outside the zone for N frames,
+emit ``processor.zone_exited``.
+
+### Lockstep schema widening (no DB migration)
+- **upstream-api-server**:
+  ``src/upstream_api/schemas/processor.py`` — ``ProcessorObservationType``
+  Literal gains ``"processor.zone_entered"`` and
+  ``"processor.zone_exited"``. ``tests/test_processor.py`` adds
+  two pinned positive tests + ``test_future_observation_types_still_rejected``
+  (regression guard against accidentally widening dwell / direction /
+  track / telemetry types).
+- **upstream-processor**:
+  ``app/observations/schemas.py`` adds the same two strings to
+  ``ObservationType`` Literal + ``OBSERVATION_TYPES`` tuple.
+  ``app/observations/observation_taxonomy.py`` flips both rows from
+  ``deferred`` to ``api_supported``.
+
+The post-P4-C ``test_zone_dwell_track_types_still_unsupported`` guard
+becomes ``test_dwell_track_telemetry_types_still_unsupported``: the
+two zone types move out of the assertion (now supported), the dwell
++ direction + track + telemetry types stay in it.
+
+### Adapter design — ZoneMembershipState
+**File:** ``app/observations/observation_adapter.py``.
+
+New constants ``CANDIDATE_ZONE_ENTERED_TYPE`` /
+``CANDIDATE_ZONE_EXITED_TYPE`` join the existing CANDIDATE tuple.
+``ZoneTransitionEvent`` is a new frozen dataclass with top-level
+runtime-neutral fields (``zone_id`` / ``zone_label`` / ``track_id``
+/ ``sequence`` / ``idempotency_key`` + optional ``class_id`` /
+``class_label``). DeepStream provenance lives under ``source``;
+``debug`` carries ``transition`` (``outside_to_inside`` /
+``inside_to_outside``), ``stability_frames_required``, ``frame_num``,
+``geometry_source``, and the raw ``roi_labels`` list.
+
+**State machine** (per ``(track_id, zone_id)``):
+
+- ``stable_membership[(t, z)]`` — committed state.
+  ``None`` (never seen inside) / ``True`` (stably inside) /
+  ``False`` (stably outside, only reachable after a prior True).
+- ``pending_membership[(t, z)]`` — candidate value being
+  accumulated.
+- ``pending_seen_frames[(t, z)]`` — consecutive observed-frames count
+  for the candidate.
+- ``sequence_by_track_zone_transition[(t, z, type)]`` — per-(track,
+  zone, transition-type) emit counter. Re-enter after exit gives
+  ``zone_entered`` sequence=2 while ``zone_exited`` is independently
+  at sequence=1.
+
+**Per-frame logic** in ``absorb_object(track_id, zone_set,
+roi_labels, occurred_at, ...)``:
+
+1. For each zone in ``zone_set``:
+   - ``observed = zone in roi_labels``.
+   - ``committed = stable_membership.get((track_id, zone))``.
+   - **Case A** (``committed is None and observed is False``):
+     no-op. We don't track "outside" for tracks we've never seen
+     inside this zone.
+   - **Case B** (``observed == committed``): clear pending.
+   - **Case C** (``observed != committed``): update pending
+     (matching → seen += 1; different → reset to seen=1). If
+     threshold met, commit + emit. Emit reason is encoded in
+     ``debug["transition"]`` as ``"outside_to_inside"`` (→ emit
+     ``zone_entered``) or ``"inside_to_outside"`` (→ emit
+     ``zone_exited``).
+
+**Crucial invariant: object disappearance does NOT emit
+``zone_exited``.** A tracker drop-frame is indistinguishable from a
+real exit in this milestone; we only act on observed frames. Pending
+state survives an arbitrary number of missing frames. This is the
+brief's explicit "do not infer exit from total disappearance"
+guidance.
+
+Default ``membership_stability_frames`` is ``1`` in the dataclass
+(legacy / backward-compat for direct unit-test callers) and ``5``
+in production via
+``Settings.deepstream_zone_membership_stability_frames``
+(env-overridable via
+``UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES``). Values
+``< 1`` are rejected at ``__post_init__``.
+
+### Worker integration
+``DeepStreamWorker._drive_metadata_probe`` instantiates ``zone_state``
+alongside the existing ``line_state`` / ``roi_state`` when in
+analytics mode with a writer. The consumer loop calls a new
+``_emit_zone_transitions`` helper directly after
+``_emit_roi_occupancies``. The new helper:
+
+- skips frames whose ``source.analytics.roi_counts`` is missing or
+  empty (no known zones for this frame),
+- iterates ``frame.objects`` and skips any object without a
+  ``tracker_id`` or without a ``debug.analytics.roi_labels`` list,
+- coerces ``roi_labels`` to ``set[str]`` defensively,
+- hands ``track_id`` / ``zone_set`` (= keys of ``roi_counts``) /
+  ``roi_labels`` to ``zone_state.absorb_object(...)``,
+- for each returned event, emits via the existing
+  ``ObservationWriter`` with the same try/except shape as
+  ``_emit_line_crossings`` / ``_emit_roi_occupancies``.
+
+### Status payload extension
+The analytics-mode payload (when a writer is wired) adds:
+``zone_transition_observations_enabled``,
+``zone_entered_observations_emitted``,
+``zone_exited_observations_emitted``,
+``zone_membership_stability_frames``. The shared
+``observation_write_errors_count`` covers writer errors for all
+three observation types.
+
+### Coverage
+- ``tests/test_zone_membership_state.py`` — **19 new tests** for
+  the pure adapter: threshold validation; default-1; first-observed-
+  outside is no-op; first stable inside emits after N frames;
+  stability=1 is immediate; repeated inside doesn't duplicate;
+  stable outside emits exited; single-frame outside flap does not
+  emit false exit; inside-outside-inside short flap is safe;
+  multi-track and multi-zone independence; re-enter increments
+  per-type sequence (1, 2 for enter; 1, 2 for exit); disappearance
+  does not emit; class_id / class_label preservation; debug shape
+  + transition string; idempotency key builders match event keys;
+  pending resets on return-to-committed.
+- ``tests/test_deepstream_zone_transition_emit.py`` — **17 new
+  tests** for the worker integration: schema lock-step; stable
+  inside emits zone_entered; stable outside emits zone_exited;
+  short ROI label flap doesn't emit false exit; tracker_id None /
+  missing roi_labels / non-list roi_labels / empty roi_counts all
+  skip safely; ``writer=None`` is silent; tracker_probe and
+  metadata_probe modes don't emit; transient ApiServerError raises
+  shared error counter without crashing; status payload exposes
+  threshold + per-type counters; counters distinguish entered vs
+  exited; combined frame emits line + ROI + zone independently;
+  re-enter / re-exit increments the per-type sequence.
+- ``tests/test_observation_adapter_contract.py`` — flips the P4-C
+  zone-deferred guard to two now-supported asserts plus a
+  re-aimed guard at dwell / direction / track / telemetry.
+- ``tests/test_observation_taxonomy.py`` — two new
+  ``test_zone_*_is_now_api_supported`` invariants.
+- ``tests/conftest.py`` — ``fast_settings`` adds
+  ``deepstream_zone_membership_stability_frames=1`` for same-shape
+  test brevity as the P4-C cleanup pattern.
+
+### Accuracy caveat (operator-facing)
+Live results will not be perfectly accurate. The TrafficCamNet probe
+misses frames; nvtracker drops / reassigns IDs; nvdsanalytics
+labels flap. **P4-D is judged by adapter correctness given the
+metadata it sees, not by whether the camera scene is understood
+correctly.** Live verification is a smoke test (no schema failures,
+no observation flood, no crashes, no leaks). Unit tests are the
+primary correctness gate.
+
+When live results look messy, classify the cause before flagging
+P4-D as broken:
+
+1. **Detection issue** — TrafficCamNet missed or falsely detected.
+2. **Tracker issue** — NvTracker changed IDs or lost a track.
+3. **Analytics metadata issue** — nvdsanalytics ROI labels don't
+   match the expected geometry.
+4. **Adapter issue** — given stable metadata, ZoneMembershipState
+   produced a wrong observation.
+
+Only #4 is a P4-D regression.
+
+### Out of scope (defer to P4-E+)
+- Dwell observations
+  (``processor.dwell_started`` / ``dwell_updated`` / ``dwell_exceeded``).
+  ``ZoneMembershipState``'s ``stable_membership`` map is the
+  foundation a future ``DwellState`` builds on (timer per
+  ``(track, zone, dwell_session)``).
+- Object-disappearance-emits-exit policy.
+- Per-zone configurable stability thresholds (one global setting
+  for now).
+- Server-side ``idempotency_key`` column + UNIQUE constraint.
+- Dashboard-driven ROI / line geometry.
+- Direction / track-update / telemetry types.
+- Class-id-conditional zone counting (P4-D treats every tracked
+  object as eligible regardless of class).

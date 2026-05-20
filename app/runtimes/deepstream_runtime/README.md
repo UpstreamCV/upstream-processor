@@ -118,8 +118,8 @@ Files:
     `DeepStreamMetadataProcessManager.stop()` and `_cleanup_work_dir()`
     are idempotent.
 
-**P4-B and P4-C widen this:** the `analytics_probe` mode now
-emits **two** real DeepStream-backed observation types via the
+**P4-B / P4-C / P4-D widen this:** the `analytics_probe` mode now
+emits **four** real DeepStream-backed observation types via the
 existing `ObservationWriter`:
 
 - `processor.line_crossing` (P4-B) — one per `objLCCumCnt`
@@ -135,14 +135,24 @@ existing `ObservationWriter`:
   suppresses TrafficCamNet's edge-frame detection flaps. During a
   pending change, the heartbeat reports the LAST STABLE count,
   not the unstable candidate.
+- `processor.zone_entered` / `processor.zone_exited` (P4-D) —
+  per-track zone transitions. Combines the stable ``tracker_id``
+  (P3) with per-object ``roi_labels`` (P3.5). Emits when the
+  tracked object's membership in the zone has been stable for
+  `UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES`
+  (default 5) consecutive **observed** frames. Disappearance
+  (the track simply vanishing) does NOT emit ``zone_exited`` —
+  only an observed-with-no-label trajectory does. Sequence is
+  per-(track, zone, transition-type) so re-enter / re-exit
+  produce distinct events with monotonic sequence numbers.
 
 The ``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
 ``tracker_probe`` modes remain observation-free. The pyds
 container still does not call the UpStream API; the adapters +
 writer run in the host asyncio consumer loop. Everything else is
-still deferred: **no zone enter/exit / dwell / direction
-events yet, no rules/events, no dashboard-driven geometry, no
-Triton.** KITTI / `UPSTREAM_METADATA` output is debug evidence —
+still deferred: **no dwell observations yet, no
+direction/track-update/telemetry types, no rules/events, no
+dashboard-driven geometry, no Triton.** KITTI / `UPSTREAM_METADATA` output is debug evidence —
 *not* final metadata extraction. The webhook secret never enters the pyds container
 (the in-container app never calls UpStream APIs; status posting stays
 with the outer supervisor). Default images: **DeepStream 8.0** for

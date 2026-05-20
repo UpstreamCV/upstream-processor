@@ -102,6 +102,21 @@ def test_roi_occupancy_is_now_api_supported() -> None:
     assert "processor.roi_occupancy" not in DEFERRED_TYPES
 
 
+def test_zone_entered_is_now_api_supported() -> None:
+    """P4-D flipped ``processor.zone_entered`` from ``deferred`` to
+    ``api_supported`` in lock-step with the api-server widening."""
+    assert "processor.zone_entered" in API_SUPPORTED_TYPES
+    assert "processor.zone_entered" not in PROPOSED_FIRST_API_ADD_TYPES
+    assert "processor.zone_entered" not in DEFERRED_TYPES
+
+
+def test_zone_exited_is_now_api_supported() -> None:
+    """Pairs with zone_entered; both transition types shipped in P4-D."""
+    assert "processor.zone_exited" in API_SUPPORTED_TYPES
+    assert "processor.zone_exited" not in PROPOSED_FIRST_API_ADD_TYPES
+    assert "processor.zone_exited" not in DEFERRED_TYPES
+
+
 def test_no_proposed_type_is_already_supported() -> None:
     """``proposed_first_api_add`` and ``api_supported`` are mutually
     exclusive — once a type is supported it must be flipped to

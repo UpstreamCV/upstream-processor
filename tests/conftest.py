@@ -63,6 +63,12 @@ def fast_settings():  # type: ignore[no-untyped-def]
             # so those tests' assumptions hold; tests that exercise the
             # debounce path explicitly override via ``model_copy``.
             "deepstream_roi_change_stability_frames": 1,
+            # P4-D: same rationale as the ROI debounce — production
+            # default is 5; tests that want immediate-transition
+            # behavior use ``fast_settings`` (= 1), tests that need to
+            # exercise the per-(track, zone) debounce explicitly
+            # override.
+            "deepstream_zone_membership_stability_frames": 1,
         }
     )
 
