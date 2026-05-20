@@ -421,6 +421,8 @@ class DeepStreamWorker(Runtime):
                 tracker_width=self._settings.deepstream_tracker_width,
                 tracker_height=self._settings.deepstream_tracker_height,
                 analytics_enabled=analytics_enabled,
+                analytics_roi_margin_pct=(self._settings.deepstream_analytics_roi_margin_pct),
+                analytics_class_ids=self._settings.deepstream_analytics_class_ids,
             )
         if self._mode == _INFERENCE_MODE:
             return DeepStreamInferenceProcessManager(
@@ -736,6 +738,33 @@ class DeepStreamWorker(Runtime):
             p["objects_with_line_metadata"] = counters.objects_with_line_metadata
             p["analytics_labels_count"] = len(counters.analytics_labels)
             p["analytics_labels_sample"] = list(counters.analytics_labels_sample)
+            # P4-D follow-up: live-debug diagnostics. When zone events
+            # don't emit, the operator needs to distinguish "no detection"
+            # from "wrong class" from "no ROI tag" from "adapter
+            # suppressed". The first three are pre-adapter; the fourth
+            # is a P4-D regression. Surface enough of the upstream state
+            # in the status payload to triage without re-running.
+            p["analytics_class_ids"] = self._settings.deepstream_analytics_class_ids
+            p["analytics_roi_margin_pct"] = float(
+                self._settings.deepstream_analytics_roi_margin_pct
+            )
+            # ``object_class_id_counts`` is the count of OBJECTS (not
+            # frames) per detected class_id seen by the worker; it
+            # would already be in ``class_counts`` for metadata_probe
+            # mode but we explicitly surface it under an analytics-
+            # specific name here so the live triage flow doesn't need
+            # to look at two different keys.
+            p["analytics_object_class_id_counts"] = {
+                str(k): int(v) for k, v in counters.class_counts.items()
+            }
+            # ``objects_with_roi_labels_count`` is the count of
+            # OBJECTS that had a non-empty per-object roiStatus list
+            # (i.e., ``roi_labels`` was attached). Equivalent to
+            # ``objects_with_roi_metadata`` but the name matches the
+            # diagnostic checklist in docs/local-dev.md so an operator
+            # can grep without rederiving.
+            p["objects_with_roi_labels_count"] = counters.objects_with_roi_metadata
+            p["roi_labels_sample"] = list(counters.analytics_labels_sample)
             # P4-B: observation-emit counters only land in the status
             # payload when the worker actually has a writer (analytics
             # + writer present). The flag stays False so an operator can

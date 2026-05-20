@@ -1522,3 +1522,73 @@ Only #4 is a P4-D regression.
 - Direction / track-update / telemetry types.
 - Class-id-conditional zone counting (P4-D treats every tracked
   object as eligible regardless of class).
+
+## P4-D Follow-up — ROI Label / Analytics Class Filter Fix
+
+### Why
+P4-D's live verification produced **zero zone events** — not because
+the adapter was broken, but because the upstream metadata pipeline
+never attached ``roi_labels`` to any tracked object. The triage
+classified this as a detection / analytics issue at the time, but a
+second look at the live evidence pinpointed the real root cause:
+**ROI geometry, not class filtering.**
+
+Live evidence:
+- Operator bbox bottom-center: ``(418, 719)`` on a 1280×720 frame.
+- ROI rectangle: ``(rx0, ry0) = (256, 72)`` to ``(rx1, ry1) = (1024, 648)``
+  — covering 20%-80% horizontally and 10%-90% vertically.
+- nvdsanalytics's per-object reference point for ROI containment is
+  the bbox bottom-center. ``y=719`` falls **71 pixels below the
+  ROI's y-max of 648**, so every observed frame correctly registered
+  the object as outside the ROI; ``roiStatus`` stayed empty and
+  ``roi_labels`` was never attached to the per-object meta.
+- ``class-id=-1`` was already in the analytics config, so the
+  brief's "class filter" hypothesis was wrong; the class filter
+  was already wide-open. The geometry was the smoking gun.
+
+### Fix
+1. **Widen the probe-default ROI**. New default is **5% margin on
+   each side** (5%-95% × 5%-95%, covering 90% × 90% of the frame
+   area). Far more forgiving for the camera-above-operator scene
+   pattern.
+2. **Make the geometry env-configurable**. New setting
+   ``deepstream_analytics_roi_margin_pct: float = 0.05``
+   (env: ``UPSTREAM_DEEPSTREAM_ANALYTICS_ROI_MARGIN_PCT``). Range
+   ``[0.0, 0.5)``; values outside fail at config generation.
+3. **Add a class-filter env knob** even though the existing
+   ``class-id=-1`` was already correct — this is the production-
+   tuning seam the brief requested. New setting
+   ``deepstream_analytics_class_ids: str = "all"``
+   (env: ``UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS``). Accepts
+   ``"all"`` / ``"-1"`` / ``""`` → ``-1`` (every class) or a single
+   integer like ``"2"`` → that class only. Comma-lists are rejected
+   with a clear error (nvdsanalytics' single-section ``class-id=``
+   takes one int).
+4. **Add live-debug diagnostics** to the analytics-mode status
+   payload so an operator can triage the next live run without
+   guessing:
+   - ``analytics_class_ids`` — the configured filter.
+   - ``analytics_roi_margin_pct`` — the configured geometry.
+   - ``analytics_object_class_id_counts`` — count of objects
+     observed per class_id.
+   - ``objects_with_roi_labels_count`` — count of objects whose
+     per-object ``roiStatus`` list was non-empty. When this stays
+     0 while ``analytics_object_class_id_counts`` is non-zero, the
+     issue is geometry / class filter — NOT the adapter.
+   - ``roi_labels_sample`` — bounded sample of distinct labels
+     seen on objects.
+
+### What this follow-up did NOT change
+- ``ZoneMembershipState`` (no bug found).
+- ``RoiOccupancyState`` / ``LineCrossingState`` (semantics unchanged).
+- ``processor.*`` observation Literal (no new types).
+- api-server (no schema or route change).
+- Pyds metadata app (already extracts ``roiStatus`` correctly).
+- Tracker config / model.
+
+### Out of scope (still deferred)
+- Dashboard-driven per-camera ROI / line geometry.
+- Multi-class filtering in a single nvdsanalytics section
+  (needs per-class sections).
+- Dwell observations (P4-E).
+- Server-side idempotency.

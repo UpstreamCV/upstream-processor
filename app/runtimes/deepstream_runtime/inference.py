@@ -205,12 +205,47 @@ _DEFAULT_ROI_LABEL = "entry-roi"
 _DEFAULT_LINE_LABEL = "entry-line"
 
 
+def normalize_analytics_class_ids(class_ids: str) -> str:
+    """Validate + normalize the operator-facing
+    ``UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS`` value into the
+    integer string nvdsanalytics' ``class-id=`` line expects.
+
+    Accepted inputs:
+      - ``"all"`` / ``""`` / ``"-1"`` → ``"-1"`` (any class counted)
+      - Single integer like ``"0"`` / ``"2"`` → unchanged
+      - Anything else → ``ValueError`` (multi-class lists are NOT
+        supported — nvdsanalytics' parser takes a single int per
+        section, so a comma-list would require multiple sections,
+        which is a later milestone)."""
+    raw = (class_ids or "").strip().lower()
+    if raw in ("", "all", "-1"):
+        return "-1"
+    # Reject comma-lists explicitly so a typo produces a clear error
+    # rather than a silently-mistuned filter.
+    if "," in raw:
+        raise ValueError(
+            f"deepstream_analytics_class_ids: comma-lists are not supported "
+            f"by nvdsanalytics' single-section class-id key; got {class_ids!r}. "
+            "Use 'all' for every class or a single integer for one class."
+        )
+    try:
+        _ = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"deepstream_analytics_class_ids must be 'all', '-1', or a single integer; "
+            f"got {class_ids!r}"
+        ) from exc
+    return raw
+
+
 def build_analytics_config(
     *,
     frame_width: int = 1280,
     frame_height: int = 720,
     roi_label: str = _DEFAULT_ROI_LABEL,
     line_label: str = _DEFAULT_LINE_LABEL,
+    roi_margin_pct: float = 0.05,
+    class_ids: str = "all",
 ) -> str:
     """``nvdsanalytics`` config (INI-style) covering one ROI + one line
     crossing. Modelled on the DS 8.0 sample
@@ -218,12 +253,18 @@ def build_analytics_config(
     actually surface in the status payload (ROI + LC). Pure / side-effect
     free so it is unit-testable without DeepStream.
 
-    The ROI is a central rectangle (covers ~60% of the frame area) — wide
-    enough that any person who walks across the scene at least partially
-    overlaps it. The line is horizontal across the middle of the ROI, so
-    walking through the ROI also crosses the line. Coordinates are in
-    pixels of the ``config-width`` / ``config-height`` (set to the
-    nvstreammux output, default 1280x720).
+    The ROI is a near-full-frame rectangle (covers ~90% x 90% by
+    default after the 5% margin on each side) — wide enough that an
+    operator's bbox bottom-center (nvdsanalytics' reference point
+    for ROI containment) is inside even when the operator stands at
+    the bottom edge of the frame. The line is horizontal across the
+    middle of the ROI, so walking through the ROI also crosses the
+    line. Coordinates are in pixels of the ``config-width`` /
+    ``config-height`` (set to the nvstreammux output).
+
+    ``roi_margin_pct`` controls the inset on each side of the frame
+    in [0, 0.49]; ``class_ids`` controls the per-section class
+    filter (see ``normalize_analytics_class_ids``).
 
     Geometry tuning for specific scenes is out of scope for v0; this
     config exists to prove the analytics extraction path, not to ship
@@ -234,12 +275,16 @@ def build_analytics_config(
         )
     if not roi_label or not line_label:
         raise ValueError("roi_label and line_label must be non-empty")
-    # Central ROI: (20%, 10%) -> (80%, 90%) of the frame. Polygon points
-    # are clockwise from top-left as nvdsanalytics expects.
-    rx0 = int(frame_width * 0.20)
-    rx1 = int(frame_width * 0.80)
-    ry0 = int(frame_height * 0.10)
-    ry1 = int(frame_height * 0.90)
+    if not 0.0 <= roi_margin_pct < 0.5:
+        raise ValueError(f"roi_margin_pct must be in [0.0, 0.5); got {roi_margin_pct}")
+    class_id_value = normalize_analytics_class_ids(class_ids)
+    # Near-full-frame ROI: default ``margin=0.05`` → 5%..95% on both
+    # axes (covers 90% x 90% of the frame area). Polygon points are
+    # clockwise from top-left as nvdsanalytics expects.
+    rx0 = int(frame_width * roi_margin_pct)
+    rx1 = int(frame_width * (1.0 - roi_margin_pct))
+    ry0 = int(frame_height * roi_margin_pct)
+    ry1 = int(frame_height * (1.0 - roi_margin_pct))
     roi_points = f"{rx0};{ry0};{rx1};{ry0};{rx1};{ry1};{rx0};{ry1}"
     # Horizontal line across the middle of the ROI. nvdsanalytics LC
     # requires 4 (line-segment) + 2 (direction reference) point pairs:
@@ -267,20 +312,25 @@ def build_analytics_config(
         # prefixed properties: the label is the suffix after "roi-" in the
         # KEY name (NOT in the value); the value is the polygon point list.
         # See sources/gst-plugins/gst-nvdsanalytics/nvdsanalytics_property_parser.cpp
-        # (DSANALYTICS_PROPERTY_ROI = "roi-").
+        # (DSANALYTICS_PROPERTY_ROI = "roi-"). Verified against the DS 8.0
+        # sample at sample_apps/deepstream-nvdsanalytics-test/config_nvdsanalytics.txt
+        # which uses ``roi-RF=`` with "RF" as the label.
         f"roi-{roi_label}={roi_points}\n"
         # inverse-roi=0: count objects INSIDE the polygon (vs outside).
         "inverse-roi=0\n"
-        # class-id=-1: all classes counted (TrafficCamNet emits 4 classes;
-        # for v0 we want any of them to register in the ROI).
-        "class-id=-1\n"
+        # P4-D follow-up: class filter is env-driven via
+        # ``UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS``. Default ``-1``
+        # (all classes) — the live run showed TrafficCamNet sometimes
+        # misclassifies people as cars, so probe-default-all is the
+        # safe choice. Production scenes can narrow per-deployment.
+        f"class-id={class_id_value}\n"
         f"[line-crossing-stream-{_ANALYTICS_STREAM_ID}]\n"
         "enable=1\n"
         # line-crossing-<Label>=<line-coords>;<direction-coords> — label
         # is part of the key (parser strips the "line-crossing-" prefix).
         f"line-crossing-{line_label}={lc_points}\n"
-        # class-id=-1: any class trips the line in v0.
-        "class-id=-1\n"
+        # Same class filter as the ROI section.
+        f"class-id={class_id_value}\n"
         "extended=0\n"
         # mode=loose: count any crossing without strict direction
         # adherence; we want to prove events flow, not enforce direction.

@@ -4,6 +4,94 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-21 - P4-D Follow-up: ROI Label / Analytics Class Filter Fix
+
+### Summary
+P4-D's live verification produced zero zone events because the
+upstream metadata pipeline never attached ``roi_labels`` to any
+tracked object. Triage at the time blamed detection / analytics
+ambiguously; a second look at the live evidence pinpointed
+**geometry** as the real root cause: operator bbox bottom-center
+was at ``y=719`` on a 720-tall frame, while our ROI ended at
+``y=648`` (90% of 720). nvdsanalytics uses the bbox bottom-center
+as the per-object ROI reference point, so the object was outside
+the ROI and ``roiStatus`` stayed empty. ``class-id=-1`` was
+already in the config; the class-filter hypothesis was wrong.
+
+This commit widens the probe-default ROI, makes both the
+geometry margin and the class filter env-configurable for future
+production tuning, and adds analytics-mode diagnostics so the
+next live triage requires no guesswork.
+
+### What changed
+- ``app/config.py`` — two new ``Settings`` fields:
+  ``deepstream_analytics_roi_margin_pct: float = 0.05`` (env:
+  ``UPSTREAM_DEEPSTREAM_ANALYTICS_ROI_MARGIN_PCT``) and
+  ``deepstream_analytics_class_ids: str = "all"`` (env:
+  ``UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS``).
+- ``app/runtimes/deepstream_runtime/inference.py``:
+  - New helper ``normalize_analytics_class_ids(value)`` — the
+    single source of truth for the ``class-id=`` string;
+    accepts ``all`` / ``-1`` / ``""`` / single integer; rejects
+    comma-lists + non-integer typos with clear errors.
+  - ``build_analytics_config(...)`` gains
+    ``roi_margin_pct: float = 0.05`` and ``class_ids: str = "all"``
+    keyword args; the previous hard-coded 20%/10% margin and
+    ``class-id=-1`` strings are now parameterized; range check on
+    margin (``[0.0, 0.5)``); class_ids passed through the helper.
+- ``app/runtimes/deepstream_runtime/metadata_probe.py`` —
+  ``DeepStreamMetadataProcessManager`` constructor + work-dir
+  builder thread the new knobs through; defaults are backward-
+  compatible.
+- ``app/runtimes/deepstream_runtime/worker.py``:
+  - ``_default_pm_factory`` passes the settings into the PM.
+  - ``_metadata_payload`` analytics block surfaces five new
+    diagnostic fields: ``analytics_class_ids``,
+    ``analytics_roi_margin_pct``,
+    ``analytics_object_class_id_counts``,
+    ``objects_with_roi_labels_count``, ``roi_labels_sample``.
+- ``.env.example`` documents the two new env vars next to the
+  existing analytics knobs.
+
+### Tests
+- **319 passing** in upstream-processor (307 prior + 12 net new).
+  ruff + ruff-format + ``mypy app`` clean.
+- ``tests/test_deepstream_analytics_probe.py`` — 9 new tests
+  covering 5% default margin (with regression guard on the broken
+  20%/10% values), explicit margin override (0.0 = full frame),
+  invalid margin rejection (negative / 0.5 / 1.0), default
+  ``class_ids="all"`` maps to ``-1``, explicit single-int filter,
+  ``-1`` / ``""`` alias handling, comma-list rejection,
+  non-integer rejection, settings-default pin.
+- ``tests/test_deepstream_zone_transition_emit.py`` — 3 new
+  worker-level diagnostics tests: status payload exposes both
+  settings + per-class object counts + ``objects_with_roi_labels_count``;
+  P4-D live failure pattern recreated showing zero zone events
+  with diagnostic counters that classify the issue as analytics-
+  side; env override propagates.
+
+### Why this is NOT a P4-D adapter regression
+The state machine never saw "track observed inside ROI" because
+the upstream metadata didn't attach ``roi_labels``. The adapter
+behaved correctly on the input it received (Case A: never seen
+inside → no-op). The unit tests already prove every adapter
+transition; this commit fixes the metadata-side gap so the
+adapter has the inputs it needs.
+
+### Operator-facing change
+The probe ROI is now wider by default. Production scenes that
+need narrower geometry can override via env. The class filter is
+unchanged from the operator's perspective (``-1`` was already
+the default) but the knob now exists for production tuning.
+
+### Out of scope (still deferred)
+- Dashboard-driven per-camera ROI / line geometry.
+- Multi-class filter in a single nvdsanalytics section.
+- Dwell observations (P4-E).
+- Server-side idempotency.
+
+---
+
 ## 2026-05-21 - P4-D: Zone Entered / Zone Exited Observations
 
 ### Summary
