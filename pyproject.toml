@@ -45,6 +45,15 @@ strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
+# The P2 in-container pyds app is bind-mounted into the DeepStream 8.0 +
+# pyds container and runs there with `python3 -B`. It imports gi/pyds at
+# module level (only resolvable inside the container), and it is not
+# imported by any other `app/` code. Skip strict checking on this module.
+[[tool.mypy.overrides]]
+module = "app.runtimes.deepstream_runtime.pyds_metadata_app"
+ignore_missing_imports = true
+ignore_errors = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

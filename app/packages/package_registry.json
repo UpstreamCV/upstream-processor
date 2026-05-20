@@ -30,6 +30,16 @@
       "supports": {
         "inference_probe": true
       }
+    },
+    {
+      "package_id": "deepstream.metadata_probe.v0",
+      "display_name": "DeepStream Metadata Probe v0",
+      "runtime": "deepstream",
+      "description": "DeepStream 8.0 + pyds metadata probe. Runs a pyds pad probe in a DS 8.0 + pyds container, walks NvDsBatchMeta/NvDsFrameMeta/NvDsObjectMeta, and surfaces neutral per-frame metadata through the BoundedBridgeQueue/MetadataSource seam into the worker's status payload (counters + class_counts + queue_stats). Status/debug evidence only -- no observations, no metadata adapter, no API writes.",
+      "outputs": [],
+      "supports": {
+        "metadata_probe": true
+      }
     }
   ]
 }

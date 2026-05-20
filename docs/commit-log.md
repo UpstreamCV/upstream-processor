@@ -4,6 +4,111 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P2: supervisor-managed metadata probe worker
+
+### Summary
+Connects the manual P2 pyds metadata pipeline to the existing
+`WorkerManager` supervisor lifecycle via a new package
+`deepstream.metadata_probe.v0` (`supports.metadata_probe: true`).
+`DeepStreamWorker` mode dispatch is now a 3-way (metadata > inference >
+decode); the metadata mode spawns the pyds-derived DS 8.0 container,
+parses structured `UPSTREAM_METADATA=<json>` / `UPSTREAM_METADATA_SUMMARY=<json>`
+stdout lines, validates each frame line with `NeutralFrameMetadata`, and
+exercises the real app-side `BoundedBridgeQueue` /
+`BridgeQueueMetadataSource` seam from P2 (seam milestone). Status
+payload surfaces counters + queue stats. **The container never calls
+UpStream APIs** — the webhook secret never enters the container.
+**Implementation complete + unit-tested; live verification pending.** NO
+observations, NO API contract change.
+
+### What changed
+- `app/packages/package_registry.json` — `deepstream.metadata_probe.v0`
+  (`supports.metadata_probe`); mock + decode + inference entries unchanged.
+- `app/config.py` — new env-overridable settings:
+  `deepstream_pyds_image` (default `upstream-deepstream:8.0-pyds-v1.2.2`),
+  `deepstream_metadata_probe_timeout_seconds` (60),
+  `deepstream_metadata_queue_maxsize` (256),
+  `deepstream_metadata_queue_drop_policy` (`drop_newest`),
+  `deepstream_metadata_sample_limit` (3).
+- `app/runtimes/deepstream_runtime/pyds_metadata_app.py` (new) — the
+  **in-container** pyds Python app, bind-mounted into the pyds-derived
+  DS 8.0 container; never imported by other `app/` code. Builds the
+  proven RTSP -> nvstreammux -> nvinfer -> fakesink pipeline, attaches a
+  pad probe to `nvinfer.src`, walks NvDsBatchMeta/NvDsFrameMeta/
+  NvDsObjectMeta, emits one `UPSTREAM_METADATA=<json>` per frame +
+  terminal `UPSTREAM_METADATA_SUMMARY=<json>`. Near-zero-work pad
+  probe (build dict + `sys.stdout.write` + flush; no HTTP / async /
+  `ObservationWriter`). The raw RTSP URL is consumed via `RTSP_URL` env
+  and redacted in any GST_ERROR output. mypy/ruff skip this module via
+  `[[tool.mypy.overrides]]` because gi/pyds only resolve at runtime.
+- `app/runtimes/deepstream_runtime/metadata_probe.py` (new) — pure
+  `build_metadata_docker_command` + `DeepStreamMetadataProcessManager`.
+  Owns a per-run temp work dir (PGIE config + copy of
+  `pyds_metadata_app.py`), bind-mounted into the container at the same
+  path; runs `docker run --rm --gpus all --network host -v wd:wd -e
+  PYTHONDONTWRITEBYTECODE=1 -e RTSP_URL=... bash -lc 'timeout -s INT N
+  python3 -B wd/pyds_metadata_app.py …'`. Same docker-stop -> SIGTERM ->
+  SIGKILL-after-timeout teardown as the inference PM; shreds the temp
+  dir on stop unless `keep_temp_files`.
+- `app/runtimes/deepstream_runtime/worker.py` — module-level
+  `_METADATA_MODE` + pure `parse_metadata_line` (returns
+  `("frame"|"summary", "<json>")` or `None`) + `_MetadataCounters` /
+  `_MetadataReaderState` dataclasses + `_queue_stats_dict`. `_mode`
+  property now orders metadata > inference > decode. `_default_pm_factory`
+  branches to `DeepStreamMetadataProcessManager`. New
+  `_drive_metadata_probe` runs reader + consumer asyncio tasks
+  concurrently: reader validates via `NeutralFrameMetadata` and pushes
+  to `BoundedBridgeQueue.put_from_thread`; consumer iterates
+  `BridgeQueueMetadataSource` and feeds counters; posts `attached` on
+  first valid frame, `processing` immediately + throttled, terminal
+  `stopped` (clean exit + no hard fail) or `failed` (with redacted
+  `error_message` + `deepstream_unsupported_sm` /
+  `deepstream_trt_error` / `deepstream_exit`).
+- `tests/test_deepstream_metadata_probe.py` (new, 13 tests) plus
+  additions to `tests/test_config.py` (2 tests) and
+  `tests/test_package_resolver.py` (1 test). Covers mode selection
+  (and decode/inference regression guard), pure parser routing, pure
+  command builder (`--gpus all` / `--network host` / `-v wd:wd` /
+  `PYTHONDONTWRITEBYTECODE` / `RTSP_URL` / inner argv), full lifecycle
+  with counters + `queue_stats` + `app_summary`, `Unsupported SM` ->
+  `failed` with RTSP redaction, nonzero exit without metadata,
+  malformed-JSON / schema-invalid lines being skipped, missing RTSP
+  fast-fail, graceful `request_stop`, and the real PM's temp-dir write
+  + cleanup (monkeypatched `create_subprocess_exec`). NO Docker / GPU /
+  pyds / gi in any test.
+- `pyproject.toml` — added `[[tool.mypy.overrides]]` for the
+  in-container app module (gi/pyds only resolve inside the container).
+- Docs: `README.md` (new P2 scope + env table rows), `.env.example`
+  (new env vars), `docs/architecture.md` (P2 supervisor-managed
+  metadata-probe section), `docs/local-dev.md` (live verification
+  checklist), `app/runtimes/deepstream_runtime/README.md` (now describes
+  three modes), this entry.
+
+### Not changed
+NO `app/`-side `ObservationWriter` integration. NO `POST /observations`.
+NO final metadata adapter. NO `nvtracker` (and thus no stable tracker
+IDs — `tracker_id` is `None` for now, preserved as a forward-compatible
+field). NO `nvdsanalytics`, NO line crossing, NO zone analytics, NO
+dashboard overlay, NO rules / events, NO Triton, NO package catalog UI,
+NO API contract change. upstream-agent / api-server / streaming-server /
+dashboard untouched. The existing decode (M8.2B) and inference
+(M8.2C1-B) workers are unchanged; mock runtime unchanged. The webhook
+secret never enters the pyds container.
+
+### Testing/checks
+`uv run pytest -q` **126 passed** (111 prior + 15 new); `ruff check`,
+`ruff format --check`, `mypy app`, `bash -n scripts/*.sh` all clean.
+
+### Follow-up TODOs
+- Live verification of the supervisor-managed metadata worker on
+  crowdcountS2 (see `docs/local-dev.md` P2 checklist).
+- After live-verified: either P3 (tracker metadata probe — add
+  `nvtracker` so `tracker_id` is populated and `has_tracker_id=True`),
+  or P4 (observation adapter — map `NeutralFrameMetadata` ->
+  `ObservationPayload` and wire the `ObservationWriter`).
+
+---
+
 ## 2026-05-19 - P2: MetadataSource Protocol + bounded bridge queue (app/ seam)
 
 ### Summary

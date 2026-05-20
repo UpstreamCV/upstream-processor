@@ -220,3 +220,94 @@ dashboard, no API change**. The manual P2 probe in ``scripts/`` continues
 to be the standalone *runtime* proof; this milestone is purely the
 **`app/`-side seam** the next milestone (supervisor-managed metadata
 probe worker) will build on top of.
+
+## P2 — supervisor-managed metadata probe worker
+
+Connects the manual pyds metadata pipeline to the existing
+``WorkerManager`` lifecycle via a new package
+``deepstream.metadata_probe.v0`` (``supports.metadata_probe: true``).
+``DeepStreamWorker``'s mode dispatch is now a 3-way: metadata > inference
+> decode (most specific support wins). The container never calls UpStream
+APIs — the webhook secret never enters the container; status posting
+stays with the outer supervisor.
+
+- **`app/runtimes/deepstream_runtime/pyds_metadata_app.py`** — the
+  **in-container** pyds Python app. Bind-mounted into a DS 8.0 + pyds
+  container; never imported by any other ``app/`` code. Builds the
+  proven manual probe pipeline (``rtspsrc(tcp, latency=200) → rtph264depay
+  → h264parse → nvv4l2decoder → nvstreammux(batch=1) → nvinfer →
+  nvvideoconvert → fakesink``), attaches a pad probe on ``nvinfer.src``,
+  walks ``pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta →
+  NvDsObjectMeta``, and emits structured per-frame stdout lines
+  ``UPSTREAM_METADATA=<json>`` plus a terminal
+  ``UPSTREAM_METADATA_SUMMARY=<json>``. The pad probe does near-zero
+  work: build dict → ``sys.stdout.write`` → ``flush``. No HTTP, no
+  async, no ``ObservationWriter`` calls. The raw RTSP URL is consumed
+  via ``RTSP_URL`` env (the outer worker passes it) and is redacted in
+  any GST_ERROR text. mypy/ruff skip this module (``[[tool.mypy.overrides]]``)
+  because gi/pyds only resolve at run time inside the container.
+
+- **`app/runtimes/deepstream_runtime/metadata_probe.py`** —
+  ``DeepStreamMetadataProcessManager`` + pure
+  ``build_metadata_docker_command``. Owns a per-run temp work dir
+  holding ``pgie.txt`` (reused ``build_pgie_config`` from
+  ``inference.py``, TrafficCamNet INT8) and a copy of the in-container
+  app. Runs ``docker run --rm --gpus all --network host -v wd:wd -e
+  PYTHONDONTWRITEBYTECODE=1 -e RTSP_URL=... <pyds-image> bash -lc
+  "timeout -s INT <t> python3 -B wd/pyds_metadata_app.py …"``. Streams
+  stdout, does the same ``docker stop`` → SIGTERM → SIGKILL-after-
+  ``stop_timeout``, and shreds the temp dir on stop unless
+  ``keep_temp_files``.
+
+- **`DeepStreamWorker._drive_metadata_probe`** — runs two asyncio tasks
+  concurrently:
+  1. **Reader**: pulls every stdout line, classifies via the pure
+     ``parse_metadata_line`` (``UPSTREAM_METADATA=`` / ``UPSTREAM_METADATA_SUMMARY=``
+     / other), JSON-parses, **validates with**
+     :class:`~app.observations.metadata_models.NeutralFrameMetadata`,
+     and pushes valid frames into a per-worker
+     :class:`~app.observations.bridge_queue.BoundedBridgeQueue` via
+     ``put_from_thread`` (the queue seam is exercised exactly the way a
+     future real pyds thread will use it). Tracks
+     ``hard_fail_code``/``last_err`` for terminal status. On EOF/stop,
+     closes the queue.
+  2. **Consumer**: iterates a
+     :class:`~app.runtimes.metadata_source.BridgeQueueMetadataSource`
+     and feeds an ``_MetadataCounters`` aggregator. On the first frame
+     consumed, posts ``attached`` (gating); thereafter posts
+     ``processing`` immediately, then throttled at
+     ``status_interval_seconds``.
+
+  On both tasks finishing, the worker posts terminal ``stopped`` (clean
+  exit code + no hard-fail) or ``failed`` (otherwise) with the same
+  status payload shape:
+
+  ``{runtime, mode="metadata_probe", metadata_enabled, metadata_source,
+    model, image, frames_seen, frames_with_objects, objects_seen,
+    class_counts, label_counts, has_bbox, has_confidence,
+    has_tracker_id, sample_count, queue_stats, app_summary?}``
+
+- **Config** (``app/config.py``): ``deepstream_pyds_image`` (default
+  ``upstream-deepstream:8.0-pyds-v1.2.2``),
+  ``deepstream_metadata_probe_timeout_seconds`` (60),
+  ``deepstream_metadata_queue_maxsize`` (256),
+  ``deepstream_metadata_queue_drop_policy`` (``drop_newest``),
+  ``deepstream_metadata_sample_limit`` (3). All env-overridable. Reuses
+  ``deepstream_keep_temp_files`` and the existing shutdown-budget knobs.
+
+Coverage: ``tests/test_deepstream_metadata_probe.py`` exercises mode
+selection (and verifies decode/inference still resolve), the pure parser
+(frame / summary / other), the pure command builder
+(``--gpus all`` / ``--network host`` / ``-v wd:wd`` /
+``PYTHONDONTWRITEBYTECODE`` env / ``RTSP_URL`` env / inner argv), the
+full lifecycle (starting → attached → processing → stopped with counters
++ ``queue_stats`` + ``app_summary``), ``Unsupported SM`` → ``failed``
+with redacted ``error_message``, nonzero exit without metadata,
+graceful ``request_stop``, malformed-JSON / schema-invalid lines being
+skipped, missing RTSP fast-fail, and the real PM's temp-dir write +
+cleanup (monkeypatched ``create_subprocess_exec``). **No Docker, no GPU,
+no pyds/gi anywhere in tests.**
+
+Out of scope (later milestones): ``ObservationWriter`` integration,
+``POST /observations``, the final metadata adapter, ``nvtracker``,
+``nvdsanalytics``, line crossing, zones, Triton, dashboard, rules.

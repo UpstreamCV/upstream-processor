@@ -174,6 +174,55 @@ runtime-checkable ``MetadataSource`` Protocol + ``BridgeQueueMetadataSource``
 ``docs/architecture.md`` for the design rationale (queue choice, drop
 policies, single-consumer scope).
 
+## Live verification checklist (P2 — supervisor-managed metadata probe)
+
+Run on the GPU/streaming host (crowdcountS2). The pyds-derived image
+`upstream-deepstream:8.0-pyds-v1.2.2` must already be built (see the
+manual P2 probe milestone — `scripts/probe_deepstream_pyds_metadata.sh
+CONFIRM_BUILD=1 …` will build it). Status: implementation complete +
+unit-tested; **live verification pending until explicitly run** (do not
+claim live-verified otherwise).
+
+```
+[ ] Start a valid upstream-agent stream
+[ ] Wait for validation_status=true
+[ ] eligible-sessions returns one session
+[ ] Run upstream-processor with:
+      UPSTREAM_FORCE_PACKAGE_ID=deepstream.metadata_probe.v0
+      UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2
+      UPSTREAM_PROCESSOR_ID=proc_p2_metadata_live
+[ ] Worker starts (log: "package override active",
+    "deepstream worker ... mode=metadata_probe",
+    "deepstream metadata start: image=... pyds-v1.2.2 model=trafficcamnet")
+[ ] pyds container starts
+[ ] RTSP opens; nvinfer engine builds (~30 s cold)
+[ ] UPSTREAM_METADATA= lines flow on stdout
+[ ] worker validates each as NeutralFrameMetadata
+[ ] BoundedBridgeQueue accepts metadata; consumer drains via
+    BridgeQueueMetadataSource
+[ ] Status posts `starting`
+[ ] Status posts `attached` (first valid metadata frame)
+[ ] Status posts `processing` (payload includes
+    metadata_enabled=true, frames_seen, frames_with_objects,
+    objects_seen, class_counts, label_counts, has_bbox, has_confidence,
+    queue_stats)
+[ ] Stop processor (SIGINT) — or the bounded probe self-exits at the
+    timeout
+[ ] pyds container stops cleanly (docker stop; no lingering container)
+[ ] Status posts `stopped`
+[ ] processor_statuses row: runtime=deepstream,
+    package_id=deepstream.metadata_probe.v0
+[ ] No observations are posted (`processor.*` types absent for this run)
+[ ] No raw RTSP URL, stream key, secret, Authorization or Bearer in logs
+[ ] Temp work dir cleaned up (unless KEEP_TEMP_FILES=true);
+    no __pycache__ leftovers (PYTHONDONTWRITEBYTECODE=1)
+```
+
+The probe is bounded by `UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS`
+(default 60). It exits `124` (timeout, clean) and the supervisor restarts
+it next poll while the session stays eligible — expected for a probe,
+same shape as decode/inference probes.
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

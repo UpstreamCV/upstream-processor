@@ -84,3 +84,29 @@ def test_deepstream_inference_env_overridable(monkeypatch) -> None:  # type: ign
     s = Settings()  # type: ignore[call-arg]
     assert s.deepstream_inference_timeout_seconds == 90.0
     assert s.deepstream_keep_temp_files is True
+
+
+def test_deepstream_metadata_probe_defaults() -> None:
+    # P2 metadata-probe runtime: pyds-derived image, 60s probe, 256-slot
+    # drop_newest queue, 3 samples per frame.
+    s = get_settings()
+    assert s.deepstream_pyds_image == "upstream-deepstream:8.0-pyds-v1.2.2"
+    assert s.deepstream_metadata_probe_timeout_seconds == 60.0
+    assert s.deepstream_metadata_queue_maxsize == 256
+    assert s.deepstream_metadata_queue_drop_policy == "drop_newest"
+    assert s.deepstream_metadata_sample_limit == 3
+
+
+def test_deepstream_metadata_probe_env_overridable(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_PYDS_IMAGE", "ghcr.io/example/ds:custom")
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS", "90")
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_METADATA_QUEUE_MAXSIZE", "512")
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_METADATA_QUEUE_DROP_POLICY", "drop_oldest")
+    monkeypatch.setenv("UPSTREAM_DEEPSTREAM_METADATA_SAMPLE_LIMIT", "8")
+    get_settings.cache_clear()
+    s = Settings()  # type: ignore[call-arg]
+    assert s.deepstream_pyds_image == "ghcr.io/example/ds:custom"
+    assert s.deepstream_metadata_probe_timeout_seconds == 90.0
+    assert s.deepstream_metadata_queue_maxsize == 512
+    assert s.deepstream_metadata_queue_drop_policy == "drop_oldest"
+    assert s.deepstream_metadata_sample_limit == 8
