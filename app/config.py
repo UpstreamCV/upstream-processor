@@ -84,6 +84,23 @@ class Settings(BaseSettings):
     deepstream_inference_model: str = "trafficcamnet"
     deepstream_keep_temp_files: bool = False
 
+    # --- P2 DeepStream metadata-probe runtime ---------------------------
+    # Bounded pyds metadata extraction under the supervisor. Uses a separate
+    # DeepStream 8.0 + pyds image (built from docker/Dockerfile.pyds in the
+    # manual P2 probe milestone). Status/debug evidence only — NO
+    # observations, NO API writes, NO metadata adapter. Env-overridable.
+    deepstream_pyds_image: str = "upstream-deepstream:8.0-pyds-v1.2.2"
+    deepstream_metadata_probe_timeout_seconds: float = 60.0
+    # Bounded bridge queue between the pyds container stdout reader and the
+    # async consumer. ``drop_policy`` is the producer-side eviction policy
+    # when the queue is full (``drop_newest`` | ``drop_oldest``).
+    deepstream_metadata_queue_maxsize: int = 256
+    deepstream_metadata_queue_drop_policy: str = "drop_newest"
+    # How many object samples per frame the in-container app emits in its
+    # UPSTREAM_METADATA= lines (status/debug evidence; the worker never
+    # forwards these to the API).
+    deepstream_metadata_sample_limit: int = 3
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

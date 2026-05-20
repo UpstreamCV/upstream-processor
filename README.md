@@ -92,6 +92,49 @@ UPSTREAM_PROCESSOR_ID=proc_m82c1b_live \
 uv run upstream-processor
 ```
 
+## P2 scope (supervisor-managed metadata probe)
+
+- New package `deepstream.metadata_probe.v0` (runtime `deepstream`,
+  `outputs: []`, `supports.metadata_probe: true`). `mock.detect.v0`,
+  `deepstream.decode_probe.v0`, `deepstream.inference_probe.v0` are unchanged.
+- The package's `supports` selects `DeepStreamWorker` mode: `decode_probe`
+  / `inference_probe` / **`metadata_probe`** (this milestone).
+- Metadata mode spawns the **pyds-derived DS 8.0 image**
+  (`upstream-deepstream:8.0-pyds-v1.2.2`, built from `docker/Dockerfile.pyds`
+  in the manual P2 probe milestone) and runs
+  `app/runtimes/deepstream_runtime/pyds_metadata_app.py` inside it
+  (bind-mounted from the runtime work dir). The in-container app builds
+  the proven RTSP → `nvstreammux` → `nvinfer` (TrafficCamNet) → `fakesink`
+  pipeline, attaches a pad probe to `nvinfer.src`, walks
+  `pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta → NvDsObjectMeta`,
+  and emits one structured line **per frame** on stdout
+  (`UPSTREAM_METADATA=<json>`) plus a terminal `UPSTREAM_METADATA_SUMMARY=<json>`.
+- The outer supervisor's worker validates each line with
+  `NeutralFrameMetadata`, pushes through the `BoundedBridgeQueue` and an
+  async `BridgeQueueMetadataSource` consumer, and surfaces counters
+  (`frames_seen`, `frames_with_objects`, `objects_seen`, `class_counts`,
+  `label_counts`, `has_bbox`, `has_confidence`, `has_tracker_id`,
+  `sample_count`) + the queue's own stats (`accepted`, `dropped`,
+  `dropped_newest`, `dropped_oldest`, `consumed`, `current_size`) in the
+  status payload. **The container never calls UpStream APIs** — the
+  webhook secret never enters the container.
+- Status lifecycle: `starting → attached` (first valid metadata frame)
+  `→ processing` (throttled with counters) `→ stopped` (graceful);
+  `→ failed` with redacted `error_message` +
+  `deepstream_unsupported_sm` / `deepstream_trt_error` / `deepstream_exit`
+  on hard TRT/SM/CUDA failure.
+- **Status/debug evidence only — no observations, no metadata adapter
+  yet.** KITTI files / per-frame samples are NOT stuffed into status.
+
+Run it (on the GPU/streaming host, with an active validated session):
+
+```sh
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.metadata_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_PROCESSOR_ID=proc_p2_metadata_live \
+uv run upstream-processor
+```
+
 ## What it deliberately does NOT do (yet)
 
 The DeepStream inference probe (M8.2C1-B) runs `nvinfer` but is still a
@@ -134,6 +177,11 @@ make run                     # python -m app.main
 | `UPSTREAM_DEEPSTREAM_INFERENCE_OUTPUT_DIR` | no | — (auto temp) | Base dir for the per-run config + KITTI output; empty = system tempdir |
 | `UPSTREAM_DEEPSTREAM_KEEP_TEMP_FILES` | no | `false` | Keep the per-run temp dir after stop (still never logs the raw RTSP URL) |
 | `UPSTREAM_DEEPSTREAM_DOCKER_NETWORK` | no | `host` | Docker network (host → container `127.0.0.1` = streaming host) |
+| `UPSTREAM_DEEPSTREAM_PYDS_IMAGE` | no | `upstream-deepstream:8.0-pyds-v1.2.2` | Pyds-derived DeepStream 8.0 image for the **metadata probe** (built from `docker/Dockerfile.pyds`) |
+| `UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS` | no | `60` | Bounded **metadata**-probe duration cap |
+| `UPSTREAM_DEEPSTREAM_METADATA_QUEUE_MAXSIZE` | no | `256` | Max slots in the producer→consumer bridge queue inside the worker |
+| `UPSTREAM_DEEPSTREAM_METADATA_QUEUE_DROP_POLICY` | no | `drop_newest` | `drop_newest` \| `drop_oldest` — eviction when the queue is full |
+| `UPSTREAM_DEEPSTREAM_METADATA_SAMPLE_LIMIT` | no | `3` | In-container app: object samples per frame in each `UPSTREAM_METADATA=` line |
 | `UPSTREAM_FINAL_STATUS_TIMEOUT_SECONDS` | no | `15` | Per-worker budget for graceful stop + final `stopped` post (DeepStream-safe; mock exits faster) |
 | `UPSTREAM_OVERALL_SHUTDOWN_TIMEOUT_SECONDS` | no | `25` | Overall supervisor shutdown cap before workers are force-cancelled |
 
