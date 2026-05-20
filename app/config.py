@@ -125,6 +125,21 @@ class Settings(BaseSettings):
     # Keep small — status payload should stay tiny.
     deepstream_tracker_ids_sample_limit: int = 10
 
+    # --- P3.5 DeepStream analytics-probe runtime ------------------------
+    # Analytics-probe mode (deepstream.analytics_probe.v0): same pyds path
+    # as tracker_probe but inserts an ``nvdsanalytics`` element after
+    # ``nvtracker`` and walks ``NvDsUserMeta`` (frame + object) for the
+    # ROI / line-crossing / overcrowding / direction metadata that the
+    # SDK attaches. v0 ships a hand-authored ROI + line-crossing config
+    # targeted at 1280x720; dashboard-driven geometry is a later
+    # milestone. Status payload gains analytics_enabled,
+    # has_analytics_metadata, roi_metadata_count, line_metadata_count,
+    # analytics_labels_sample. Still NO observations, NO API writes.
+    #
+    # Bounded sample of distinct analytics labels (e.g. ROI / LC labels
+    # observed) surfaced in the status payload. Keep small.
+    deepstream_analytics_labels_sample_limit: int = 20
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -28,6 +28,7 @@ from uuid import uuid4
 
 from app.redact import redact_rtsp
 from app.runtimes.deepstream_runtime.inference import (
+    build_analytics_config,
     build_pgie_config,
     build_tracker_config,
     resolve_model_dir,
@@ -55,20 +56,28 @@ def build_metadata_docker_command(
     tracker_lib_path: str = "",
     tracker_width: int = 960,
     tracker_height: int = 544,
+    analytics_enabled: bool = False,
 ) -> list[str]:
-    """Docker argv for one bounded metadata- or tracker-probe run. Pure /
-    side-effect free so it is unit-testable without Docker. Mirrors the
-    proven manual P2 invocation (``--gpus all``, ``--network host``, work
-    dir bind-mounted at the same path so the app's absolute config paths
-    resolve inside the container) and runs the in-container app with
-    ``python3 -B`` so no ``__pycache__`` files land in the host work dir.
+    """Docker argv for one bounded metadata- / tracker- / analytics-probe
+    run. Pure / side-effect free so it is unit-testable without Docker.
+    Mirrors the proven manual P2 invocation (``--gpus all``,
+    ``--network host``, work dir bind-mounted at the same path so the
+    app's absolute config paths resolve inside the container) and runs
+    the in-container app with ``python3 -B`` so no ``__pycache__`` files
+    land in the host work dir.
 
-    When ``tracker_enabled`` is set, the in-container app gets the extra
+    When ``tracker_enabled`` is set, the in-container app gets
     ``--tracker-config-path`` / ``--tracker-lib-path`` / ``--tracker-width``
-    / ``--tracker-height`` args so it splices ``nvtracker`` into the
-    pipeline and attaches the pad probe at the tracker src pad."""
+    / ``--tracker-height`` so it splices ``nvtracker`` into the pipeline.
+    When ``analytics_enabled`` is also set, the app additionally gets
+    ``--analytics-config-path`` so it splices ``nvdsanalytics`` after
+    ``nvtracker`` and the pad probe attaches at the analytics src pad."""
     # Note: ``RTSP_URL`` env passes the URL to the in-container app; the
     # in-container app redacts it before any printing.
+    if analytics_enabled and not tracker_enabled:
+        raise ValueError(
+            "analytics_enabled requires tracker_enabled (nvdsanalytics operates on tracked objects)"
+        )
     tracker_args = ""
     if tracker_enabled:
         tracker_args = (
@@ -77,6 +86,9 @@ def build_metadata_docker_command(
             f"--tracker-width {int(tracker_width)} "
             f"--tracker-height {int(tracker_height)} "
         )
+    analytics_args = ""
+    if analytics_enabled:
+        analytics_args = f"--analytics-config-path {work_dir}/analytics_config.txt "
     inner = (
         f"timeout -s INT {int(probe_timeout_seconds)} "
         f"python3 -B {work_dir}/pyds_metadata_app.py "
@@ -85,6 +97,7 @@ def build_metadata_docker_command(
         f"--sample-limit {int(sample_limit)} "
         f"--stream-session-id {stream_session_id or ''} "
         f"{tracker_args}"
+        f"{analytics_args}"
         "2>&1"
     )
     argv: list[str] = [
@@ -129,7 +142,13 @@ class DeepStreamMetadataProcessManager:
         tracker_lib_path: str = "",
         tracker_width: int = 960,
         tracker_height: int = 544,
+        analytics_enabled: bool = False,
     ) -> None:
+        if analytics_enabled and not tracker_enabled:
+            raise ValueError(
+                "analytics_enabled requires tracker_enabled "
+                "(nvdsanalytics operates on tracked objects)"
+            )
         self._rtsp_url = rtsp_url
         self._image = image
         self._network = network
@@ -148,9 +167,15 @@ class DeepStreamMetadataProcessManager:
         self._tracker_lib_path = tracker_lib_path
         self._tracker_width = tracker_width
         self._tracker_height = tracker_height
-        # ``upstream-dst-`` distinguishes tracker-probe containers from
-        # metadata-probe ones (``upstream-dsm-``) in `docker ps`.
-        prefix = "upstream-dst" if tracker_enabled else "upstream-dsm"
+        self._analytics_enabled = analytics_enabled
+        # Container name prefix encodes the mode for easy `docker ps`
+        # grouping: -dsm (metadata), -dst (tracker), -dsa (analytics).
+        if analytics_enabled:
+            prefix = "upstream-dsa"
+        elif tracker_enabled:
+            prefix = "upstream-dst"
+        else:
+            prefix = "upstream-dsm"
         self._container = f"{prefix}-{uuid4().hex[:12]}"
         self._work_dir: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -168,10 +193,18 @@ class DeepStreamMetadataProcessManager:
             # Validate the tracker algorithm up-front so a typo posts
             # ``failed`` cleanly rather than failing inside the container.
             build_tracker_config(self._tracker_algorithm)
+        if self._analytics_enabled:
+            # Validate the analytics geometry up-front for the same reason.
+            build_analytics_config(frame_width=self._width, frame_height=self._height)
         base = self._output_base_dir.strip() or None
         if base is not None:
             Path(base).mkdir(parents=True, exist_ok=True)
-        prefix = "upstream-p3-tracker." if self._tracker_enabled else "upstream-p2-meta."
+        if self._analytics_enabled:
+            prefix = "upstream-p35-analytics."
+        elif self._tracker_enabled:
+            prefix = "upstream-p3-tracker."
+        else:
+            prefix = "upstream-p2-meta."
         work = Path(tempfile.mkdtemp(prefix=prefix, dir=base))
         pgie_path = work / "pgie.txt"
         engine_path = work / "trafficcamnet_b1_gpu0_int8.engine"
@@ -182,6 +215,11 @@ class DeepStreamMetadataProcessManager:
         if self._tracker_enabled:
             (work / "tracker_config.yml").write_text(
                 build_tracker_config(self._tracker_algorithm),
+                encoding="utf-8",
+            )
+        if self._analytics_enabled:
+            (work / "analytics_config.txt").write_text(
+                build_analytics_config(frame_width=self._width, frame_height=self._height),
                 encoding="utf-8",
             )
         # Copy (not symlink) the pyds app into the work dir so the
@@ -218,17 +256,20 @@ class DeepStreamMetadataProcessManager:
             tracker_lib_path=self._tracker_lib_path,
             tracker_width=self._tracker_width,
             tracker_height=self._tracker_height,
+            analytics_enabled=self._analytics_enabled,
         )
 
     async def start(self) -> None:
         self._work_dir = self._prepare_work_dir()
         argv = self.command()
         _log.info(
-            "deepstream metadata start: image=%s network=%s model=%s tracker=%s url=%s",
+            "deepstream metadata start: image=%s network=%s model=%s tracker=%s "
+            "analytics=%s url=%s",
             self._image,
             self._network,
             self._model,
             "on" if self._tracker_enabled else "off",
+            "on" if self._analytics_enabled else "off",
             redact_rtsp(self._rtsp_url),  # never log the real URL
         )
         self._proc = await asyncio.create_subprocess_exec(

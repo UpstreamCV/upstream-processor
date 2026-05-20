@@ -1,10 +1,26 @@
-# deepstream_runtime (decode / inference / metadata / tracker probes)
+# deepstream_runtime (decode / inference / metadata / tracker / analytics probes)
 
 The DeepStream runtime. Implements the same `app/runtimes/base.py:Runtime`
 interface as `mock_runtime`, so the supervisor / poller / status paths are
-unchanged. One `DeepStreamWorker` class, **four modes** selected by the
-resolved package's `supports` (most specific wins):
+unchanged. One `DeepStreamWorker` class, **five modes** selected by the
+resolved package's `supports` (most specific wins, in order:
+`analytics > tracker > metadata > inference > decode`):
 
+- `analytics_probe` — `deepstream.analytics_probe.v0`,
+  `supports.analytics_probe` (**P3.5**). Same pyds pad probe as
+  `tracker_probe`, but the pipeline gains an `nvdsanalytics` element
+  after `nvtracker`; the pad probe attaches to the analytics src pad
+  and additionally walks `frame_user_meta_list` /
+  `obj_user_meta_list` for the SDK's `NVDS_FRAME_META_NVDSANALYTICS`
+  (→ `NvDsAnalyticsFrameMeta`: `objInROIcnt` / `objLCCumCnt` /
+  `objLCCurrCnt` / `ocStatus`) and `NVDS_OBJ_META_NVDSANALYTICS`
+  (→ `NvDsAnalyticsObjInfo`: `roiStatus` / `lcStatus` / `dirStatus` /
+  `ocStatus`) user-meta. Status payload adds `analytics_enabled`,
+  `has_analytics_metadata`, `roi_metadata_count`,
+  `line_metadata_count`, `objects_with_roi_metadata`,
+  `objects_with_line_metadata`, `analytics_labels_count` and a bounded
+  `analytics_labels_sample`. v0 ships a hand-authored ROI +
+  line-crossing config (1280×720). Still **no observations**.
 - `tracker_probe` — `deepstream.tracker_probe.v0`,
   `supports.tracker_probe` (**P3**). Same pyds pad probe as
   `metadata_probe`, but the pipeline gains an `nvtracker` element
@@ -41,22 +57,31 @@ Files:
   `fakesink`, no display); exposes `kitti_stats()` (frame/detection
   counts as status evidence).
 - `metadata_probe.py` — pure `build_metadata_docker_command` +
-  `DeepStreamMetadataProcessManager`: the metadata / tracker probe owns
-  a per-run temp work dir with a PGIE config + a copy of
+  `DeepStreamMetadataProcessManager`: the metadata / tracker / analytics
+  probe owns a per-run temp work dir with a PGIE config + a copy of
   `pyds_metadata_app.py` (plus a generated `tracker_config.yml` when
-  tracker mode is on), bind-mounted into the pyds-derived DS 8.0 image
+  tracker is on, plus `analytics_config.txt` when analytics is on),
+  bind-mounted into the pyds-derived DS 8.0 image
   (`upstream-deepstream:8.0-pyds-v1.2.2`). Runs the in-container app
   under `python3 -B` with `PYTHONDONTWRITEBYTECODE=1` so no root-owned
   `__pycache__` lands in the host work dir. Cleans the temp dir on stop.
-  Container naming distinguishes the two modes: `upstream-dsm-*` for
-  metadata-only, `upstream-dst-*` for tracker-on (P3).
+  Container naming distinguishes the modes: `upstream-dsm-*` for
+  metadata-only, `upstream-dst-*` for tracker-on (P3),
+  `upstream-dsa-*` for analytics-on (P3.5).
 - `pyds_metadata_app.py` — the **in-container** pyds Python app
   (bind-mounted, never imported by other `app/` code). Builds the
   proven pipeline programmatically; in tracker mode (CLI
   `--tracker-config-path` set) an `nvtracker` element is spliced
-  between `nvinfer` and `nvvideoconvert` and the pad probe attaches to
-  the tracker src pad so `NvDsObjectMeta.object_id` is populated.
-  Walks `pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta →
+  between `nvinfer` and `nvvideoconvert`; in analytics mode (CLI
+  `--analytics-config-path` set; requires tracker) an `nvdsanalytics`
+  element is appended after `nvtracker` and the pad probe attaches to
+  the analytics src pad instead. The probe additionally walks
+  `frame_user_meta_list` / `obj_user_meta_list` for
+  `NVDS_FRAME_META_NVDSANALYTICS` /
+  `NVDS_OBJ_META_NVDSANALYTICS` user-meta and folds the result under
+  `frame.source["analytics"]` (ROI / LC / overcrowding frame counters)
+  and `object.debug["analytics"]` (per-object ROI / LC / direction
+  labels). Walks `pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta →
   NvDsObjectMeta`, and emits structured stdout:
   - `UPSTREAM_METADATA=<json>` per frame (matches
     `NeutralFrameMetadata`).
@@ -94,9 +119,10 @@ Files:
     are idempotent.
 
 **No observations** in any mode. **No `ObservationWriter`** is wired up
-anywhere in `app/`. The metadata / tracker probes run `pyds` (and, in
-tracker mode, `nvtracker`) but are still probes: **no metadata adapter,
-no nvdsanalytics, no line crossing / zones, no Triton.** KITTI /
+anywhere in `app/`. The metadata / tracker / analytics probes run `pyds`
+(and, in analytics mode, `nvdsanalytics` on top of `nvtracker`) but are
+still probes: **no final metadata adapter, no rules/events, no
+dashboard-driven geometry, no Triton.** KITTI /
 `UPSTREAM_METADATA` output is debug evidence only — *not* final
 metadata extraction. The webhook secret never enters the pyds container
 (the in-container app never calls UpStream APIs; status posting stays

@@ -189,6 +189,105 @@ def build_tracker_config(algorithm: str = "iou") -> str:
     )
 
 
+# --- P3.5 analytics-probe config builder -------------------------------
+
+# Stream id (per-stream sections key off this). v0 only batches a single
+# RTSP source so 0 is the only stream index ever used; making it a named
+# constant keeps the section names tidy and lets future multi-stream
+# work parameterize it without breaking tests.
+_ANALYTICS_STREAM_ID = 0
+
+# v0 ships one ROI ("entry-roi") and one line ("entry-line"). Both are
+# parameterized but the public knob surface stays tiny: width / height of
+# the frame the geometry was authored against. The dashboard-driven /
+# operator-authored config generator is a later milestone.
+_DEFAULT_ROI_LABEL = "entry-roi"
+_DEFAULT_LINE_LABEL = "entry-line"
+
+
+def build_analytics_config(
+    *,
+    frame_width: int = 1280,
+    frame_height: int = 720,
+    roi_label: str = _DEFAULT_ROI_LABEL,
+    line_label: str = _DEFAULT_LINE_LABEL,
+) -> str:
+    """``nvdsanalytics`` config (INI-style) covering one ROI + one line
+    crossing. Modelled on the DS 8.0 sample
+    ``config_nvdsanalytics.txt`` but stripped to the two rules we
+    actually surface in the status payload (ROI + LC). Pure / side-effect
+    free so it is unit-testable without DeepStream.
+
+    The ROI is a central rectangle (covers ~60% of the frame area) — wide
+    enough that any person who walks across the scene at least partially
+    overlaps it. The line is horizontal across the middle of the ROI, so
+    walking through the ROI also crosses the line. Coordinates are in
+    pixels of the ``config-width`` / ``config-height`` (set to the
+    nvstreammux output, default 1280x720).
+
+    Geometry tuning for specific scenes is out of scope for v0; this
+    config exists to prove the analytics extraction path, not to ship
+    production zones."""
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError(
+            f"frame_width and frame_height must be > 0; got {frame_width}x{frame_height}"
+        )
+    if not roi_label or not line_label:
+        raise ValueError("roi_label and line_label must be non-empty")
+    # Central ROI: (20%, 10%) -> (80%, 90%) of the frame. Polygon points
+    # are clockwise from top-left as nvdsanalytics expects.
+    rx0 = int(frame_width * 0.20)
+    rx1 = int(frame_width * 0.80)
+    ry0 = int(frame_height * 0.10)
+    ry1 = int(frame_height * 0.90)
+    roi_points = f"{rx0};{ry0};{rx1};{ry0};{rx1};{ry1};{rx0};{ry1}"
+    # Horizontal line across the middle of the ROI. nvdsanalytics LC
+    # requires 4 (line-segment) + 2 (direction reference) point pairs:
+    # line_x0;line_y0;line_x1;line_y1;dir_x0;dir_y0;dir_x1;dir_y1
+    line_y = frame_height // 2
+    lx0 = int(frame_width * 0.25)
+    lx1 = int(frame_width * 0.75)
+    # Direction reference points: from above the line to below, so
+    # "downwards" trips the crossing event.
+    dir_x = frame_width // 2
+    dir_y0 = max(0, line_y - 80)
+    dir_y1 = min(frame_height - 1, line_y + 80)
+    lc_points = f"{lx0};{line_y};{lx1};{line_y};{dir_x};{dir_y0};{dir_x};{dir_y1}"
+    return (
+        "[property]\n"
+        "enable=1\n"
+        f"config-width={int(frame_width)}\n"
+        f"config-height={int(frame_height)}\n"
+        # osd-mode=0: don't draw anything (we render to fakesink anyway).
+        "osd-mode=0\n"
+        "display-font-size=12\n"
+        f"[roi-filtering-stream-{_ANALYTICS_STREAM_ID}]\n"
+        "enable=1\n"
+        # The DS 8.0 nvdsanalytics property parser keys ROIs off "roi-"-
+        # prefixed properties: the label is the suffix after "roi-" in the
+        # KEY name (NOT in the value); the value is the polygon point list.
+        # See sources/gst-plugins/gst-nvdsanalytics/nvdsanalytics_property_parser.cpp
+        # (DSANALYTICS_PROPERTY_ROI = "roi-").
+        f"roi-{roi_label}={roi_points}\n"
+        # inverse-roi=0: count objects INSIDE the polygon (vs outside).
+        "inverse-roi=0\n"
+        # class-id=-1: all classes counted (TrafficCamNet emits 4 classes;
+        # for v0 we want any of them to register in the ROI).
+        "class-id=-1\n"
+        f"[line-crossing-stream-{_ANALYTICS_STREAM_ID}]\n"
+        "enable=1\n"
+        # line-crossing-<Label>=<line-coords>;<direction-coords> — label
+        # is part of the key (parser strips the "line-crossing-" prefix).
+        f"line-crossing-{line_label}={lc_points}\n"
+        # class-id=-1: any class trips the line in v0.
+        "class-id=-1\n"
+        "extended=0\n"
+        # mode=loose: count any crossing without strict direction
+        # adherence; we want to prove events flow, not enforce direction.
+        "mode=loose\n"
+    )
+
+
 def build_inference_docker_command(
     *,
     work_dir: str,

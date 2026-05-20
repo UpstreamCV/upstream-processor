@@ -172,21 +172,68 @@ UPSTREAM_PROCESSOR_ID=proc_p3_tracker_live \
 uv run upstream-processor
 ```
 
+## P3.5 scope (supervisor-managed analytics probe)
+
+- New package `deepstream.analytics_probe.v0` (runtime `deepstream`,
+  `outputs: []`, `supports.analytics_probe: true`). Existing packages
+  (mock, decode_probe, inference_probe, metadata_probe, tracker_probe)
+  are unchanged. Mode dispatch is now most-specific-wins
+  `analytics > tracker > metadata > inference > decode`.
+- Analytics mode reuses the P3 tracker pipeline and adds an
+  `nvdsanalytics` element after `nvtracker`. The pad probe attaches to
+  `analytics.src` (one element further down than P3) and additionally
+  walks `frame_user_meta_list` / `obj_user_meta_list` for the SDK's
+  `NVDS_FRAME_META_NVDSANALYTICS` (→ `NvDsAnalyticsFrameMeta`:
+  `objInROIcnt` / `objLCCumCnt` / `objLCCurrCnt` / `ocStatus`) and
+  `NVDS_OBJ_META_NVDSANALYTICS` (→ `NvDsAnalyticsObjInfo`:
+  `roiStatus` / `lcStatus` / `dirStatus` / `ocStatus`) user-meta.
+  Frame-level analytics is folded under `frame.source["analytics"]`;
+  per-object under `object.debug["analytics"]`.
+- v0 ships a hand-authored config (`build_analytics_config(...)`):
+  one ROI (central rectangle 20-80% wide × 10-90% tall) + one
+  horizontal line crossing (x ∈ 25-75% at mid-height), `mode=loose`,
+  `class-id=-1` (any class trips). Dashboard-driven geometry is a
+  later milestone.
+- Status payload (in addition to all metadata + tracker fields) adds
+  `analytics_enabled`, `has_analytics_metadata`, `roi_metadata_count`,
+  `line_metadata_count`, `overcrowding_metadata_count`,
+  `direction_metadata_count`, `objects_with_roi_metadata`,
+  `objects_with_line_metadata`, `analytics_labels_count`, and a
+  FIFO-bounded `analytics_labels_sample`. Container name prefix
+  flips from `upstream-dst-` to `upstream-dsa-`.
+- **Status/debug evidence only — no observations, no metadata adapter
+  yet.** No rules/events, no dashboard overlay, no API change.
+
+Run it (on the GPU/streaming host, with an active validated session;
+the operator must walk THROUGH the central ROI / across the middle line
+for the SDK to emit ROI / LC events):
+
+```sh
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_PROCESSOR_ID=proc_p35_analytics_live \
+uv run upstream-processor
+```
+
 ## What it deliberately does NOT do (yet)
 
-The DeepStream tracker probe (P3) runs `nvinfer` + `nvtracker` and
-produces neutral metadata with **real stable tracker IDs**, but it is
-still a **probe** — the worker validates frames, accumulates counters,
-and surfaces them in the status payload (`processing` lines on
-`/v1/internal/processor/status`). It does NOT yet write observations.
-Explicitly out of scope: **`ObservationWriter` integration**,
-**`POST /observations`**, the final metadata adapter, `nvdsanalytics`,
-line crossing, zone analytics, Triton/nvinferserver, dashboard UI,
-package catalog, billing, YOLO/custom models, multi-stream batching.
-API contracts are unchanged. The `mock` runtime, the M8.2B decode
-probe, the M8.2C1-B inference probe, and the P2 metadata probe are
-unchanged; M8.1's `internal_rtsp_url`-is-never-read rule still holds
-for the mock runtime.
+The DeepStream analytics probe (P3.5) runs `nvinfer` + `nvtracker` +
+`nvdsanalytics` and produces neutral metadata with **real stable
+tracker IDs** plus **ROI / line-crossing / direction events**, but it
+is still a **probe** — the worker validates frames, accumulates
+counters, and surfaces them in the status payload (`processing` lines
+on `/v1/internal/processor/status`). It does NOT yet write
+observations. Explicitly out of scope: **`ObservationWriter`
+integration**, **`POST /observations`**, the final metadata adapter,
+dashboard-driven ROI / line geometry (the analytics config is
+hand-authored in `build_analytics_config`), rules / events, dashboard
+UI, package catalog, billing, Triton/nvinferserver, YOLO/custom
+models, multi-stream batching. API contracts are unchanged. The
+`mock` runtime, the M8.2B decode probe, the M8.2C1-B inference probe,
+the P2 metadata probe, and the P3 tracker probe are unchanged; M8.1's
+`internal_rtsp_url`-is-never-read rule still holds for the mock
+runtime.
 
 ## Run locally
 

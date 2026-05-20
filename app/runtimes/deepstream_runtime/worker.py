@@ -74,6 +74,7 @@ _DECODE_MODE = "decode_probe"
 _INFERENCE_MODE = "inference_probe"
 _METADATA_MODE = "metadata_probe"
 _TRACKER_MODE = "tracker_probe"
+_ANALYTICS_MODE = "analytics_probe"
 
 # Structured stdout markers emitted by the in-container pyds metadata app
 # (``app/runtimes/deepstream_runtime/pyds_metadata_app.py``). Keep in lock-
@@ -170,6 +171,18 @@ class _MetadataCounters:
     unique_tracker_ids: set[str] = field(default_factory=set)
     tracker_ids_sample: list[str] = field(default_factory=list)
     tracker_ids_sample_limit: int = 10
+    # P3.5 analytics counters; populated only when the producer attached
+    # nvdsanalytics user-meta (analytics_probe mode).
+    has_analytics_metadata: bool = False
+    roi_metadata_count: int = 0
+    line_metadata_count: int = 0
+    overcrowding_metadata_count: int = 0
+    direction_metadata_count: int = 0
+    objects_with_roi_metadata: int = 0
+    objects_with_line_metadata: int = 0
+    analytics_labels: set[str] = field(default_factory=set)
+    analytics_labels_sample: list[str] = field(default_factory=list)
+    analytics_labels_sample_limit: int = 20
 
     def absorb(self, frame: NeutralFrameMetadata) -> None:
         self.frames_seen += 1
@@ -195,6 +208,67 @@ class _MetadataCounters:
                     self.unique_tracker_ids.add(obj.tracker_id)
                     if len(self.tracker_ids_sample) < self.tracker_ids_sample_limit:
                         self.tracker_ids_sample.append(obj.tracker_id)
+            self._absorb_object_analytics(obj.debug)
+        self._absorb_frame_analytics(frame.source)
+
+    # ------------------------------------------------------------------
+    # P3.5 helpers: fold the per-frame / per-object analytics blobs the
+    # in-container app drops under ``frame.source["analytics"]`` /
+    # ``object.debug["analytics"]`` into bounded worker-side counters.
+    # All keys are optional — the producer only sets the ones it found.
+    # ------------------------------------------------------------------
+
+    def _absorb_object_analytics(self, debug: dict[str, Any]) -> None:
+        if not debug:
+            return
+        analytics = debug.get("analytics")
+        if not isinstance(analytics, dict) or not analytics:
+            return
+        self.has_analytics_metadata = True
+        roi = analytics.get("roi_labels") or []
+        lc = analytics.get("line_labels") or []
+        oc = analytics.get("overcrowding_labels") or []
+        direction = analytics.get("direction") or ""
+        if roi:
+            self.objects_with_roi_metadata += 1
+            self._record_labels(roi)
+        if lc:
+            self.objects_with_line_metadata += 1
+            self._record_labels(lc)
+        if oc:
+            self._record_labels(oc)
+        if direction:
+            self.direction_metadata_count += 1
+            self._record_labels([direction])
+
+    def _absorb_frame_analytics(self, source: dict[str, Any]) -> None:
+        if not source:
+            return
+        analytics = source.get("analytics")
+        if not isinstance(analytics, dict) or not analytics:
+            return
+        self.has_analytics_metadata = True
+        roi_counts = analytics.get("roi_counts") or {}
+        lc_cum = analytics.get("line_crossing_cumulative") or {}
+        oc = analytics.get("overcrowding_status") or {}
+        if roi_counts:
+            self.roi_metadata_count += 1
+            self._record_labels(roi_counts.keys())
+        if lc_cum:
+            self.line_metadata_count += 1
+            self._record_labels(lc_cum.keys())
+        if oc:
+            self.overcrowding_metadata_count += 1
+            self._record_labels(oc.keys())
+
+    def _record_labels(self, labels: Any) -> None:
+        for raw in labels:
+            label = str(raw)
+            if label in self.analytics_labels:
+                continue
+            self.analytics_labels.add(label)
+            if len(self.analytics_labels_sample) < self.analytics_labels_sample_limit:
+                self.analytics_labels_sample.append(label)
 
 
 @dataclass
@@ -276,11 +350,14 @@ class DeepStreamWorker(Runtime):
 
     @property
     def _mode(self) -> str:
-        """``tracker_probe`` (P3) / ``metadata_probe`` (P2) /
-        ``inference_probe`` (M8.2C1-B) / ``decode_probe`` (M8.2B), from
-        the resolved package's ``supports``. Order matters: a package
-        that advertises multiple supports falls through to the most
-        specific mode (tracker > metadata > inference > decode)."""
+        """``analytics_probe`` (P3.5) / ``tracker_probe`` (P3) /
+        ``metadata_probe`` (P2) / ``inference_probe`` (M8.2C1-B) /
+        ``decode_probe`` (M8.2B), from the resolved package's
+        ``supports``. Order matters: a package that advertises multiple
+        supports falls through to the most specific mode
+        (analytics > tracker > metadata > inference > decode)."""
+        if self._package.supports.get("analytics_probe"):
+            return _ANALYTICS_MODE
         if self._package.supports.get("tracker_probe"):
             return _TRACKER_MODE
         if self._package.supports.get("metadata_probe"):
@@ -290,8 +367,9 @@ class DeepStreamWorker(Runtime):
         return _DECODE_MODE
 
     def _default_pm_factory(self) -> ProcessManager:
-        if self._mode in (_METADATA_MODE, _TRACKER_MODE):
-            tracker_enabled = self._mode == _TRACKER_MODE
+        if self._mode in (_METADATA_MODE, _TRACKER_MODE, _ANALYTICS_MODE):
+            tracker_enabled = self._mode in (_TRACKER_MODE, _ANALYTICS_MODE)
+            analytics_enabled = self._mode == _ANALYTICS_MODE
             return DeepStreamMetadataProcessManager(
                 rtsp_url=self._session.internal_rtsp_url,
                 image=self._settings.deepstream_pyds_image,
@@ -311,6 +389,7 @@ class DeepStreamWorker(Runtime):
                 tracker_lib_path=self._settings.deepstream_tracker_lib_path,
                 tracker_width=self._settings.deepstream_tracker_width,
                 tracker_height=self._settings.deepstream_tracker_height,
+                analytics_enabled=analytics_enabled,
             )
         if self._mode == _INFERENCE_MODE:
             return DeepStreamInferenceProcessManager(
@@ -359,7 +438,7 @@ class DeepStreamWorker(Runtime):
             self._pm = self._pm_factory()
             await self._pm.start()
 
-            if self._mode in (_METADATA_MODE, _TRACKER_MODE):
+            if self._mode in (_METADATA_MODE, _TRACKER_MODE, _ANALYTICS_MODE):
                 await self._drive_metadata_probe()
             elif self._mode == _INFERENCE_MODE:
                 await self._drive_inference()
@@ -590,7 +669,8 @@ class DeepStreamWorker(Runtime):
         ``tracker_enabled`` / ``unique_tracker_ids_count`` /
         ``tracker_ids_sample`` so the operator can confirm stable IDs
         without scraping container logs."""
-        tracker_enabled = self._mode == _TRACKER_MODE
+        tracker_enabled = self._mode in (_TRACKER_MODE, _ANALYTICS_MODE)
+        analytics_enabled = self._mode == _ANALYTICS_MODE
         p: dict[str, Any] = {
             "runtime": "deepstream",
             "mode": self._mode,
@@ -614,6 +694,17 @@ class DeepStreamWorker(Runtime):
             p["tracker_algorithm"] = self._settings.deepstream_tracker_algorithm
             p["unique_tracker_ids_count"] = len(counters.unique_tracker_ids)
             p["tracker_ids_sample"] = list(counters.tracker_ids_sample)
+        if analytics_enabled:
+            p["analytics_enabled"] = True
+            p["has_analytics_metadata"] = counters.has_analytics_metadata
+            p["roi_metadata_count"] = counters.roi_metadata_count
+            p["line_metadata_count"] = counters.line_metadata_count
+            p["overcrowding_metadata_count"] = counters.overcrowding_metadata_count
+            p["direction_metadata_count"] = counters.direction_metadata_count
+            p["objects_with_roi_metadata"] = counters.objects_with_roi_metadata
+            p["objects_with_line_metadata"] = counters.objects_with_line_metadata
+            p["analytics_labels_count"] = len(counters.analytics_labels)
+            p["analytics_labels_sample"] = list(counters.analytics_labels_sample)
         if last_app_summary is not None:
             p["app_summary"] = last_app_summary
         return p
@@ -676,6 +767,9 @@ class DeepStreamWorker(Runtime):
         source = BridgeQueueMetadataSource(queue)
         counters = _MetadataCounters(
             tracker_ids_sample_limit=int(self._settings.deepstream_tracker_ids_sample_limit),
+            analytics_labels_sample_limit=int(
+                self._settings.deepstream_analytics_labels_sample_limit
+            ),
         )
         reader_state = _MetadataReaderState()
 
