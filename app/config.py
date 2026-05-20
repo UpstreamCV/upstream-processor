@@ -150,6 +150,26 @@ class Settings(BaseSettings):
     # safe for fakes/tests.
     deepstream_roi_min_interval_seconds: float = 30.0
 
+    # --- P4-C cleanup: ROI debounce / hysteresis ---------------------
+    # Number of consecutive frames a new ROI count must hold before
+    # the change branch emits. P4-C's live verification showed
+    # TrafficCamNet's detection count flaps on edge-case frames
+    # (count flips 0 ↔ 1 between adjacent frames even with an
+    # operator stationary), and an undamped on-change policy turns
+    # each flap into a real observation. Setting >= 2 suppresses
+    # short flaps; 5 (production default) requires ~166 ms of
+    # stability at 30 fps before a change is committed.
+    #
+    # The first-seen path and the interval heartbeat are unchanged.
+    # During a pending change, the heartbeat reports the LAST stable
+    # count, not the unstable candidate (so consumers cannot mistake
+    # a heartbeat for a real state change).
+    #
+    # Setting to 1 reproduces the P4-C immediate-change behavior
+    # (used by ``fast_settings`` so existing emit tests don't need
+    # to override). Values < 1 are rejected at adapter construction.
+    deepstream_roi_change_stability_frames: int = 5
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

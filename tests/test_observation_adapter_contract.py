@@ -469,6 +469,261 @@ def test_roi_emit_reason_does_not_overwrite_caller_debug() -> None:
     assert body["debug"]["geometry_source"] == "probe_default"
 
 
+# --- P4-C cleanup: debounce / hysteresis -------------------------------
+
+
+def test_roi_change_stability_frames_must_be_at_least_one() -> None:
+    """Adapter rejects 0 / negative thresholds at construction so a
+    typo in env config fails fast, not silently."""
+    import pytest
+
+    with pytest.raises(ValueError, match="change_stability_frames must be >= 1"):
+        RoiOccupancyState(stream_session_id=uuid4(), change_stability_frames=0)
+    with pytest.raises(ValueError, match="change_stability_frames must be >= 1"):
+        RoiOccupancyState(stream_session_id=uuid4(), change_stability_frames=-3)
+
+
+def test_roi_stability_1_matches_legacy_immediate_change() -> None:
+    """stability=1 is the P4-C legacy path: any new value emits on
+    the next frame. Critical for backward compat (the adapter dataclass
+    default is 1; the production Settings default is 5)."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=None,
+        change_stability_frames=1,
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    second = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=1)
+    )
+    assert len(second) == 1
+    assert second[0].total_count == 1
+    assert second[0].debug["emit_reason"] == "change"
+
+
+def test_roi_stability_3_does_not_emit_on_first_changed_frame() -> None:
+    """With debounce=3, the first frame at the new count only updates
+    pending state. No event yet."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=None,
+        change_stability_frames=3,
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    events = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=1)
+    )
+    assert events == []
+
+
+def test_roi_stability_3_emits_on_third_consecutive_frame() -> None:
+    """With debounce=3, the third consecutive frame at the new count
+    commits the change. ``pending_seen_frames_by_roi`` is the
+    accumulator; we don't expose it in the payload but the test asserts
+    the emit fires exactly when the threshold is met."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=None,
+        change_stability_frames=3,
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    assert (
+        state.absorb_roi_counts(
+            roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=1)
+        )
+        == []
+    )
+    assert (
+        state.absorb_roi_counts(
+            roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=2)
+        )
+        == []
+    )
+    events = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=3)
+    )
+    assert len(events) == 1
+    assert events[0].total_count == 1
+    assert events[0].debug["emit_reason"] == "change"
+    # Sequence is 2 (first emit was sequence=1).
+    assert events[0].sequence == 2
+
+
+def test_roi_pending_resets_when_count_flips_back_before_threshold() -> None:
+    """The 0 → 1 → 0 → 1 → … flap pattern from the P4-C live run.
+    With debounce=3, the count returning to 0 mid-flap clears the
+    pending candidate; the subsequent 1 starts over from 1, not 2."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=None,
+        change_stability_frames=3,
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    # Two frames at 1 — pending=1, seen=2.
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=1))
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=2))
+    # Count flips back to 0 (== last emitted) — pending clears.
+    flip = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=3)
+    )
+    assert flip == []
+    # Now 1 again — pending starts FROM 1, not from 3.
+    again_1 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=4)
+    )
+    again_2 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=5)
+    )
+    assert again_1 == []
+    assert again_2 == []
+    # Third consecutive 1 should now commit.
+    again_3 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=6)
+    )
+    assert len(again_3) == 1
+    assert again_3[0].total_count == 1
+    assert again_3[0].debug["emit_reason"] == "change"
+
+
+def test_roi_pending_switches_to_different_new_candidate() -> None:
+    """Pending was 1 (seen 2x), then frame is 2 (different new value).
+    Pending must reset to 2 with seen=1, NOT carry over the old 2x
+    accumulation."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=None,
+        change_stability_frames=3,
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=1))
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=2))
+    # Switch candidate to 2 — pending state replaces, doesn't increment.
+    switch = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 2}, occurred_at=_now() + timedelta(seconds=3)
+    )
+    assert switch == []
+    # Need TWO more consecutive 2s to hit the threshold.
+    assert (
+        state.absorb_roi_counts(
+            roi_counts={"entry-roi": 2}, occurred_at=_now() + timedelta(seconds=4)
+        )
+        == []
+    )
+    final = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 2}, occurred_at=_now() + timedelta(seconds=5)
+    )
+    assert len(final) == 1
+    assert final[0].total_count == 2
+    assert final[0].debug["emit_reason"] == "change"
+
+
+def test_roi_interval_heartbeat_reports_last_stable_count_during_pending() -> None:
+    """Key invariant: when the interval elapses while a candidate is
+    pending but not yet stable, the heartbeat must report the LAST
+    STABLE count, not the unstable candidate. Consumers cannot mistake
+    a heartbeat for a real state change."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=30.0,
+        change_stability_frames=5,
+    )
+    # First emit at t=0 commits count=2.
+    state.absorb_roi_counts(roi_counts={"entry-roi": 2}, occurred_at=_now())
+    # Two frames at 0 — pending=0, seen=2. Threshold (5) not met.
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=10))
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=20))
+    # 31 s elapsed — heartbeat fires. Must report the LAST STABLE count (2),
+    # not the pending candidate (0).
+    heartbeat = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=31)
+    )
+    assert len(heartbeat) == 1
+    assert heartbeat[0].total_count == 2  # NOT 0
+    assert heartbeat[0].debug["emit_reason"] == "interval"
+    # Pending state survives the heartbeat: the seen counter must
+    # have advanced (we just saw another 0).
+    assert state.pending_count_by_roi.get("entry-roi") == {"__total": 0}
+    assert state.pending_seen_frames_by_roi.get("entry-roi") == 3
+
+
+def test_roi_pending_eventually_commits_after_heartbeat() -> None:
+    """If pending count stays pending through a heartbeat AND
+    eventually accumulates enough frames, the next emit is a regular
+    'change' to the new value. Two distinct emits total: heartbeat
+    (stable count) + change (new count)."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=30.0,
+        change_stability_frames=10,  # threshold high enough that the
+        # heartbeat fires BEFORE the pending count would commit.
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 2}, occurred_at=_now())  # first
+
+    # Three frames at 0 over the interval window — pending=0, seen=3
+    # (still well below threshold=10).
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=10))
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=20))
+    state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=29))
+
+    # Heartbeat at 31s — must emit STABLE count=2, not the pending 0.
+    hb = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=31)
+    )
+    assert len(hb) == 1
+    assert hb[0].total_count == 2  # NOT 0
+    assert hb[0].debug["emit_reason"] == "interval"
+    # Pending state survived the heartbeat: count=0 was just seen 4 times
+    # (frames at offsets 10, 20, 29, 31).
+    assert state.pending_seen_frames_by_roi.get("entry-roi") == 4
+
+    # Six more frames at 0 (4 + 6 = 10 = threshold) commit the change.
+    for offset in (32, 33, 34, 35, 36):
+        no_emit = state.absorb_roi_counts(
+            roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=offset)
+        )
+        assert no_emit == []
+    final = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 0}, occurred_at=_now() + timedelta(seconds=37)
+    )
+    assert len(final) == 1
+    assert final[0].total_count == 0
+    assert final[0].debug["emit_reason"] == "change"
+    assert final[0].sequence == 3  # first=1, interval=2, change=3
+
+
+def test_roi_sequence_increments_only_on_actual_emits() -> None:
+    """A flap that's suppressed by the debounce must NOT advance the
+    sequence — sequences are emit counters, not frame counters."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(),
+        emit_on_change=True,
+        min_interval_seconds=None,
+        change_stability_frames=5,
+    )
+    e1 = state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    # 4 frames at count=1, all suppressed by debounce.
+    for i in range(1, 5):
+        suppressed = state.absorb_roi_counts(
+            roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=i)
+        )
+        assert suppressed == []
+    # 5th frame at 1 finally commits.
+    e2 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=5)
+    )
+    assert e1[0].sequence == 1
+    assert e2[0].sequence == 2
+    assert e1[0].idempotency_key.endswith(":1")
+    assert e2[0].idempotency_key.endswith(":2")
+
+
 def test_roi_idempotency_key_increments_per_emit() -> None:
     """The ``sequence`` field on the event must equal the sequence
     embedded in the idempotency key — keys are unique per emit, not

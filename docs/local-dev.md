@@ -678,6 +678,88 @@ rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
 rm -rf /tmp/upstream-live-p4c
 ```
 
+## Live verification checklist (P4-C Cleanup — ROI debounce / hysteresis)
+
+P4-C's first live run produced 205 ROI POSTs in one cycle because
+detection counts flap (0↔1↔0) on edge frames; every flap was a
+legitimate "change" emit. This cleanup adds a per-ROI debounce:
+new counts must hold for ``UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES``
+(default 5 ≈ 166 ms at 30 fps) frames before committing. No new
+observation type, no api-server change — re-uses the P4-C deploy.
+
+### Launch (same secret-handling pattern, new processor id)
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p4c-debounce
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p4c-debounce/secret.env
+chmod 600 /tmp/upstream-live-p4c-debounce/secret.env
+
+cd /tmp/upstream-live-p4c-debounce/repo
+set -a; . /tmp/upstream-live-p4c-debounce/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p4c_roi_debounce_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES=5 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p4c-debounce/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p4c-debounce/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p4c-debounce/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p4c-debounce/processor.pid
+```
+
+### Operator script
+
+Reproduce the P4-C movement pattern so we can compare like-for-like:
+
+1. Stay outside the ROI briefly (first-seen emit, ``total_count=0``).
+2. Walk into the central ROI; **move around inside** for ~30 s
+   (worst case for the old policy because TrafficCamNet flapped
+   here; debounce should now eat most of those flaps).
+3. Walk out; stay outside ~5 s.
+4. Stand still inside ROI for ≥35 s (heartbeat fires).
+5. SIGINT.
+
+### Expected vs P4-C baseline
+
+P4-C baseline (no debounce): **205 POSTs / 180 s cycle**.
+This cleanup with ``stability_frames=5`` should reduce that
+**meaningfully** for the same operator movement — exact ratio depends
+on the scene, but a typical detection-flap-heavy run should drop by
+roughly 2-5×. The interval heartbeat should still fire at the 30 s
+mark even when the operator is stationary inside the ROI.
+
+```
+[ ] First processor.roi_occupancy POST (debug.emit_reason=first)
+[ ] Operator moves around inside ROI; volume markedly lower than
+    P4-C's 205-POSTs baseline (informal comparison; exact count
+    will vary)
+[ ] Operator exits and re-enters; a small number of change-emits
+[ ] Heartbeat POST after 30 s of stable count
+    (debug.emit_reason=interval, total_count matches last stable)
+[ ] processor.line_crossing still emits if operator crossed the
+    midline (unchanged behavior)
+[ ] Status payload carries roi_change_stability_frames=5
+[ ] Zero 422s, zero non-2xx
+[ ] Clean shutdown
+[ ] No raw RTSP / secret / Authorization / Bearer in run log
+[ ] No leftover upstream-dsa-* containers
+[ ] No /tmp/upstream-p35-analytics.* leftovers
+```
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dsa|upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p4c-debounce
+```
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

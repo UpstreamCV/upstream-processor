@@ -297,25 +297,57 @@ def build_roi_occupancy_idempotency_key(
 class RoiOccupancyState:
     """Per-stream-per-worker ROI occupancy adapter state.
 
-    Two emit conditions, OR'd together:
+    Three emit conditions:
 
-    1. **On change** — total count for an ROI changed since the last
-       emit. Catches "person stepped into ROI" and "person left ROI".
-    2. **On interval** — at least ``min_interval_seconds`` have passed
-       since the last emit, even if the count is unchanged. Keeps the
-       observation stream visible during long steady periods.
+    1. **First-seen** — the first observation of an ROI always emits
+       (so consumers learn the ROI exists). ``debug.emit_reason="first"``.
+    2. **Change (stable)** — total count for an ROI differs from the
+       last emitted count AND the new count has been seen on at least
+       ``change_stability_frames`` consecutive frames. ``debug.emit_reason="change"``.
+       Single-frame flaps below the threshold do NOT emit (P4-C cleanup).
+    3. **Interval heartbeat** — at least ``min_interval_seconds`` have
+       passed since the last emit. ``debug.emit_reason="interval"``.
 
-    Both can be disabled (``emit_on_change=False``,
-    ``min_interval_seconds=None``) for tests. v0 recommends
-    ``emit_on_change=True`` + a generous interval (e.g. 30 s) — we want
-    state, not noise."""
+    Important: if the interval elapses while a candidate count is
+    pending (i.e., the count differs from last-emitted but hasn't yet
+    been seen N times), the heartbeat reports the **last stable
+    count**, NOT the unstable candidate. The pending state survives
+    the heartbeat. Choice rationale: heartbeats are supposed to mean
+    "this ROI is still alive and here's its committed state"; emitting
+    a flapping count in a heartbeat would look indistinguishable from
+    a real change to a consumer.
+
+    Backward compat: ``change_stability_frames`` defaults to ``1``,
+    which makes the change branch behave exactly like P4-C did
+    (emit immediately on any difference). Production wiring sets it
+    higher (default 5 via ``Settings.deepstream_roi_change_stability_frames``).
+
+    Both ``emit_on_change`` and ``min_interval_seconds`` can be
+    disabled (set to False / None) for tests."""
 
     stream_session_id: UUID
     emit_on_change: bool = True
     min_interval_seconds: float | None = 30.0
+    # P4-C cleanup: number of consecutive frames a new (non-last-emitted)
+    # count must hold before the change branch fires. 1 = legacy P4-C
+    # behavior. >=2 suppresses short flaps. <1 is rejected up front.
+    change_stability_frames: int = 1
     last_counts_by_roi: dict[str, dict[str, int]] = field(default_factory=dict)
     last_emit_at_by_roi: dict[str, datetime] = field(default_factory=dict)
     sequence_by_roi: dict[str, int] = field(default_factory=dict)
+    # P4-C cleanup: per-ROI pending-candidate tracking. ``pending_count_by_roi``
+    # is the snapshot under consideration; ``pending_seen_frames_by_roi``
+    # counts how many consecutive frames it has been observed. Cleared
+    # when the count returns to the last emitted value, or replaced when
+    # a different new value arrives.
+    pending_count_by_roi: dict[str, dict[str, int]] = field(default_factory=dict)
+    pending_seen_frames_by_roi: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.change_stability_frames < 1:
+            raise ValueError(
+                f"change_stability_frames must be >= 1; got {self.change_stability_frames}"
+            )
 
     def absorb_roi_counts(
         self,
@@ -332,20 +364,34 @@ class RoiOccupancyState:
         for this frame (the shape of ``NvDsAnalyticsFrameMeta.objInROIcnt``,
         as captured in P3.5). ``class_counts_by_roi`` is an optional
         finer breakdown; when not supplied, ``class_counts`` is left
-        empty in the emitted event."""
+        empty in the emitted event.
+
+        Side effects: ``last_counts_by_roi`` / ``last_emit_at_by_roi`` /
+        ``sequence_by_roi`` are updated only when an event is actually
+        emitted. The pending state (``pending_count_by_roi`` /
+        ``pending_seen_frames_by_roi``) is updated on every frame
+        whether or not an event is emitted — that's what implements
+        the debounce."""
         events: list[RoiOccupancyEvent] = []
         for roi_id, total in roi_counts.items():
             class_counts = (class_counts_by_roi or {}).get(roi_id, {})
-            reason = self._classify_emit(roi_id, total, class_counts, occurred_at)
-            if reason is None:
-                continue
-            seq = self.sequence_by_roi.get(roi_id, 0) + 1
-            self.sequence_by_roi[roi_id] = seq
-            self.last_counts_by_roi[roi_id] = {
+            snapshot: dict[str, int] = {
                 "__total": int(total),
                 **{str(k): int(v) for k, v in class_counts.items()},
             }
+            decision = self._classify_emit(roi_id, snapshot, occurred_at)
+            if decision is None:
+                continue
+            reason, emit_snapshot, emit_total, emit_class_counts = decision
+            seq = self.sequence_by_roi.get(roi_id, 0) + 1
+            self.sequence_by_roi[roi_id] = seq
+            self.last_counts_by_roi[roi_id] = emit_snapshot
             self.last_emit_at_by_roi[roi_id] = occurred_at
+            # An emitted change resets the debounce — the new value is
+            # now the committed last-emitted; pending is cleared.
+            if reason == "change":
+                self.pending_count_by_roi.pop(roi_id, None)
+                self.pending_seen_frames_by_roi.pop(roi_id, None)
             key = build_roi_occupancy_idempotency_key(
                 stream_session_id=self.stream_session_id,
                 roi_id=roi_id,
@@ -364,8 +410,8 @@ class RoiOccupancyState:
                     occurred_at=occurred_at,
                     roi_id=roi_id,
                     roi_label=roi_id,
-                    total_count=int(total),
-                    class_counts={str(k): int(v) for k, v in class_counts.items()},
+                    total_count=int(emit_total),
+                    class_counts={str(k): int(v) for k, v in emit_class_counts.items()},
                     sequence=seq,
                     idempotency_key=key,
                     source=dict(source or {}),
@@ -377,34 +423,88 @@ class RoiOccupancyState:
     def _classify_emit(
         self,
         roi_id: str,
-        total: int,
-        class_counts: dict[str, int],
+        snapshot: dict[str, int],
         occurred_at: datetime,
-    ) -> str | None:
-        """Decide whether to emit for this ROI, and why.
+    ) -> tuple[str, dict[str, int], int, dict[str, int]] | None:
+        """Decide whether to emit for this ROI and what to emit.
 
-        Returns one of ``"first"`` / ``"change"`` / ``"interval"`` to
-        emit (the value rides in the event's ``debug.emit_reason`` so
-        operators can tell heartbeats from state changes at a glance),
-        or ``None`` to skip."""
+        Returns ``(reason, emit_snapshot, emit_total, emit_class_counts)``
+        when emitting, where ``emit_*`` describe the count to put into
+        the observation payload. Returns ``None`` to skip.
+
+        The values are NOT always the input snapshot: during a pending
+        change, a heartbeat reports the LAST EMITTED count, not the
+        unstable candidate. The change branch updates pending state as
+        a side effect even when it skips emission (that's the debounce
+        accumulator)."""
         last = self.last_counts_by_roi.get(roi_id)
-        snapshot: dict[str, int] = {
-            "__total": int(total),
-            **{str(k): int(v) for k, v in class_counts.items()},
-        }
+
+        # Case 1: first observation of this ROI — always emit it as-is.
         if last is None:
-            # First observation of this ROI in this state — always emit so
-            # consumers know it exists.
-            return "first"
-        if self.emit_on_change and last != snapshot:
-            return "change"
-        if self.min_interval_seconds is None:
+            return ("first", dict(snapshot), snapshot["__total"], _strip_total(snapshot))
+
+        same_as_last = last == snapshot
+
+        if same_as_last:
+            # The count is back to the committed last-emitted value.
+            # Clear any pending candidate (the flap is over).
+            self.pending_count_by_roi.pop(roi_id, None)
+            self.pending_seen_frames_by_roi.pop(roi_id, None)
+            # Maybe heartbeat. The emit count IS the last (== snapshot).
+            if self._interval_elapsed(roi_id, occurred_at):
+                return ("interval", dict(snapshot), snapshot["__total"], _strip_total(snapshot))
             return None
+
+        # Case 3: count differs from last-emitted. Update the pending
+        # accumulator first; THEN decide whether to emit change or fall
+        # through to a possible heartbeat-with-stable-count.
+        if self.emit_on_change:
+            pending = self.pending_count_by_roi.get(roi_id)
+            if pending == snapshot:
+                self.pending_seen_frames_by_roi[roi_id] = (
+                    self.pending_seen_frames_by_roi.get(roi_id, 0) + 1
+                )
+            else:
+                # New (or different) candidate — start counting from 1.
+                self.pending_count_by_roi[roi_id] = dict(snapshot)
+                self.pending_seen_frames_by_roi[roi_id] = 1
+            if self.pending_seen_frames_by_roi.get(roi_id, 0) >= self.change_stability_frames:
+                # Stable threshold met: emit a change with the new count.
+                return (
+                    "change",
+                    dict(snapshot),
+                    snapshot["__total"],
+                    _strip_total(snapshot),
+                )
+
+        # Change is pending but not yet stable. Heartbeat may still fire
+        # — but it MUST report the last stable count, not the unstable
+        # candidate, so a downstream consumer can't mistake the heartbeat
+        # for a real state change.
+        if self._interval_elapsed(roi_id, occurred_at):
+            return (
+                "interval",
+                dict(last),
+                last["__total"],
+                _strip_total(last),
+            )
+        return None
+
+    def _interval_elapsed(self, roi_id: str, occurred_at: datetime) -> bool:
+        if self.min_interval_seconds is None:
+            return False
         last_at = self.last_emit_at_by_roi.get(roi_id)
         if last_at is None:
-            return "interval"
-        elapsed = (occurred_at - last_at).total_seconds()
-        return "interval" if elapsed >= float(self.min_interval_seconds) else None
+            return True
+        return (occurred_at - last_at).total_seconds() >= float(self.min_interval_seconds)
+
+
+def _strip_total(snapshot: dict[str, int]) -> dict[str, int]:
+    """Return the per-class breakdown without the synthetic
+    ``__total`` sentinel that ``_classify_emit`` uses internally to
+    compare last-vs-new snapshots without giving the total special
+    treatment."""
+    return {k: v for k, v in snapshot.items() if k != "__total"}
 
 
 # --- ergonomic helper --------------------------------------------------

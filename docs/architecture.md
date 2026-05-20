@@ -1235,3 +1235,108 @@ See ``docs/local-dev.md`` for the operator checklist.
 - Dashboard-driven ROI geometry — still hand-authored in
   ``build_analytics_config``.
 - Direction / track-update / telemetry types.
+
+## P4-C Cleanup — ROI Debounce / Hysteresis
+
+### Why
+P4-C's live verification produced **205 observation POSTs in a
+single 180s cycle** — far higher than the design anticipated. Root
+cause: TrafficCamNet's detection count is jittery on edge-case
+frames (the same person at the edge of the frame might be detected
+on frame ``N`` and missed on frame ``N+1``), so a `0 ↔ 1 ↔ 0`
+flap pattern fires three legitimate "change" emits in a single
+second. The signal is real (the count IS changing); the
+observability cost is what's wrong.
+
+### Policy
+A per-ROI debounce / hysteresis layer in ``RoiOccupancyState``:
+
+- **First emit** unchanged — first observation of any ROI still
+  fires immediately so consumers know the ROI exists.
+- **Change emit** gated on **stability**: a new count must hold
+  for ``change_stability_frames`` consecutive frames before it
+  commits and emits. Default is **5** frames (≈166 ms at 30 fps).
+  A flap that returns to the last-emitted count before the
+  threshold is met clears the pending candidate; a different new
+  candidate replaces the pending one and restarts the counter at
+  1.
+- **Interval heartbeat** unchanged in cadence (30 s default) AND
+  unchanged in invariant: when the heartbeat fires while a
+  candidate is pending but not yet stable, **the heartbeat reports
+  the last STABLE count, not the unstable candidate**. The
+  pending state survives the heartbeat; consumers cannot mistake a
+  heartbeat for a real state change.
+
+### Configuration
+``app/config.py`` adds
+``deepstream_roi_change_stability_frames: int = 5`` (env-overridable
+via ``UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES``).
+``RoiOccupancyState.change_stability_frames`` defaults to ``1`` in
+the dataclass to keep P4-A / P4-C unit-test invariants intact;
+``Settings`` carries the production value and the worker passes it
+through. ``fast_settings`` overrides to ``1`` so the existing P4-C
+emit tests stay valid.
+
+Values < 1 are rejected at adapter construction (``ValueError``).
+Setting to 1 reproduces the P4-C immediate-change behavior.
+
+### Worker integration
+``_drive_metadata_probe`` passes
+``self._settings.deepstream_roi_change_stability_frames`` into
+``RoiOccupancyState``. The status payload surfaces
+``roi_change_stability_frames`` so an operator can tell "no
+observations because steady scene" apart from "no observations
+because debounce too aggressive". Line-crossing behavior is
+completely unchanged.
+
+### State machine
+Per ROI:
+- ``last_counts_by_roi[roi]`` — last EMITTED count snapshot.
+- ``last_emit_at_by_roi[roi]`` — last emit time.
+- ``sequence_by_roi[roi]`` — per-ROI emit counter (idempotency
+  key sequence; advances only on actual emits).
+- ``pending_count_by_roi[roi]`` — candidate count not yet emitted
+  (None / missing when no candidate).
+- ``pending_seen_frames_by_roi[roi]`` — how many consecutive
+  frames the candidate has been observed.
+
+On each frame:
+1. If ROI is new → emit ``first`` with the count. Done.
+2. If count == last_emitted → clear pending; maybe emit
+   ``interval`` with that count.
+3. If count != last_emitted:
+   - Update pending (same candidate → seen += 1; different
+     candidate → reset to {count, 1}).
+   - If seen >= threshold → emit ``change`` with the new count;
+     clear pending.
+   - Else if interval elapsed → emit ``interval`` with the LAST
+     STABLE count (pending survives).
+
+### Tests
+- ``tests/test_observation_adapter_contract.py`` — 9 new tests.
+  Threshold validation; 1-equals-immediate-change; debounce=3
+  suppresses single-frame change; debounce=3 commits on third
+  consecutive frame; flap clears pending; different new candidate
+  replaces pending; heartbeat reports stable count during
+  pending; pending eventually commits after heartbeat; sequence
+  increments only on actual emits.
+- ``tests/test_deepstream_roi_occupancy_emit.py`` — 6 new tests:
+  worker-level flap suppression; stable-count commit; heartbeat
+  emits stable count under debounce; Settings default is 5;
+  invalid threshold rejected; status payload exposes the
+  threshold.
+- ``tests/conftest.py`` — ``fast_settings`` adds
+  ``deepstream_roi_change_stability_frames=1`` so existing P4-C
+  emit tests keep working without per-test overrides.
+
+### What's NOT in this cleanup
+- No new observation types.
+- No API changes.
+- No DB migration.
+- No worker-side hysteresis for the count returning to a previous
+  value (the count must explicitly hit the last emitted value to
+  clear pending, not an arbitrary back-off curve).
+- No emit-reason expansion (still only ``first`` / ``change`` /
+  ``interval``).
+- No retry / backoff loop around writer.emit.
+- ``processor.line_crossing`` behavior unchanged.

@@ -128,7 +128,13 @@ existing `ObservationWriter`:
   count change, and on a 30 s heartbeat interval (env-overridable
   via `UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`). **Never
   per-frame.** ``payload["debug"]["emit_reason"]`` records which
-  policy branch fired.
+  policy branch fired. **P4-C cleanup** adds a debounce: a new
+  count must hold for
+  `UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES` (default 5)
+  consecutive frames before the change branch commits — this
+  suppresses TrafficCamNet's edge-frame detection flaps. During a
+  pending change, the heartbeat reports the LAST STABLE count,
+  not the unstable candidate.
 
 The ``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
 ``tracker_probe`` modes remain observation-free. The pyds

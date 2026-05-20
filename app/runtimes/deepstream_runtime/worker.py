@@ -748,6 +748,13 @@ class DeepStreamWorker(Runtime):
                 p["roi_occupancy_observations_emitted"] = (
                     counters.roi_occupancy_observations_emitted
                 )
+                # P4-C cleanup: surface the debounce configuration so an
+                # operator can tell "no observations because steady scene"
+                # apart from "no observations because debounce is too
+                # aggressive". Counts >1 actively suppress short flaps.
+                p["roi_change_stability_frames"] = int(
+                    self._settings.deepstream_roi_change_stability_frames
+                )
                 p["observation_write_errors_count"] = counters.observation_write_errors
                 p["last_observation_at"] = (
                     counters.last_observation_at.isoformat()
@@ -838,11 +845,16 @@ class DeepStreamWorker(Runtime):
         # first-seen + on-change + ``min_interval_seconds`` heartbeat
         # (never per-frame). The interval is env-overridable via
         # ``UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`` (default 30s).
+        # P4-C cleanup: a debounce of ``change_stability_frames`` frames
+        # (default 5, env-overridable via
+        # ``UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES``) suppresses
+        # short detection-count flaps before a change is committed.
         roi_state: RoiOccupancyState | None = (
             RoiOccupancyState(
                 stream_session_id=self._session.session_id,
                 emit_on_change=True,
                 min_interval_seconds=self._settings.deepstream_roi_min_interval_seconds,
+                change_stability_frames=self._settings.deepstream_roi_change_stability_frames,
             )
             if observations_enabled
             else None

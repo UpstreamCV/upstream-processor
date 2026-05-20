@@ -4,6 +4,90 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P4-C Cleanup: ROI Debounce / Hysteresis
+
+### Summary
+Pure observability fix on top of P4-C: TrafficCamNet's detection
+count flaps on edge-case frames, and P4-C's undamped on-change
+policy turned each flap into a real observation (205 POSTs in one
+180s cycle, including bursts of 8 POSTs/3s during active operator
+movement). Adds a per-ROI debounce: a new count must hold for
+``change_stability_frames`` consecutive frames (default 5, ≈166ms
+at 30fps) before committing as a change. First-emit and the 30s
+heartbeat interval are unchanged in cadence. **No new observation
+types, no API change, no DB migration.**
+
+### What changed
+- ``app/observations/observation_adapter.py``:
+  - ``RoiOccupancyState`` gains ``change_stability_frames: int = 1``
+    (legacy P4-C behavior) + ``pending_count_by_roi`` /
+    ``pending_seen_frames_by_roi`` accumulator fields.
+  - ``__post_init__`` rejects ``change_stability_frames < 1``.
+  - ``_classify_emit`` now returns
+    ``tuple[reason, snapshot, total, class_counts] | None``. The
+    change branch updates the pending counter on every frame
+    (even when it doesn't emit), and the interval branch reports
+    the LAST STABLE count when a candidate is pending. The
+    pending state survives the heartbeat so the eventual commit
+    still happens.
+- ``app/config.py``: adds
+  ``deepstream_roi_change_stability_frames: int = 5`` (production
+  default; env-overridable via
+  ``UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES``).
+- ``app/runtimes/deepstream_runtime/worker.py``:
+  - Threads ``change_stability_frames`` into ``RoiOccupancyState``.
+  - Status payload surfaces ``roi_change_stability_frames`` so
+    operators can tell "no observations: steady scene" apart from
+    "no observations: debounce too aggressive".
+- ``tests/conftest.py`` — ``fast_settings`` adds
+  ``deepstream_roi_change_stability_frames=1`` so existing P4-C
+  emit tests stay valid without per-test overrides.
+- ``tests/test_observation_adapter_contract.py`` — 9 new tests for
+  debounce semantics (threshold rejection, immediate-change
+  backward compat, suppression, commit, flap-clears-pending,
+  candidate-switch, heartbeat-with-stable-count,
+  eventually-commits-after-heartbeat, sequence-only-on-emit).
+- ``tests/test_deepstream_roi_occupancy_emit.py`` — 6 new tests
+  for the worker integration (flap suppression, stable commit,
+  heartbeat-with-stable-count under debounce, Settings default
+  is 5, invalid threshold rejected, status payload exposes
+  threshold).
+- ``.env.example`` documents both
+  ``UPSTREAM_DEEPSTREAM_ROI_MIN_INTERVAL_SECONDS`` and the new
+  ``UPSTREAM_DEEPSTREAM_ROI_CHANGE_STABILITY_FRAMES``.
+
+### Backward compatibility
+- ``RoiOccupancyState`` constructor default (``change_stability_frames=1``)
+  matches the pre-cleanup behavior — every direct caller of the
+  state machine in P4-A's tests keeps working with zero changes.
+- Production wiring sets the value to 5 via Settings; existing
+  emit tests use ``fast_settings`` (= 1) so the worker-level emit
+  contracts are unchanged in tests.
+- The status payload added one new field
+  (``roi_change_stability_frames``); other payload keys unchanged.
+- ``processor.line_crossing`` unchanged.
+
+### Expected production impact
+ROI observation volume during active scenes should drop sharply
+(the 0↔1↔0 flap pattern that produced 8 POSTs/3s now suppresses
+unless the count holds for ≥5 frames). The interval heartbeat
+still ensures observers see fresh state at least every 30 s; a
+truly stable population change emits ~one observation per state
+transition instead of per flap.
+
+### Out of scope (next milestones)
+- Server-side ``idempotency_key`` column + UNIQUE constraint.
+- ``processor.zone_entered`` / ``zone_exited`` / ``dwell_exceeded``
+  (P4-D; needs a new ``ZoneMembershipState`` adapter).
+- Per-class ROI breakdown (probe-side change).
+- Dashboard-driven ROI geometry.
+
+### Tests
+- **267 passing** (252 prior + 15 new). ruff + ruff-format +
+  ``mypy app`` clean. No Docker / GPU / pyds / network.
+
+---
+
 ## 2026-05-20 - P4-C: ROI Occupancy Observation Write Path
 
 ### Summary
