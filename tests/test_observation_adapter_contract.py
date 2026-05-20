@@ -1,0 +1,502 @@
+"""P4-A — observation adapter contract probe tests.
+
+Contract-level only. NO Docker / GPU / pyds / api-server. Asserts:
+
+- ``LineCrossingState`` turns frame-level
+  ``line_crossing_cumulative`` snapshots into discrete
+  ``processor.line_crossing`` events with one event per increment.
+- Idempotency keys are deterministic and unique per ``(session, line,
+  cumulative_count)`` — both via the pure helper and via the state
+  machine.
+- A frame whose counter is unchanged from the prior frame emits
+  nothing (dedupe correctness — the load-bearing assertion before any
+  live POST happens).
+- A frame whose counter rewinds (a sketchy edge case) does NOT emit
+  spurious events and does NOT lower the watermark.
+- An empty / missing analytics block on the frame emits nothing.
+- DeepStream-specific vocabulary stays under ``source`` / ``debug``
+  on the event (top-level fields are runtime-neutral).
+- ``RoiOccupancyState`` emits on first observation of an ROI, on
+  count change, and on interval elapse — but NOT every frame when
+  unchanged.
+- The ``CANDIDATE_*`` observation type strings are NOT yet in
+  ``schemas.OBSERVATION_TYPES`` (the api-server widening hasn't
+  happened; the adapter knows this; nothing has accidentally been
+  added to the Literal whitelist).
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from app.observations.observation_adapter import (
+    CANDIDATE_LINE_CROSSING_TYPE,
+    CANDIDATE_OBSERVATION_TYPES,
+    LineCrossingState,
+    RoiOccupancyState,
+    build_line_crossing_idempotency_key,
+    build_roi_occupancy_idempotency_key,
+    deepstream_source_block,
+)
+from app.observations.schemas import OBSERVATION_TYPES
+
+# --- type registry guards ---------------------------------------------
+
+
+def test_candidate_types_not_in_server_whitelist_yet() -> None:
+    """P4-A is a probe: the adapter MUST NOT be using a type string the
+    deployed server already accepts, or we'd risk a real POST landing
+    in production. P4-B widens both ends in lockstep."""
+    for t in CANDIDATE_OBSERVATION_TYPES:
+        assert t not in OBSERVATION_TYPES, (
+            f"{t!r} unexpectedly in OBSERVATION_TYPES — "
+            "the schemas widening should happen in P4-B with the matching api-server PR"
+        )
+
+
+def test_candidate_types_use_processor_dotted_namespace() -> None:
+    """First-internal-observations naming convention: ``processor.<thing>``.
+    Locks the namespace in this milestone so a future rename has to
+    happen deliberately."""
+    for t in CANDIDATE_OBSERVATION_TYPES:
+        assert t.startswith("processor."), t
+
+
+# --- idempotency helpers ------------------------------------------------
+
+
+def test_line_crossing_idempotency_key_is_deterministic() -> None:
+    sid = uuid4()
+    a = build_line_crossing_idempotency_key(
+        stream_session_id=sid, line_id="entry-line", cumulative_count=2
+    )
+    b = build_line_crossing_idempotency_key(
+        stream_session_id=sid, line_id="entry-line", cumulative_count=2
+    )
+    assert a == b
+    assert a == f"sess:{sid}:processor.line_crossing:entry-line:2"
+
+
+def test_line_crossing_idempotency_key_changes_with_count() -> None:
+    sid = uuid4()
+    k1 = build_line_crossing_idempotency_key(
+        stream_session_id=sid, line_id="entry-line", cumulative_count=1
+    )
+    k2 = build_line_crossing_idempotency_key(
+        stream_session_id=sid, line_id="entry-line", cumulative_count=2
+    )
+    assert k1 != k2
+
+
+def test_line_crossing_idempotency_key_distinct_per_session() -> None:
+    a = build_line_crossing_idempotency_key(
+        stream_session_id=uuid4(), line_id="entry-line", cumulative_count=1
+    )
+    b = build_line_crossing_idempotency_key(
+        stream_session_id=uuid4(), line_id="entry-line", cumulative_count=1
+    )
+    assert a != b
+
+
+def test_roi_idempotency_key_uses_sequence_not_frame_num() -> None:
+    """ROI keys must NOT be keyed on a raw frame number — adapter only
+    emits on change/interval, so the sequence is a separate counter."""
+    sid = uuid4()
+    a = build_roi_occupancy_idempotency_key(stream_session_id=sid, roi_id="entry-roi", sequence=1)
+    b = build_roi_occupancy_idempotency_key(stream_session_id=sid, roi_id="entry-roi", sequence=2)
+    assert a != b
+    assert a == f"sess:{sid}:processor.roi_occupancy:entry-roi:1"
+
+
+# --- LineCrossingState core ---------------------------------------------
+
+
+def _now() -> datetime:
+    return datetime(2026, 5, 20, 16, 30, 0, tzinfo=UTC)
+
+
+def test_no_events_on_initial_zero() -> None:
+    """First frame: cumulative=0 means no crossings yet. No event."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 0},
+        occurred_at=_now(),
+    )
+    assert events == []
+
+
+def test_one_event_on_zero_to_one_transition() -> None:
+    """The simplest happy path: 0 → 1 emits exactly one event."""
+    sid = uuid4()
+    state = LineCrossingState(stream_session_id=sid)
+    state.absorb_cumulative(cumulative_by_line={"entry-line": 0}, occurred_at=_now())
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1},
+        occurred_at=_now() + timedelta(seconds=1),
+    )
+    assert len(events) == 1
+    e = events[0]
+    assert e.type == CANDIDATE_LINE_CROSSING_TYPE
+    assert e.stream_session_id == sid
+    assert e.line_id == "entry-line"
+    assert e.line_label == "entry-line"
+    assert e.count_delta == 1
+    assert e.cumulative_count == 1
+    assert e.idempotency_key.endswith(":entry-line:1")
+    # Top-level fields are runtime-neutral.
+    assert "deepstream" not in e.line_id
+    assert "deepstream" not in e.line_label
+
+
+def test_repeat_cumulative_emits_nothing() -> None:
+    """Same cumulative across two frames: dedupe holds."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    state.absorb_cumulative(cumulative_by_line={"entry-line": 2}, occurred_at=_now())
+    second = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 2},
+        occurred_at=_now() + timedelta(seconds=1),
+    )
+    assert second == []
+
+
+def test_zero_to_one_to_two_emits_two_distinct_events() -> None:
+    """The exact pattern from the P3.5 live run: cumulative ramped
+    0 → 1 → 2 across two operator crossings. Adapter must emit
+    one event per increment with distinct idempotency keys."""
+    sid = uuid4()
+    state = LineCrossingState(stream_session_id=sid)
+    # First crossing (0 → 1).
+    e1 = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1},
+        occurred_at=_now(),
+    )
+    # Second crossing (1 → 2) at a later time.
+    e2 = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 2},
+        occurred_at=_now() + timedelta(seconds=5),
+    )
+    assert len(e1) == 1
+    assert len(e2) == 1
+    assert e1[0].cumulative_count == 1
+    assert e2[0].cumulative_count == 2
+    assert e1[0].idempotency_key != e2[0].idempotency_key
+
+
+def test_jump_of_three_emits_three_events_with_consecutive_counts() -> None:
+    """If the producer skips frames so the cumulative jumps 0 → 3 in a
+    single observation, the adapter still emits three events with
+    cumulative_count = 1, 2, 3 (each its own idempotency key)."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 3},
+        occurred_at=_now(),
+    )
+    assert [e.cumulative_count for e in events] == [1, 2, 3]
+    assert [e.count_delta for e in events] == [1, 1, 1]
+    assert len({e.idempotency_key for e in events}) == 3
+
+
+def test_counter_rewind_does_not_emit_and_does_not_lower_watermark() -> None:
+    """Defensive: producer cannot trick the adapter into re-emitting by
+    rewinding. We saw N=5 once; if the next frame says N=2 we treat
+    that as noise."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    state.absorb_cumulative(cumulative_by_line={"entry-line": 5}, occurred_at=_now())
+    rewound = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 2},
+        occurred_at=_now() + timedelta(seconds=1),
+    )
+    assert rewound == []
+    # Watermark must still be 5; the next genuine new crossing emits at 6.
+    later = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 6},
+        occurred_at=_now() + timedelta(seconds=2),
+    )
+    assert len(later) == 1
+    assert later[0].cumulative_count == 6
+
+
+def test_empty_cumulative_dict_emits_nothing() -> None:
+    """Frame with no analytics block (or analytics block has no
+    line_crossing_cumulative) → empty dict → no event."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    assert state.absorb_cumulative(cumulative_by_line={}, occurred_at=_now()) == []
+
+
+def test_multiple_lines_tracked_independently() -> None:
+    """Cumulative counts are keyed per line label. Two lines crossing
+    at different times produce events with different ``line_id``."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 0, "exit-line": 0}, occurred_at=_now()
+    )
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1, "exit-line": 0},
+        occurred_at=_now() + timedelta(seconds=1),
+    )
+    assert len(events) == 1
+    assert events[0].line_id == "entry-line"
+    events2 = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1, "exit-line": 1},
+        occurred_at=_now() + timedelta(seconds=2),
+    )
+    assert len(events2) == 1
+    assert events2[0].line_id == "exit-line"
+
+
+# --- payload shape -----------------------------------------------------
+
+
+def test_event_payload_is_runtime_neutral_at_top_level() -> None:
+    """DeepStream specifics must live in ``source`` / ``debug`` on the
+    payload, not as first-class keys. Top-level shape is what a future
+    Triton / OpenCV runtime would emit too."""
+    sid = uuid4()
+    state = LineCrossingState(stream_session_id=sid)
+    state.absorb_cumulative(cumulative_by_line={"entry-line": 0}, occurred_at=_now())
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1},
+        occurred_at=_now() + timedelta(seconds=1),
+        track_id="42",
+        class_id=2,
+        class_label="person",
+        source=deepstream_source_block(
+            package_id="deepstream.analytics_probe.v0",
+            tracker_algorithm="iou",
+        ),
+        debug={"frame_num": 1234, "geometry_source": "probe_default"},
+    )
+    body = events[0].to_payload()
+    # Top-level keys: runtime-neutral.
+    assert "line_id" in body and "line_label" in body
+    assert "cumulative_count" in body and "count_delta" in body
+    assert "track_id" in body and "class_id" in body and "class_label" in body
+    assert "idempotency_key" in body
+    # No DeepStream vocabulary at the top level.
+    for forbidden in (
+        "runtime",
+        "package_id",
+        "metadata_source",
+        "analytics_plugin",
+        "tracker_algorithm",
+        "frame_num",
+        "raw_line_crossing_cumulative",
+    ):
+        assert forbidden not in body, f"top-level leak: {forbidden}"
+    # Provenance is under source.
+    assert body["source"]["runtime"] == "deepstream"
+    assert body["source"]["package_id"] == "deepstream.analytics_probe.v0"
+    assert body["source"]["metadata_source"] == "pyds_pad_probe"
+    assert body["source"]["analytics_plugin"] == "nvdsanalytics"
+    assert body["source"]["tracker_algorithm"] == "iou"
+    # Raw counters are under debug.
+    assert body["debug"]["frame_num"] == 1234
+    assert body["debug"]["geometry_source"] == "probe_default"
+
+
+def test_event_payload_omits_optional_fields_when_absent() -> None:
+    """When the producer didn't have a track_id / class / direction, the
+    payload omits those keys entirely (cleaner than ``"track_id": null``
+    everywhere)."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    state.absorb_cumulative(cumulative_by_line={"entry-line": 0}, occurred_at=_now())
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1},
+        occurred_at=_now() + timedelta(seconds=1),
+    )
+    body = events[0].to_payload()
+    assert "track_id" not in body
+    assert "class_id" not in body
+    assert "class_label" not in body
+    assert "direction" not in body
+
+
+# --- ROI occupancy state -----------------------------------------------
+
+
+def test_roi_first_observation_always_emits() -> None:
+    """Even a zero-count ROI on first sight should emit so the consumer
+    knows the ROI exists."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
+    )
+    events = state.absorb_roi_counts(roi_counts={"entry-roi": 0}, occurred_at=_now())
+    assert len(events) == 1
+    assert events[0].roi_id == "entry-roi"
+    assert events[0].total_count == 0
+    assert events[0].sequence == 1
+
+
+def test_roi_no_emit_when_unchanged_and_no_interval() -> None:
+    """Steady state with neither change nor interval = no events."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now())
+    second = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=10)
+    )
+    assert second == []
+
+
+def test_roi_emits_on_change() -> None:
+    """Total count went 1 → 2 between frames → one event."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now())
+    second = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 2}, occurred_at=_now() + timedelta(seconds=1)
+    )
+    assert len(second) == 1
+    assert second[0].total_count == 2
+    assert second[0].sequence == 2  # second emit for this ROI
+
+
+def test_roi_emits_on_interval_even_when_unchanged() -> None:
+    """If the count hasn't moved but ``min_interval_seconds`` has
+    elapsed, emit a heartbeat-style snapshot."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=False, min_interval_seconds=30.0
+    )
+    state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now())
+    # 10 s later — too soon.
+    soon = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=10)
+    )
+    assert soon == []
+    # 31 s later — interval elapsed.
+    later = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1}, occurred_at=_now() + timedelta(seconds=31)
+    )
+    assert len(later) == 1
+    assert later[0].sequence == 2
+
+
+def test_roi_class_counts_threaded_through() -> None:
+    """When the adapter gets a per-class breakdown, it includes it in
+    the event payload."""
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
+    )
+    events = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 3},
+        class_counts_by_roi={"entry-roi": {"person": 2, "car": 1}},
+        occurred_at=_now(),
+    )
+    body = events[0].to_payload()
+    assert body["total_count"] == 3
+    assert body["class_counts"] == {"person": 2, "car": 1}
+
+
+def test_roi_idempotency_key_increments_per_emit() -> None:
+    """The ``sequence`` field on the event must equal the sequence
+    embedded in the idempotency key — keys are unique per emit, not
+    per frame."""
+    sid = uuid4()
+    state = RoiOccupancyState(stream_session_id=sid, emit_on_change=True, min_interval_seconds=None)
+    e1 = state.absorb_roi_counts(roi_counts={"entry-roi": 1}, occurred_at=_now())
+    e2 = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 2}, occurred_at=_now() + timedelta(seconds=1)
+    )
+    k1 = e1[0].idempotency_key
+    k2 = e2[0].idempotency_key
+    assert k1 != k2
+    assert k1.endswith(":1")
+    assert k2.endswith(":2")
+    assert e1[0].sequence == 1 and e2[0].sequence == 2
+
+
+# --- source helper -----------------------------------------------------
+
+
+def test_deepstream_source_block_has_stable_shape() -> None:
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0", tracker_algorithm="iou"
+    )
+    assert src == {
+        "runtime": "deepstream",
+        "package_id": "deepstream.analytics_probe.v0",
+        "metadata_source": "pyds_pad_probe",
+        "analytics_plugin": "nvdsanalytics",
+        "tracker_algorithm": "iou",
+    }
+
+
+def test_deepstream_source_block_without_tracker() -> None:
+    """The metadata probe (no tracker) could in theory hand the helper
+    just a package_id and get a tracker-less source block back."""
+    src = deepstream_source_block(package_id="deepstream.metadata_probe.v0")
+    assert "tracker_algorithm" not in src
+    assert src["runtime"] == "deepstream"
+
+
+# --- malformed inputs are skipped, not crashing ------------------------
+
+
+def test_line_crossing_state_handles_no_lines_dict_safely() -> None:
+    """Empty dict from a frame with no analytics block must not crash."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    assert state.absorb_cumulative(cumulative_by_line={}, occurred_at=_now()) == []
+
+
+def test_roi_state_handles_missing_class_counts_safely() -> None:
+    state = RoiOccupancyState(
+        stream_session_id=uuid4(), emit_on_change=True, min_interval_seconds=None
+    )
+    events = state.absorb_roi_counts(
+        roi_counts={"entry-roi": 1},
+        class_counts_by_roi=None,
+        occurred_at=_now(),
+    )
+    assert events[0].class_counts == {}
+
+
+# --- regression: must not import observation writer at adapter import --
+
+
+def test_adapter_module_does_not_import_writer_or_api_client() -> None:
+    """The adapter is pure / dependency-free. Importing it must NOT
+    pull in the http client or the writer — those belong to P4-B."""
+    import sys
+
+    # If the adapter accidentally imported the writer, that module would
+    # appear in sys.modules after the import above. (writer is independently
+    # importable, so we only assert what is reachable from THIS module's
+    # explicit imports.)
+    import app.observations.observation_adapter as adapter_mod
+
+    # The module's own __dict__ must not contain the writer / api client.
+    assert "ObservationWriter" not in vars(adapter_mod)
+    assert "UpstreamApiClient" not in vars(adapter_mod)
+    # And: sanity, the module is what we think it is.
+    assert "LineCrossingState" in vars(adapter_mod)
+    # Touch sys.modules to confirm the import worked at all.
+    assert "app.observations.observation_adapter" in sys.modules
+
+
+# --- value pass-through smoke -----------------------------------------
+
+
+def test_line_crossing_payload_carries_session_in_idempotency_key() -> None:
+    """The session UUID is what makes the key unique across cameras."""
+    sid = uuid4()
+    state = LineCrossingState(stream_session_id=sid)
+    state.absorb_cumulative(cumulative_by_line={"entry-line": 0}, occurred_at=_now())
+    events = state.absorb_cumulative(
+        cumulative_by_line={"entry-line": 1},
+        occurred_at=_now() + timedelta(seconds=1),
+    )
+    assert str(sid) in events[0].idempotency_key
+
+
+@pytest.mark.parametrize("cum", [10, 99, 1_000_000])
+def test_line_crossing_handles_large_cumulative_counts(cum: int) -> None:
+    """Counter can be anything the SDK returns; the key just stringifies
+    the int."""
+    state = LineCrossingState(stream_session_id=uuid4())
+    events = state.absorb_cumulative(cumulative_by_line={"entry-line": cum}, occurred_at=_now())
+    assert events[-1].cumulative_count == cum
+    assert events[-1].idempotency_key.endswith(f":{cum}")

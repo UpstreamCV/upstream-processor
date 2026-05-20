@@ -525,3 +525,225 @@ malformed analytics payloads don't crash the worker, and the
 Out of scope (still): ``ObservationWriter`` integration,
 ``POST /observations``, the final metadata adapter, dashboard-driven
 ROI / line geometry, rules / events, billing.
+
+## P4-A — Observation Adapter Contract Probe
+
+Defines the contract (payload shape, idempotency, adapter state) for
+the first two real processor observation types **without** writing
+anything yet. The P3.5 analytics probe surfaces line-crossing
+cumulative counters + ROI counts in the worker status payload; P4-A
+locks in HOW those signals will turn into ``processor.*`` observation
+rows once both ends of the wire are widened. **No new package, no
+worker wiring, no API writes, no api-server change in this milestone.**
+
+### API contract findings (verified offline)
+- Deployed schema: ``upstream-api-server`` at commit ``7a6057a``,
+  migration ``20260518140000_processor_status_observations.sql``.
+- ``POST /v1/internal/processor/observations`` accepts a
+  ``ProcessorObservationRequest`` with strict pydantic ``Literal``
+  type validation. **Today only the three ``processor.mock_*`` types
+  are accepted** — anything else 422s at the schema layer.
+- DB table ``observations`` has columns ``id, account_id, camera_id,
+  stream_session_id, processor_id, package_id, type, payload, observed_at,
+  created_at``. ``type`` is plain ``text`` (no DB CHECK), so the
+  whitelist widens with a one-string Python change on each side; **no
+  migration is needed** to add types.
+- There is **no ``idempotency_key`` column** and no unique constraint
+  preventing duplicate rows. Duplicate POSTs create duplicate rows.
+  Client-side dedupe is therefore the only mechanism in v0; we embed
+  ``idempotency_key`` in ``payload`` so future server dedupe is a
+  cheap migration if/when wanted.
+- Client side (this repo) mirrors that strictness:
+  ``schemas.ObservationType`` is a matching ``Literal`` and
+  ``ObservationWriter.emit`` defensively rejects any type not in
+  ``OBSERVATION_TYPES``.
+
+### First observation types (candidate strings, not yet whitelisted)
+- ``processor.line_crossing`` — one event per
+  ``objLCCumCnt[<label>]`` increment. Maps directly off P3.5's
+  ``line_crossing_cumulative`` (we live-saw 0→1→2). **First target.**
+- ``processor.roi_occupancy`` — periodic / on-change snapshot of an
+  ROI's count. Off P3.5's ``objInROIcnt`` (we live-saw
+  ``entry-roi: 1``). Design only in P4-A; emission gated by
+  per-ROI change detection + a min-interval heartbeat.
+
+Both names live for now ONLY in
+``app/observations/observation_adapter.py`` as
+``CANDIDATE_LINE_CROSSING_TYPE`` / ``CANDIDATE_ROI_OCCUPANCY_TYPE`` —
+**deliberately NOT added to** ``schemas.ObservationType`` /
+``OBSERVATION_TYPES`` because that whitelist is the gate
+``ObservationWriter`` uses. P4-B widens both ends in lock-step with
+the matching api-server PR. A regression test
+(``test_candidate_types_not_in_server_whitelist_yet``) asserts the
+guard holds.
+
+### Payload shape (runtime-neutral at the top level)
+``processor.line_crossing`` payload body (goes inside the outer
+``ObservationPayload.payload`` dict):
+
+```
+{
+  "line_id":            "entry-line",
+  "line_label":         "entry-line",
+  "count_delta":        1,
+  "cumulative_count":   2,
+  "idempotency_key":    "sess:<uuid>:processor.line_crossing:entry-line:2",
+  "track_id":           "0",          # optional
+  "class_id":           2,            # optional
+  "class_label":        "person",     # optional
+  "direction":          "dirSouth",   # optional
+  "source": {
+    "runtime":            "deepstream",
+    "package_id":         "deepstream.analytics_probe.v0",
+    "metadata_source":    "pyds_pad_probe",
+    "analytics_plugin":   "nvdsanalytics",
+    "tracker_algorithm":  "iou"
+  },
+  "debug": {
+    "frame_num":          1234,
+    "geometry_source":    "probe_default"
+  }
+}
+```
+
+The outer ``ObservationPayload`` continues to carry
+``stream_session_id``, ``type``, ``observed_at``, ``processor_id``,
+``package_id`` — those stay on the existing client schema.
+DeepStream vocabulary lives ONLY under ``source`` / ``debug`` so a
+future Triton / OpenCV runtime can emit the same observation type
+with a different ``source.runtime``.
+
+### Idempotency strategy
+**Line crossing key:**
+``sess:<session_id>:processor.line_crossing:<line_id>:<cumulative_count>``.
+``track_id`` deliberately omitted — ``nvdsanalytics``'
+``objLCCumCnt`` is a per-LINE aggregate, not per-track. Track context
+attaches as optional payload, not as a key component.
+
+**ROI occupancy key:**
+``sess:<session_id>:processor.roi_occupancy:<roi_id>:<sequence>``
+where ``sequence`` is the adapter's per-ROI emit counter (one per
+change/interval), NOT the raw frame number. Frame-number keys would
+collide on flapping counts and balloon the emit rate.
+
+Server has no dedupe today. Client carries the keys so that:
+1. ``LineCrossingState.recently_emitted_keys`` (bounded set) acts as
+   a belt-and-suspenders against producer rewind.
+2. A future api-server PR can add an ``idempotency_key`` column and
+   re-derive the key without coordinating with the processor.
+
+### Adapter state design (per-stream, per-worker)
+``LineCrossingState`` (the load-bearing one):
+- ``last_cumulative_by_line: dict[str, int]`` — watermark per line.
+  Counter going from ``N`` to ``N + k`` between two frames emits
+  ``k`` discrete events with cumulative counts ``N + 1 .. N + k``.
+  Counter unchanged → emit nothing. Counter rewound → emit nothing
+  AND do not lower the watermark.
+- ``recently_emitted_keys: set[str]`` — bounded LRU-ish guard against
+  replay; eviction at ``recently_emitted_keys_max`` (default 256).
+- Resets when the supervisor restarts the worker (each bounded
+  probe cycle starts fresh). Acceptable today because the
+  cumulative counter itself resets per container.
+
+``RoiOccupancyState`` (designed, not yet wired):
+- ``last_counts_by_roi`` (total + per-class snapshot keyed by ROI).
+- ``last_emit_at_by_roi`` (per-ROI timestamp of the last emit).
+- ``sequence_by_roi`` (per-ROI emit counter for idempotency keys).
+- Emit conditions OR'd: (a) ``emit_on_change=True`` and counts
+  differ from the last snapshot, (b) ``min_interval_seconds`` (30s
+  default) since the last emit. v0 enables both so the consumer
+  sees both "person stepped into ROI" and a slow heartbeat
+  thereafter.
+- Designed to scale to per-class breakdowns when the producer
+  surfaces them; v0 leaves ``class_counts`` empty if the producer
+  didn't break it down.
+
+### ObservationWriter / sink review
+``ObservationWriter`` already exists at
+``app/observations/writer.py`` and is used by the mock worker. It:
+- builds an ``ObservationPayload`` from a typed ``obs_type`` + body
+  dict + ``observed_at``,
+- guards the type via the ``OBSERVATION_TYPES`` whitelist (defensive
+  even though the parameter is a ``Literal``),
+- delegates to ``ProcessorApi.post_observation``.
+
+**No bridge / sink redesign is needed for P4-B.** The path is:
+1. The analytics worker's consumer task already runs on the event
+   loop and already calls ``api.post_processor_status`` per frame.
+2. P4-B adds adapter state to the worker (``LineCrossingState`` keyed
+   by ``stream_session_id``), calls
+   ``state.absorb_cumulative(...)`` per frame, and forwards each
+   ``LineCrossingEvent.to_payload()`` to
+   ``ObservationWriter.emit(...)``.
+3. Transient errors absorb through the existing backoff; the
+   writer's strict-Literal guard prevents accidentally posting a
+   not-yet-whitelisted type.
+
+The pad probe inside the pyds container does NOT change — it still
+emits raw analytics counters via stdout JSON. **All adapter logic
+lives outside the container** (worker-side), so:
+- The webhook secret continues to never enter the container.
+- Per-event API writes don't block the GLib thread.
+- A flaky network only delays the worker, never the GST pipeline.
+
+### What must change in api-server before P4-B can POST
+- One-string widening of ``ProcessorObservationType`` in
+  ``upstream-api-server/src/upstream_api/schemas/processor.py`` to
+  include ``processor.line_crossing`` (and later
+  ``processor.roi_occupancy``).
+- No DB migration. No route change. No new auth.
+- Optionally (P4-C): add an ``idempotency_key`` column +
+  ``UNIQUE(stream_session_id, idempotency_key)``. **Not required**
+  for P4-B — client-side state dedupes within a container lifetime.
+
+### Coverage
+``tests/test_observation_adapter_contract.py`` (31 tests, no Docker /
+GPU / pyds / api-server) exercises:
+- both ``CANDIDATE_*`` strings are absent from the server whitelist
+  (so the probe cannot accidentally write to production),
+- both use the ``processor.<thing>`` namespace,
+- idempotency keys are deterministic, session-scoped, and change
+  with cumulative count / sequence,
+- ROI keys use a per-emit sequence (not frame number),
+- ``LineCrossingState`` emits nothing at initial zero, one event on
+  0→1, two on 0→1→2, three on a 0→3 jump (with consecutive
+  cumulative counts), nothing on repeat / rewind, and tracks
+  multiple lines independently,
+- the payload body is runtime-neutral at the top level and pushes
+  DeepStream vocabulary under ``source`` / ``debug``,
+- optional fields (``track_id`` / ``class_*`` / ``direction``) are
+  omitted when absent (no ``null`` noise),
+- ``RoiOccupancyState`` emits on first observation, on change, and
+  on interval — but NOT every frame when unchanged,
+- malformed analytics blobs (empty dicts, missing class counts)
+  return safely without crashing,
+- the adapter module does NOT import the writer / API client at
+  import time (pure / dependency-free, by design).
+
+### What's deliberately NOT in P4-A
+- No call into ``ObservationWriter.emit`` from any worker.
+- No widening of ``schemas.OBSERVATION_TYPES``.
+- No api-server PR.
+- No production POST.
+- No dashboard-driven ROI/line geometry, no rules/events, no
+  billing surface.
+
+### Next step (P4-B)
+1. Open the matching api-server PR adding ``processor.line_crossing``
+   to ``ProcessorObservationType``.
+2. In lock-step, widen ``schemas.ObservationType`` /
+   ``OBSERVATION_TYPES`` in this repo (one tuple element + one
+   Literal arm).
+3. In ``DeepStreamWorker._drive_metadata_probe`` (analytics mode),
+   instantiate ``LineCrossingState(stream_session_id=...)`` once per
+   worker and feed each consumed frame's
+   ``frame.source.analytics.line_crossing_cumulative`` to
+   ``state.absorb_cumulative(...)``. For each returned
+   ``LineCrossingEvent``, ``await self._writer.emit(...)``.
+4. Add live verification on crowdcountS2: walk across the line,
+   confirm one ``processor.line_crossing`` row per crossing in the
+   ``observations`` table, with deterministic ``idempotency_key``
+   values in ``payload``.
+5. Defer ``processor.roi_occupancy`` to P4-C — the adapter state is
+   ready, but production observability burden + class-count surface
+   need a separate design pass.

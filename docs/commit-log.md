@@ -4,6 +4,90 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-20 - P4-A: Observation Adapter Contract Probe
+
+### Summary
+Defines the contract for the first two real processor observation
+types (``processor.line_crossing``, ``processor.roi_occupancy``) and
+the deterministic idempotency / adapter-state machinery that will
+turn P3.5's analytics counters into discrete observation rows —
+**without** writing any observations or touching any worker. Pure
+contract-level milestone; the matching api-server PR + worker wiring
+land in P4-B.
+
+### What changed
+- `app/observations/observation_adapter.py` (new) — pure / dependency-
+  free module:
+  - ``CANDIDATE_LINE_CROSSING_TYPE`` / ``CANDIDATE_ROI_OCCUPANCY_TYPE``
+    string constants (deliberately NOT in
+    ``schemas.OBSERVATION_TYPES`` yet).
+  - ``LineCrossingEvent`` + ``LineCrossingState.absorb_cumulative(...)``
+    — turns ``objLCCumCnt`` deltas into one event per crossing with
+    a deterministic
+    ``sess:<id>:processor.line_crossing:<line>:<cum>``
+    idempotency key. Handles rewind (no spurious emit, watermark
+    held) and replay (bounded ``recently_emitted_keys``).
+  - ``RoiOccupancyEvent`` + ``RoiOccupancyState.absorb_roi_counts(...)``
+    — designed but not wired. Emits on first observation, on count
+    change, and on ``min_interval_seconds`` elapse; otherwise quiet.
+  - ``build_*_idempotency_key`` pure helpers.
+  - ``deepstream_source_block(...)`` — stable provenance dict so
+    worker code doesn't inline DeepStream literals at the emit site.
+- `tests/test_observation_adapter_contract.py` (new) — 31 tests
+  covering type-registry guards, idempotency determinism, the full
+  cumulative→discrete event mapping including the 0→1→2 pattern from
+  the P3.5 live run, the 0→3 jump case, repeat / rewind / empty
+  defenses, runtime-neutral payload shape (DeepStream vocabulary
+  under ``source`` / ``debug``), optional-field omission,
+  ``RoiOccupancyState`` emit conditions (on-change + interval +
+  not-every-frame), malformed-input safety, and a regression that
+  the adapter module does NOT import ``ObservationWriter`` /
+  ``UpstreamApiClient`` (pure by design).
+- `docs/architecture.md` — adds the **P4-A — Observation Adapter
+  Contract Probe** section: api-server schema findings, candidate
+  type names, payload shape, idempotency strategy, adapter state
+  design, ``ObservationWriter`` review, what the api-server PR
+  must contain for P4-B, what's deliberately NOT in P4-A.
+- `docs/commit-log.md` — this entry.
+
+### API contract findings (verified offline against `upstream-api-server` @ 7a6057a)
+- ``POST /v1/internal/processor/observations`` exists and is
+  webhook-authed. Strict ``Literal`` validation on ``type``;
+  ``processor.line_crossing`` 422s today.
+- DB column ``observations.type`` is plain ``text`` (no CHECK), so
+  widening the whitelist is a one-string Python change on each side
+  — no migration.
+- No ``idempotency_key`` column, no unique constraint. Duplicate
+  POSTs create duplicate rows. Client-side dedupe via
+  ``LineCrossingState`` is the only mechanism in v0; the
+  idempotency_key lives in ``payload`` so a future server-side
+  dedupe migration is cheap.
+
+### Idempotency keys (deterministic, session-scoped)
+- Line crossing: ``sess:<session_id>:processor.line_crossing:<line_id>:<cumulative_count>``.
+- ROI occupancy: ``sess:<session_id>:processor.roi_occupancy:<roi_id>:<sequence>``.
+- ``track_id`` intentionally OMITTED from the line-crossing key
+  (``objLCCumCnt`` is per-LINE aggregate, not per-track); attached
+  as optional ``payload.track_id`` context.
+
+### Out of scope (next milestones)
+- ``ObservationWriter.emit(...)`` integration in the analytics
+  worker (P4-B).
+- ``schemas.OBSERVATION_TYPES`` widening + the matching api-server
+  one-string PR (P4-B).
+- Live verification of a real ``processor.line_crossing`` row
+  landing in the ``observations`` table (P4-B).
+- ``processor.roi_occupancy`` wiring (P4-C).
+- ``idempotency_key`` column + ``UNIQUE`` constraint on the api-server
+  (optional P4-C; not required for P4-B because client-side state
+  dedupes within a container lifetime).
+
+### Tests
+- 190 passing (159 prior + 31 new contract tests). ruff + ruff-format
+  + ``mypy app`` clean. No Docker / GPU / pyds / api-server in tests.
+
+---
+
 ## 2026-05-20 - P3.5: Analytics Metadata Probe
 
 ### Summary
