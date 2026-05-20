@@ -143,6 +143,11 @@ class DeepStreamMetadataProcessManager:
         tracker_width: int = 960,
         tracker_height: int = 544,
         analytics_enabled: bool = False,
+        # P4-D follow-up: probe-default geometry + class filter knobs.
+        # Defaults match the previous hard-coded values where possible
+        # so existing callers/tests don't need to update.
+        analytics_roi_margin_pct: float = 0.05,
+        analytics_class_ids: str = "all",
     ) -> None:
         if analytics_enabled and not tracker_enabled:
             raise ValueError(
@@ -168,6 +173,8 @@ class DeepStreamMetadataProcessManager:
         self._tracker_width = tracker_width
         self._tracker_height = tracker_height
         self._analytics_enabled = analytics_enabled
+        self._analytics_roi_margin_pct = analytics_roi_margin_pct
+        self._analytics_class_ids = analytics_class_ids
         # Container name prefix encodes the mode for easy `docker ps`
         # grouping: -dsm (metadata), -dst (tracker), -dsa (analytics).
         if analytics_enabled:
@@ -195,7 +202,12 @@ class DeepStreamMetadataProcessManager:
             build_tracker_config(self._tracker_algorithm)
         if self._analytics_enabled:
             # Validate the analytics geometry up-front for the same reason.
-            build_analytics_config(frame_width=self._width, frame_height=self._height)
+            build_analytics_config(
+                frame_width=self._width,
+                frame_height=self._height,
+                roi_margin_pct=self._analytics_roi_margin_pct,
+                class_ids=self._analytics_class_ids,
+            )
         base = self._output_base_dir.strip() or None
         if base is not None:
             Path(base).mkdir(parents=True, exist_ok=True)
@@ -219,7 +231,12 @@ class DeepStreamMetadataProcessManager:
             )
         if self._analytics_enabled:
             (work / "analytics_config.txt").write_text(
-                build_analytics_config(frame_width=self._width, frame_height=self._height),
+                build_analytics_config(
+                    frame_width=self._width,
+                    frame_height=self._height,
+                    roi_margin_pct=self._analytics_roi_margin_pct,
+                    class_ids=self._analytics_class_ids,
+                ),
                 encoding="utf-8",
             )
         # Copy (not symlink) the pyds app into the work dir so the

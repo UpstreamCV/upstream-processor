@@ -846,6 +846,79 @@ rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
 rm -rf /tmp/upstream-live-p4d
 ```
 
+## Live verification checklist (P4-D Follow-up — ROI label / analytics filter)
+
+P4-D's first live run produced zero zone events because the ROI
+geometry didn't cover the operator's foot point (bbox bottom-center
+was 71 px below the ROI's y-max). This follow-up widens the
+probe-default ROI to 5%-95% × 5%-95% and adds env-knobs +
+diagnostics. **No api-server change.**
+
+### Launch (same pattern as P4-D)
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p4d-fu
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p4d-fu/secret.env
+chmod 600 /tmp/upstream-live-p4d-fu/secret.env
+
+cd /tmp/upstream-live-p4d-fu/repo
+set -a; . /tmp/upstream-live-p4d-fu/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p4d_roi_label_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES=5 \
+UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS=all \
+UPSTREAM_DEEPSTREAM_ANALYTICS_ROI_MARGIN_PCT=0.05 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p4d-fu/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p4d-fu/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p4d-fu/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p4d-fu/processor.pid
+```
+
+### Operator script
+Same as P4-D. Walk into the center of the frame, stand 5-10s,
+walk out. With the new 5% margin, almost any standing position
+inside the visible frame should land inside the ROI.
+
+### Triage checklist (read status payload after stop)
+
+```
+[ ] analytics_class_ids matches what was set in env
+[ ] analytics_roi_margin_pct matches what was set in env
+[ ] analytics_object_class_id_counts non-zero (model detected something)
+    → if zero: detection issue (sample model / camera angle), NOT P4-D
+[ ] objects_with_roi_labels_count non-zero (analytics tagged the object)
+    → if zero with detection > 0: STILL geometry / analytics issue.
+      Try larger margin (e.g., 0.0 = full frame) or narrower
+      class_ids if the model is hallucinating other classes.
+[ ] roi_labels_sample contains "entry-roi"
+[ ] zone_entered_observations_emitted >= 1 (adapter fires)
+[ ] zone_exited_observations_emitted >= 1 (adapter fires on stable exit)
+[ ] zero 422s, zero non-2xx
+[ ] clean shutdown
+[ ] no secrets in run.log; no leftover containers; no temp dirs
+```
+
+### Failure mode reminder
+- `analytics_object_class_id_counts={}` → detection (TrafficCamNet)
+- `analytics_object_class_id_counts > 0` AND `objects_with_roi_labels_count=0` → geometry / class filter (NOT adapter; widen margin or narrow class_ids)
+- `objects_with_roi_labels_count > 0` AND `zone_entered_observations_emitted=0` → P4-D adapter regression. Capture the run log + status payload.
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dsa|upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p4d-fu
+```
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

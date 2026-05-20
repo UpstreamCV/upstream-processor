@@ -168,6 +168,92 @@ def test_build_analytics_config_rejects_empty_labels() -> None:
         build_analytics_config(line_label="")
 
 
+# --- P4-D follow-up: geometry + class filter knobs --------------------
+
+
+def test_default_roi_uses_loose_5pct_margin() -> None:
+    """P4-D live verification showed the previous 20%/10% ROI margins
+    were too tight (operator foot point at the bottom edge fell
+    outside the ROI). Default is now 5% on each side so the ROI
+    covers the central 90% x 90% of the frame."""
+    body = build_analytics_config(frame_width=1280, frame_height=720)
+    # 5% inset → rx0=64, ry0=36, rx1=1216, ry1=684.
+    assert "roi-entry-roi=64;36;1216;36;1216;684;64;684" in body
+    # The previous (broken) 20%/10% bounds must NOT show up — that's a
+    # regression test for the foot-point-below-ROI live finding.
+    assert "256;72;1024;72" not in body
+    assert "256;648" not in body
+
+
+def test_explicit_roi_margin_overrides_default() -> None:
+    """A scene with a top-mounted camera and small feet might want
+    a 0.0 margin (full frame). Probe knob honors it."""
+    body = build_analytics_config(frame_width=1280, frame_height=720, roi_margin_pct=0.0)
+    # 0% margin → polygon at (0, 0)..(1280, 720) — full frame.
+    assert "roi-entry-roi=0;0;1280;0;1280;720;0;720" in body
+
+
+def test_build_analytics_config_rejects_invalid_margin() -> None:
+    """Out-of-range margins fail fast at config generation, not
+    silently producing a malformed polygon."""
+    with pytest.raises(ValueError, match=r"roi_margin_pct must be in"):
+        build_analytics_config(roi_margin_pct=-0.01)
+    with pytest.raises(ValueError, match=r"roi_margin_pct must be in"):
+        build_analytics_config(roi_margin_pct=0.5)
+    with pytest.raises(ValueError, match=r"roi_margin_pct must be in"):
+        build_analytics_config(roi_margin_pct=1.0)
+
+
+def test_default_class_ids_all_maps_to_minus_one() -> None:
+    """P4-D follow-up: ``class_ids="all"`` (the probe default) emits
+    ``class-id=-1`` so every detected class counts (TrafficCamNet
+    sometimes misclassifies people as cars; we want every class to
+    register in the ROI for the probe)."""
+    body = build_analytics_config(class_ids="all")
+    # Both sections use the same class filter.
+    assert body.count("class-id=-1\n") == 2
+
+
+def test_explicit_class_id_filters_to_one_class() -> None:
+    body = build_analytics_config(class_ids="2")
+    assert body.count("class-id=2\n") == 2
+    assert "class-id=-1" not in body
+
+
+def test_class_ids_minus_one_and_empty_map_to_all() -> None:
+    """``"-1"`` is the literal nvdsanalytics value; ``""`` is a friendly
+    no-op alias the operator might paste in via ``UPSTREAM_*`` env."""
+    assert "class-id=-1\n" in build_analytics_config(class_ids="-1")
+    assert "class-id=-1\n" in build_analytics_config(class_ids="")
+
+
+def test_class_ids_rejects_comma_list() -> None:
+    """nvdsanalytics' single-section ``class-id=`` takes a SINGLE int,
+    so a comma-list would silently apply only one class if we passed
+    it through. Reject with a clear error pointing at the operator
+    knob so a typo fails fast."""
+    with pytest.raises(ValueError, match="comma-lists are not supported"):
+        build_analytics_config(class_ids="0,2")
+
+
+def test_class_ids_rejects_non_integer() -> None:
+    with pytest.raises(ValueError, match="single integer"):
+        build_analytics_config(class_ids="person")
+    with pytest.raises(ValueError, match="single integer"):
+        build_analytics_config(class_ids="abc")
+
+
+def test_settings_defaults_for_p4d_followup() -> None:
+    """Pin the production defaults: ``roi_margin_pct=0.05`` (matching
+    the probe-default geometry above) and ``class_ids="all"`` (matching
+    the all-class probe default)."""
+    from app.config import Settings
+
+    s = Settings()
+    assert s.deepstream_analytics_roi_margin_pct == 0.05
+    assert s.deepstream_analytics_class_ids == "all"
+
+
 # --- pure docker command builder ---------------------------------------
 
 

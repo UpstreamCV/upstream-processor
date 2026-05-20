@@ -592,3 +592,96 @@ async def test_re_enter_after_exit_sequence_increments(fast_settings) -> None:  
     # Keys all distinct.
     all_keys = {o.payload["idempotency_key"] for o in enters + exits}
     assert len(all_keys) == 4
+
+
+# --- P4-D follow-up: live-debug diagnostics ----------------------------
+
+
+async def test_status_payload_exposes_analytics_class_ids_and_margin(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """P4-D live didn't emit zone events because the per-object
+    ``roi_labels`` was never attached (operator's foot point was below
+    the ROI's y-max). The diagnostic fields make this triage trivial:
+    the operator can see the configured class filter + margin and the
+    per-class object counts in the status payload."""
+    settings = fast_settings.model_copy(
+        update={
+            "deepstream_analytics_class_ids": "all",
+            "deepstream_analytics_roi_margin_pct": 0.05,
+        }
+    )
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(
+                frame_num=0,
+                objects=[
+                    _person(tracker_id="0", roi_labels=["entry-roi"]),
+                    _person(tracker_id="1", roi_labels=[]),
+                ],
+                roi_counts={"entry-roi": 1},
+            ),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    stopped = next(s for s in api.statuses if s.status == "stopped")
+    p = stopped.payload
+    assert p["analytics_class_ids"] == "all"
+    assert p["analytics_roi_margin_pct"] == 0.05
+    # Two objects of class_id=2 (person, per the _person helper).
+    assert p["analytics_object_class_id_counts"] == {"2": 2}
+    # One object had non-empty roi_labels.
+    assert p["objects_with_roi_labels_count"] == 1
+    assert "entry-roi" in p["roi_labels_sample"]
+
+
+async def test_status_payload_exposes_zero_roi_labels_when_geometry_misses(  # type: ignore[no-untyped-def]
+    fast_settings,
+) -> None:
+    """Mirror of the P4-D live failure mode: objects detected but
+    nvdsanalytics never tags them with a ROI label. Diagnostics show
+    detection class counts > 0 BUT
+    ``objects_with_roi_labels_count == 0`` — the triage signal that
+    classifies the issue as 'analytics metadata' (not adapter)."""
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(
+                frame_num=0,
+                objects=[_person(tracker_id="0", roi_labels=[])],
+                roi_counts={"entry-roi": 0},
+            ),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, fast_settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    stopped = next(s for s in api.statuses if s.status == "stopped")
+    p = stopped.payload
+    assert p["analytics_object_class_id_counts"] == {"2": 1}
+    assert p["objects_with_roi_labels_count"] == 0
+    # No zone events fired — correct adapter behavior when roi_labels
+    # is absent.
+    assert _zone_obs(api) == []
+
+
+async def test_overridden_class_ids_flows_to_status_payload(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Env override (e.g. ``UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS=2``)
+    propagates into the status payload."""
+    settings = fast_settings.model_copy(update={"deepstream_analytics_class_ids": "2"})
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(
+                frame_num=0,
+                objects=[_person(tracker_id="0", roi_labels=["entry-roi"])],
+                roi_counts={"entry-roi": 1},
+            ),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    stopped = next(s for s in api.statuses if s.status == "stopped")
+    assert stopped.payload["analytics_class_ids"] == "2"

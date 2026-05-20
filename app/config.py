@@ -184,6 +184,34 @@ class Settings(BaseSettings):
     # construction.
     deepstream_zone_membership_stability_frames: int = 5
 
+    # --- P4-D follow-up: analytics ROI geometry + class filter -------
+    # P4-D live verification revealed that the operator's bbox bottom-
+    # center (nvdsanalytics' reference point for ROI containment) was
+    # at y=719 on a 720-tall frame while the previous ROI ended at
+    # y=648 (90% of 720) — so the object was outside the ROI and
+    # ``roi_labels`` was never attached. ``class-id=-1`` was already
+    # in the config; the actual root cause was geometry.
+    #
+    # ``roi_margin_pct`` is the inset on each side of the frame for
+    # the probe-default rectangular ROI. 0.05 → ROI covers the
+    # central 90% x 90% of the frame. P4-D used the implicit 20%
+    # horizontal + 10% vertical margin and a foot point at the bottom
+    # edge fell outside; the new looser default is more forgiving for
+    # camera-above-operator scenes. Range [0, 0.49]; values outside
+    # fail at adapter construction. Production-tuned scenes are
+    # expected to ship per-camera geometry via the dashboard milestone.
+    deepstream_analytics_roi_margin_pct: float = 0.05
+
+    # ``analytics_class_ids`` is the nvdsanalytics per-section class
+    # filter. ``"all"`` (the probe default) and ``"-1"`` both map to
+    # ``class-id=-1`` (every detected class counted). A single integer
+    # like ``"2"`` maps to ``class-id=2`` (one class only). The
+    # nvdsanalytics property parser accepts a SINGLE int per section
+    # so multi-class lists are not supported in v0; multi-class
+    # production tuning will need per-class sections, a later
+    # milestone. Values are validated at adapter construction.
+    deepstream_analytics_class_ids: str = "all"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
