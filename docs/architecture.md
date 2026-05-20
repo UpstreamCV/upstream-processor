@@ -125,3 +125,34 @@ evidence only, **not** metadata extraction. Out of scope: pyds, pad probes,
 MetadataSource, metadata adapter, observations, tracking, nvtracker,
 nvdsanalytics, line crossing, zones, Triton, dashboard, package catalog,
 billing. API contracts unchanged.
+
+## P2 — manual pyds metadata probe (out-of-tree)
+
+A *manual* probe that proves the DeepStream metadata seam (no runtime worker
+change, **no `app/` code touched**). It builds, inside a thin
+`upstream-deepstream:8.0-pyds-v1.2.2` image (DS 8.0 +
+NVIDIA-published `pyds-1.2.2` wheel for cp312 / Ubuntu 24.04), an RTSP →
+`nvstreammux` → `nvinfer` (TrafficCamNet) → `fakesink` pipeline and attaches
+a pad probe on the `nvinfer` src pad that walks
+`pyds.gst_buffer_get_nvds_batch_meta` → `NvDsBatchMeta.frame_meta_list`
+(`NvDsFrameMeta.cast`) → `obj_meta_list` (`NvDsObjectMeta.cast`) and pulls
+`class_id` / `obj_label` / `confidence` / `rect_params` / `object_id`. The
+probe emits a single `PYDS_PROBE_SUMMARY=<json>` line with counters and a
+small bounded sample shaped per the P2 "neutral metadata" spec
+(`runtime`, `metadata_source: "pyds_pad_probe"`, `frame.{frame_num,width,height}`,
+`objects[*].{class_id,label,confidence,bbox_pixels,bbox_normalized,tracker_id}`).
+
+Files: `docker/Dockerfile.pyds`, `scripts/_pyds_probe_helpers.py`,
+`scripts/deepstream_pyds_metadata_probe.py`,
+`scripts/probe_deepstream_pyds_metadata.sh`,
+`tests/test_pyds_probe_helpers.py`. The probe is **not imported by `app/`**;
+mypy/ruff cover only the pure helpers (the gi/pyds-touching code lives in
+the probe script). The pad probe does near-zero work — no HTTP, no async,
+no UpStream API writes. The raw RTSP URL appears only in the per-run temp
+`pgie.txt` / subprocess argv; all logs use the redacted form. The
+TrafficCamNet engine builds fresh on first run (Blackwell sm_120, ~30 s).
+
+This is **not** the MetadataSource and **not** the metadata adapter — those
+land in the next milestones. KITTI/log output here is debug evidence only.
+Still **no observations, no pyds in `app/`, no pad probes in `app/`, no
+nvtracker, no nvdsanalytics, no Triton, no dashboard, no API change**.
