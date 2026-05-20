@@ -549,3 +549,138 @@ async def test_writer_emit_call_surface_for_roi(fast_settings) -> None:  # type:
     assert o.processor_id == _PROCESSOR_ID
     assert o.package_id == "deepstream.analytics_probe.v0"
     assert o.observed_at.tzinfo is not None
+
+
+# --- P4-C cleanup: debounce / hysteresis -------------------------------
+
+
+async def test_short_flap_below_threshold_does_not_emit(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Reproduces the P4-C live-finding pattern: count flips 0 -> 1 ->
+    0 quickly. With debounce=5, neither the up-flap nor the
+    down-flap should commit a change emit. Only the first observation
+    fires."""
+    settings = fast_settings.model_copy(update={"deepstream_roi_change_stability_frames": 5})
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(frame_num=0, roi_counts={"entry-roi": 0}),  # first emit
+            _frame_line(frame_num=1, roi_counts={"entry-roi": 1}),  # pending 1
+            _frame_line(frame_num=2, roi_counts={"entry-roi": 1}),  # pending 2
+            _frame_line(frame_num=3, roi_counts={"entry-roi": 0}),  # flap clears
+            _frame_line(frame_num=4, roi_counts={"entry-roi": 1}),  # pending starts over
+            _frame_line(frame_num=5, roi_counts={"entry-roi": 0}),  # flap clears
+            _frame_line(frame_num=6, roi_counts={"entry-roi": 0}),  # steady
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    obs = _roi_obs(api)
+    # Only the first observation lands; all the 0<->1 flaps are
+    # suppressed because the candidate never accumulates 5 consecutive
+    # same-value frames.
+    assert len(obs) == 1
+    assert obs[0].payload["debug"]["emit_reason"] == "first"
+
+
+async def test_stable_count_commits_after_threshold(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """If the count holds at the new value for >= stability_frames
+    frames in a row, the change emits."""
+    settings = fast_settings.model_copy(update={"deepstream_roi_change_stability_frames": 3})
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(frame_num=0, roi_counts={"entry-roi": 0}),  # first
+            _frame_line(frame_num=1, roi_counts={"entry-roi": 1}),  # pending 1
+            _frame_line(frame_num=2, roi_counts={"entry-roi": 1}),  # pending 2
+            _frame_line(frame_num=3, roi_counts={"entry-roi": 1}),  # commit
+            _frame_line(frame_num=4, roi_counts={"entry-roi": 1}),  # same as last, no emit
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    obs = _roi_obs(api)
+    assert len(obs) == 2
+    assert obs[0].payload["debug"]["emit_reason"] == "first"
+    assert obs[1].payload["debug"]["emit_reason"] == "change"
+    assert obs[1].payload["total_count"] == 1
+
+
+async def test_interval_heartbeat_emits_stable_count_under_debounce(  # type: ignore[no-untyped-def]
+    fast_settings,
+) -> None:
+    """A pending change that hasn't yet hit the stability threshold
+    must NOT replace the heartbeat's reported count. Heartbeat fires
+    with the last STABLE count even while a candidate is pending."""
+    settings = fast_settings.model_copy(
+        update={
+            "deepstream_roi_change_stability_frames": 10,
+            "deepstream_roi_min_interval_seconds": 30.0,
+        }
+    )
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(frame_num=0, roi_counts={"entry-roi": 0}, timestamp=_now_iso(0)),
+            # Three pending frames at 1 — well below threshold of 10.
+            _frame_line(frame_num=1, roi_counts={"entry-roi": 1}, timestamp=_now_iso(10)),
+            _frame_line(frame_num=2, roi_counts={"entry-roi": 1}, timestamp=_now_iso(20)),
+            _frame_line(frame_num=3, roi_counts={"entry-roi": 1}, timestamp=_now_iso(31)),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    obs = _roi_obs(api)
+    assert len(obs) == 2
+    assert obs[0].payload["debug"]["emit_reason"] == "first"
+    assert obs[0].payload["total_count"] == 0
+    assert obs[1].payload["debug"]["emit_reason"] == "interval"
+    # The interval heartbeat reports the LAST STABLE count (0), NOT
+    # the pending candidate (1). This is the P4-C cleanup contract.
+    assert obs[1].payload["total_count"] == 0
+
+
+def test_settings_default_for_stability_frames_is_5() -> None:
+    """Production default is 5 (per the brief). Tests can override via
+    ``fast_settings`` (which sets 1 for backward compat with existing
+    immediate-change tests) but the underlying Settings default is the
+    production value."""
+    from app.config import Settings
+
+    # Don't use ``get_settings()`` (cached fixture state) — instantiate
+    # directly with only the required secret env. ``conftest.py``
+    # already exports ``UPSTREAM_PROCESSOR_WEBHOOK_SECRET``.
+    s = Settings()
+    assert s.deepstream_roi_change_stability_frames == 5
+
+
+def test_invalid_stability_frame_count_rejected_by_adapter() -> None:
+    """``Settings`` accepts any int (pydantic permits it) but the
+    adapter constructor rejects values < 1 so a misconfigured env
+    var fails fast inside the worker, not silently."""
+    from uuid import uuid4 as _uuid4
+
+    import pytest
+    from app.observations.observation_adapter import RoiOccupancyState
+
+    with pytest.raises(ValueError, match="change_stability_frames must be >= 1"):
+        RoiOccupancyState(stream_session_id=_uuid4(), change_stability_frames=0)
+
+
+async def test_status_payload_exposes_stability_frames(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """The configured debounce threshold appears in the analytics
+    status payload so an operator can tell `no observations because
+    steady scene` apart from `no observations because debounce too
+    aggressive`."""
+    settings = fast_settings.model_copy(update={"deepstream_roi_change_stability_frames": 7})
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [_frame_line(frame_num=0, roi_counts={"entry-roi": 0})],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    stopped = next(s for s in api.statuses if s.status == "stopped")
+    assert stopped.payload.get("roi_change_stability_frames") == 7

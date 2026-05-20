@@ -56,6 +56,13 @@ def fast_settings():  # type: ignore[no-untyped-def]
             "final_status_timeout_seconds": 0.5,
             "overall_shutdown_timeout_seconds": 1.0,
             "restart_window_seconds": 1.0,
+            # P4-C cleanup: production default is 5 (suppress short
+            # detection-count flaps), but the existing P4-C emit tests
+            # in test_deepstream_roi_occupancy_emit.py were written
+            # assuming immediate change emit. Keep ``fast_settings`` at 1
+            # so those tests' assumptions hold; tests that exercise the
+            # debounce path explicitly override via ``model_copy``.
+            "deepstream_roi_change_stability_frames": 1,
         }
     )
 
