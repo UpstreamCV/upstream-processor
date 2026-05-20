@@ -125,6 +125,39 @@ mock runtime exits well inside these (upper bounds, not delays). No
 inference/observation/API change — readiness cleanup before the M8.2C1
 inference smoke test.
 
+## P2 — manual pyds metadata probe (out-of-tree)
+
+A separate, manual-only probe that proves DeepStream metadata access via
+NVIDIA pyds. Does **not** touch `app/` or any runtime worker; does **not**
+call any UpStream API; does **not** emit observations.
+
+```sh
+# on the GPU host, with an active validated stream's internal_rtsp_url:
+# (first run builds upstream-deepstream:8.0-pyds-v1.2.2 from
+# docker/Dockerfile.pyds; ~15s build on top of the cached DS 8.0 image)
+CONFIRM_BUILD=1 PROBE_SECONDS=45 \
+  scripts/probe_deepstream_pyds_metadata.sh "rtsp://127.0.0.1:18554/sess_XXXX"
+```
+
+What it does: builds `rtspsrc → nvstreammux → nvinfer (TrafficCamNet) →
+fakesink` inside a pyds-enabled DS 8.0 container, attaches a pad probe to
+`nvinfer.src`, walks
+`pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta → NvDsObjectMeta`,
+and emits one `PYDS_PROBE_SUMMARY=<json>` line with counters
+(`frames_seen`, `frames_with_objects`, `objects_seen`, `class_counts`,
+`label_counts`, `has_bbox/has_confidence/has_tracker_id`) and a bounded
+neutral-metadata sample
+(`runtime`, `metadata_source`, `frame.{frame_num,width,height}`,
+`objects[*].{class_id,label,confidence,bbox_pixels,bbox_normalized,tracker_id}`).
+The pad probe is near-zero-work (no HTTP, no async, no API writes). The
+raw RTSP URL goes only into the temp `pgie.txt` (under `/tmp`, shredded on
+exit unless `KEEP_TEMP_FILES=1`) and the subprocess argv; logs use the
+redacted form.
+
+**This is NOT the MetadataSource and NOT the metadata adapter.** Object
+counts here are debug evidence only. No observations, no pyds in `app/`,
+no tracking, no nvtracker, no nvdsanalytics, no Triton.
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

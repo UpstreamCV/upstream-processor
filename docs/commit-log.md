@@ -4,6 +4,77 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P2: manual DeepStream pyds metadata probe (live-verified)
+
+### Summary
+Out-of-tree, manual-only probe proving the DeepStream metadata seam: pyds
+imports under `--gpus all`, a pad probe on `nvinfer.src` walks
+`pyds.gst_buffer_get_nvds_batch_meta` → `NvDsFrameMeta` → `NvDsObjectMeta`
+and pulls `class_id` / `obj_label` / `confidence` / `rect_params` /
+`object_id`. Live against the active stream the probe produced
+**671 frames / 673 `person` detections** with bbox + confidence + (correct)
+`tracker_id=null`; neutral metadata sample matches the P2 spec exactly;
+clean bounded exit (`docker_exit=124`), no leftover container, no raw RTSP
+key or secret in any logged/committed file.
+
+DeepStream 8.0 ships no pyds; the probe stands on a thin
+`upstream-deepstream:8.0-pyds-v1.2.2` image built from
+`docker/Dockerfile.pyds` (FROM `deepstream:8.0-samples-multiarch` +
+`libpython3.12t64` + NVIDIA `pyds-1.2.2-cp312-cp312-linux_x86_64.whl`).
+Build is reproducible; the in-build `import pyds` check was removed because
+`libcuda.so.1` is only injected at run time by the NVIDIA Container Toolkit
+(`--gpus all`) — the probe verifies the import naturally on first run.
+
+### What changed
+- `docker/Dockerfile.pyds` (new) — pinned base + wheel URL, SHELL `bash -lc`,
+  apt: `python3-pip`, `libpython3.12t64`, `curl`, `ca-certificates`; curl
+  purged after install; LABEL with pyds version + base.
+- `scripts/_pyds_probe_helpers.py` (new) — pure helpers: `redact_rtsp`,
+  `scrub_rtsp_inline`, `bbox_normalized`, `build_neutral_object_sample`,
+  `UNTRACKED_OBJECT_ID`. No gi/pyds imports → testable on the Mac.
+- `scripts/deepstream_pyds_metadata_probe.py` (new) — Python probe: builds
+  `rtspsrc(tcp) → rtph264depay → h264parse → nvv4l2decoder → nvstreammux →
+  nvinfer → nvvideoconvert → fakesink`; pad probe on `nvinfer.src`;
+  near-zero work; bounded by `--seconds`; emits one
+  `PYDS_PROBE_SUMMARY=<json>` line; SIGINT/SIGTERM-clean.
+- `scripts/probe_deepstream_pyds_metadata.sh` (new) — driver: builds the
+  pyds image on demand (`CONFIRM_BUILD=1`), generates a per-run temp
+  `pgie.txt` (TrafficCamNet INT8 — same as M8.2C1-A/B), `docker run --rm
+  --gpus all --network host -v wd:wd ...`, parses summary, exit-classifies,
+  shreds the temp dir. RTSP redacted in every log line; `KEEP_TEMP_FILES=1`
+  to retain.
+- `tests/test_pyds_probe_helpers.py` (new, 9 tests) — redact / scrub /
+  normalize / neutral-sample shape / JSON roundtrip / `UNTRACKED_OBJECT_ID`.
+- Docs updated: `docs/architecture.md` (P2 section), `docs/deepstream-
+  inference-smoke.md` (P2 pointer), `docs/deepstream-rtsp-probe.md`
+  (forward pointer), README + local-dev (run-it pointer).
+
+### Not changed
+**No `app/` code touched.** No MetadataSource, no metadata adapter, no
+ObservationWriter integration, no observations, no pyds in `app/`, no pad
+probes in `app/`, no nvtracker, no nvdsanalytics, no Triton, no line
+crossing, no zones, no dashboard, no rules. The runtime supervisor / worker
+behavior is unchanged. API contracts unchanged. upstream-agent / api-server
+/ streaming-server / dashboard untouched. The webhook secret never left the
+API host (this probe doesn't call any UpStream API).
+
+### Testing/checks
+`uv run pytest -q` **79 passed** (70 prior + 9 new). `ruff check`,
+`ruff format --check`, `mypy app`, `bash -n scripts/*.sh` — all clean.
+Live: SSM eligible-sessions HTTP 200 / `validation.passed=true`;
+`ffprobe` exit 0 (h264 1280×720 30/1); pyds 1.2.2 image built in ~15 s;
+probe run produced `frames_seen=671 / frames_with_objects=671 /
+objects_seen=673 / class_counts={"2":673} / label_counts={"person":673}`,
+3 neutral-sample frames matching the P2 spec.
+
+### Follow-up TODOs
+- P2 (continued) — `MetadataSource` Protocol + bounded bridge queue in
+  `app/`, consumed by an eventual ObservationWriter seam. Still no
+  observations.
+- Later: metadata adapter, tracking, nvtracker, nvdsanalytics, etc.
+
+---
+
 ## 2026-05-19 - P1/M8.2C1-B: supervisor-managed DeepStream inference worker
 
 ### Summary

@@ -112,3 +112,12 @@ mode + `DeepStreamInferenceProcessManager`). Decode probe (M8.2B) unchanged.
 Default DeepStream image bumped to 8.0 for both. Still **no observations / no
 metadata extraction / no pyds**. Implementation complete + unit-tested; live
 verification pending. See `docs/local-dev.md` M8.2C1-B checklist.
+
+**P2 — manual pyds metadata probe (2026-05-19):** out-of-tree probe
+(`scripts/probe_deepstream_pyds_metadata.sh` +
+`scripts/deepstream_pyds_metadata_probe.py`, built on
+`upstream-deepstream:8.0-pyds-v1.2.2`) walks NvDsBatchMeta/NvDsFrameMeta/
+NvDsObjectMeta via the NVIDIA pyds 1.2.2 wheel and emits neutral
+intermediate metadata. Proves the metadata seam without touching the
+runtime worker or `app/`. Still **no observations, no pyds in `app/`, no
+MetadataSource, no metadata adapter** — those land in later milestones.

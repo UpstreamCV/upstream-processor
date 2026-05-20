@@ -112,6 +112,19 @@ only, not metadata extraction. Implementation complete + unit-tested;
 **live verification pending until explicitly run** (see the M8.2C1-B
 checklist in `docs/local-dev.md`).
 
+**P2 manual pyds metadata probe (2026-05-19):** the metadata seam *itself*
+is now proven live. A separate out-of-tree probe
+(`scripts/probe_deepstream_pyds_metadata.sh` +
+`scripts/deepstream_pyds_metadata_probe.py`, on top of
+`upstream-deepstream:8.0-pyds-v1.2.2` built from `docker/Dockerfile.pyds`)
+walks `pyds.gst_buffer_get_nvds_batch_meta` → `NvDsFrameMeta` →
+`NvDsObjectMeta` and produces neutral intermediate metadata (`class_id`,
+`label`, `confidence`, `bbox_pixels`, `bbox_normalized`, `tracker_id=null`).
+Live result against the same live stream: **671 frames / 673 person
+detections** in 45 s, sample shape matches the P2 spec, redaction holds,
+clean exit. Still no MetadataSource, no metadata adapter, no observations,
+no pyds in `app/`. Next: MetadataSource + bounded bridge queue.
+
 ## How to run
 
 ```sh

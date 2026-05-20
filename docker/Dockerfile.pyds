@@ -1,0 +1,56 @@
+# P2 — DeepStream 8.0 image with NVIDIA pyds Python bindings.
+#
+# Manual-probe-only. Adds the NVIDIA-published pyds wheel (which is NOT
+# bundled in the standard *-samples-multiarch image) on top of DeepStream 8.0
+# so a Python pad probe can walk NvDsBatchMeta / NvDsFrameMeta /
+# NvDsObjectMeta via pyds.gst_buffer_get_nvds_batch_meta. Build is
+# reproducible: base image and wheel URL/version are pinned.
+#
+# Not used by app/ runtime workers; consumed only by
+# scripts/probe_deepstream_pyds_metadata.sh.
+#
+# Build:
+#   docker build -t upstream-deepstream:8.0-pyds-v1.2.2 \
+#     -f docker/Dockerfile.pyds docker/
+
+ARG BASE_IMAGE=nvcr.io/nvidia/deepstream:8.0-samples-multiarch
+FROM ${BASE_IMAGE}
+
+# Re-declare so it is usable after FROM (the pre-FROM ARG is only visible to
+# the FROM line).
+ARG BASE_IMAGE
+
+# NVIDIA pyds wheel for DeepStream 8.0 / Python 3.12 / Ubuntu 24.04 / x86_64.
+# Released by NVIDIA-AI-IOT/deepstream_python_apps. Override with
+# --build-arg PYDS_WHEEL_URL=... for a newer version.
+ARG PYDS_WHEEL_URL=https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.2/pyds-1.2.2-cp312-cp312-linux_x86_64.whl
+
+# Use a login shell so the DeepStream image's /etc/profile.d/* (which sets
+# LD_LIBRARY_PATH for the DeepStream/CUDA libs) is sourced for every RUN.
+SHELL ["/bin/bash", "-lc"]
+
+# `python3-pip` is not in the base image. `libpython3.12t64` provides
+# libpython3.12.so.1.0 (Ubuntu 24.04's t64 transition variant), which the
+# pyds extension needs at import time. `curl` is required to fetch the wheel
+# during build. `--break-system-packages` is needed because Ubuntu 24.04
+# marks the system Python externally-managed (PEP 668); the wheel goes into
+# /usr/local/lib/python3.12/dist-packages so it stays out of the apt path.
+#
+# NOTE: we do NOT `import pyds` during build. pyds links libcuda.so.1, which
+# is only injected by the NVIDIA Container Toolkit at run time (--gpus all);
+# `docker build` has no GPU. The probe script verifies the import naturally
+# the first time it runs inside `docker run --gpus all ...`.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3-pip libpython3.12t64 curl ca-certificates \
+ && curl -fsSL -o /tmp/pyds.whl "${PYDS_WHEEL_URL}" \
+ && WHL_NAME="$(basename "${PYDS_WHEEL_URL}")" \
+ && mv /tmp/pyds.whl "/tmp/${WHL_NAME}" \
+ && python3 -m pip install --no-cache-dir --break-system-packages "/tmp/${WHL_NAME}" \
+ && rm -f "/tmp/${WHL_NAME}" \
+ && apt-get purge -y curl \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+LABEL upstream.deepstream.pyds-version="1.2.2" \
+      upstream.deepstream.base="${BASE_IMAGE}"
