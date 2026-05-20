@@ -40,6 +40,16 @@
       "supports": {
         "metadata_probe": true
       }
+    },
+    {
+      "package_id": "deepstream.tracker_probe.v0",
+      "display_name": "DeepStream Tracker Probe v0",
+      "runtime": "deepstream",
+      "description": "DeepStream 8.0 + pyds metadata probe with nvtracker enabled. Same pyds pad probe as deepstream.metadata_probe.v0, but inserts an nvtracker element (IOU low-level config by default) after nvinfer so NvDsObjectMeta.object_id is a real stable tracker id across frames. The pad probe runs on the tracker src pad. Status payload adds tracker_enabled, has_tracker_id, unique_tracker_ids_count, and a bounded tracker_ids_sample. Still status/debug evidence only -- no observations, no metadata adapter, no API writes.",
+      "outputs": [],
+      "supports": {
+        "tracker_probe": true
+      }
     }
   ]
 }

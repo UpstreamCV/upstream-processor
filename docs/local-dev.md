@@ -283,6 +283,115 @@ The probe is bounded by `UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS`
 it next poll while the session stays eligible — expected for a probe,
 same shape as decode/inference probes.
 
+## Live verification checklist (P3 — supervisor-managed tracker probe)
+
+Same shape as P2 — same pyds-derived image, same launch pattern, same
+SIGINT-driven shutdown. The only new pieces are the package override and
+(optionally) a longer probe timeout so the per-cycle engine build leaves
+more wall-clock for detections to flow through `nvtracker`. The P3 live
+run (commit added by this milestone) confirmed `nvtracker` produces
+stable tracker ids across consecutive frames against a real person in
+the camera view.
+
+### Launch (same secret-handling pattern as P2)
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p3
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p3/secret.env
+chmod 600 /tmp/upstream-live-p3/secret.env
+
+# rsync the repo into /tmp/upstream-live-p3/repo and build a venv with
+# python3.12 -m venv + pip install -e . (same recipe as P2).
+
+cd /tmp/upstream-live-p3/repo
+set -a; . /tmp/upstream-live-p3/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p3_tracker_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.tracker_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p3/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p3/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p3/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p3/processor.pid
+```
+
+`UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180` is recommended
+for the live run because the TensorRT engine builds fresh in each per-run
+temp dir (~30 s cold) — at the 60 s default, ~half of each cycle is engine
+build, which can mask "no detections in scene" as "no tracker IDs". A
+180 s cycle gives nvinfer + nvtracker ~150 s of run time per cycle.
+
+### Stop (SIGINT first; SIGTERM only as a backstop)
+
+Same as P2 — capture the real python PID via `pgrep -f ... -n`, then
+`kill -INT $PID`. The P2 cleanup hardening covers tracker mode unchanged:
+`request_stop` closes the bridge queue synchronously, the driver shields
+docker stop + workdir cleanup + the final status post, and the PM's
+`stop()` is idempotent.
+
+### Lifecycle checklist
+
+```
+[ ] Start a valid upstream-agent stream (camera scene must contain at
+    least one TrafficCamNet class: car / bicycle / person / road_sign;
+    otherwise tracker has nothing to assign IDs to)
+[ ] Wait for validation_status=true
+[ ] eligible-sessions returns one session
+[ ] Worker starts (log: "package override active",
+    "deepstream worker ... mode=tracker_probe",
+    "deepstream metadata start: image=... model=trafficcamnet tracker=on")
+[ ] pyds container starts; name prefix `upstream-dst-` (not `-dsm-`)
+[ ] RTSP opens; nvinfer engine builds (~30 s cold)
+[ ] In-container log includes `[NvMultiObjectTracker] Initialized`
+[ ] UPSTREAM_METADATA= lines flow on stdout
+[ ] Frames-with-objects appear once the scene has a detectable class
+[ ] Object lines carry a non-null `tracker_id` once nvtracker assigns one
+[ ] The same `tracker_id` recurs across many consecutive frames (stable
+    ID, not a new ID per frame)
+[ ] Status posts `starting`
+[ ] Status posts `attached` (first valid metadata frame)
+[ ] Status posts `processing` (payload includes
+    metadata_enabled=true, tracker_enabled=true, tracker_algorithm="iou",
+    has_tracker_id (true once IDs flow), unique_tracker_ids_count,
+    tracker_ids_sample, frames_seen, frames_with_objects, objects_seen,
+    class_counts, label_counts, queue_stats)
+[ ] SIGINT to the *real* PID
+[ ] Processor exits within ~25 s (clean shutdown line)
+[ ] pyds container stops cleanly (no lingering `upstream-dst-*`)
+[ ] Status posts `stopped`
+[ ] processor_statuses row: runtime=deepstream,
+    package_id=deepstream.tracker_probe.v0
+[ ] No observations are posted (`processor.*` types absent for this run)
+[ ] No raw RTSP URL, stream key, secret, Authorization or Bearer in logs
+[ ] Temp work dir cleaned (no /tmp/upstream-p3-tracker.* leftovers unless
+    KEEP_TEMP_FILES=true)
+```
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p3-tracker.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p3
+```
+
+### What was verified during P3 build
+
+- Full suite **156 tests** green (143 unit + 13 new for tracker probe);
+  ruff + ruff-format + `mypy app` clean.
+- Live run on crowdcountS2 (RTX 5070 Ti, Blackwell sm_120):
+  `nvtracker` initialised (IOU low-level), 2128 frames in one bounded
+  cycle, 2010 with detections, 7 unique tracker ids, `tracker_id "2"`
+  persisted across **1155** consecutive frames (`"5"` × 725, `"0"` × 370),
+  zero observations posted, zero leftover containers, zero
+  `/tmp/upstream-p3-tracker.*` dirs after `clean shutdown`.
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

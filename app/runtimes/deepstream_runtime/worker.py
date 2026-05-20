@@ -73,6 +73,7 @@ _CLEAN_EXIT_CODES = frozenset({0, 124, 130, 137})
 _DECODE_MODE = "decode_probe"
 _INFERENCE_MODE = "inference_probe"
 _METADATA_MODE = "metadata_probe"
+_TRACKER_MODE = "tracker_probe"
 
 # Structured stdout markers emitted by the in-container pyds metadata app
 # (``app/runtimes/deepstream_runtime/pyds_metadata_app.py``). Keep in lock-
@@ -150,7 +151,12 @@ def parse_metadata_line(line: str) -> tuple[str, str] | None:
 
 @dataclass
 class _MetadataCounters:
-    """Worker-side aggregate counters fed by the metadata consumer task."""
+    """Worker-side aggregate counters fed by the metadata consumer task.
+
+    ``unique_tracker_ids`` / ``tracker_ids_sample`` are populated only when
+    the producer emits real ``tracker_id`` values (P3 tracker_probe mode);
+    in metadata_probe they stay empty and the corresponding payload fields
+    are suppressed by the worker."""
 
     frames_seen: int = 0
     frames_with_objects: int = 0
@@ -161,6 +167,9 @@ class _MetadataCounters:
     has_confidence: bool = False
     has_tracker_id: bool = False
     sample_count: int = 0
+    unique_tracker_ids: set[str] = field(default_factory=set)
+    tracker_ids_sample: list[str] = field(default_factory=list)
+    tracker_ids_sample_limit: int = 10
 
     def absorb(self, frame: NeutralFrameMetadata) -> None:
         self.frames_seen += 1
@@ -182,6 +191,10 @@ class _MetadataCounters:
                 self.has_bbox = True
             if obj.tracker_id is not None:
                 self.has_tracker_id = True
+                if obj.tracker_id not in self.unique_tracker_ids:
+                    self.unique_tracker_ids.add(obj.tracker_id)
+                    if len(self.tracker_ids_sample) < self.tracker_ids_sample_limit:
+                        self.tracker_ids_sample.append(obj.tracker_id)
 
 
 @dataclass
@@ -263,11 +276,13 @@ class DeepStreamWorker(Runtime):
 
     @property
     def _mode(self) -> str:
-        """``metadata_probe`` (P2) / ``inference_probe`` (M8.2C1-B) /
-        ``decode_probe`` (M8.2B), from the resolved package's
-        ``supports``. Order matters: a package that advertises multiple
-        supports falls through to the most specific mode (metadata >
-        inference > decode)."""
+        """``tracker_probe`` (P3) / ``metadata_probe`` (P2) /
+        ``inference_probe`` (M8.2C1-B) / ``decode_probe`` (M8.2B), from
+        the resolved package's ``supports``. Order matters: a package
+        that advertises multiple supports falls through to the most
+        specific mode (tracker > metadata > inference > decode)."""
+        if self._package.supports.get("tracker_probe"):
+            return _TRACKER_MODE
         if self._package.supports.get("metadata_probe"):
             return _METADATA_MODE
         if self._package.supports.get("inference_probe"):
@@ -275,7 +290,8 @@ class DeepStreamWorker(Runtime):
         return _DECODE_MODE
 
     def _default_pm_factory(self) -> ProcessManager:
-        if self._mode == _METADATA_MODE:
+        if self._mode in (_METADATA_MODE, _TRACKER_MODE):
+            tracker_enabled = self._mode == _TRACKER_MODE
             return DeepStreamMetadataProcessManager(
                 rtsp_url=self._session.internal_rtsp_url,
                 image=self._settings.deepstream_pyds_image,
@@ -290,6 +306,11 @@ class DeepStreamWorker(Runtime):
                 stream_session_id=str(self._session.session_id),
                 width=self._session.approved.width,
                 height=self._session.approved.height,
+                tracker_enabled=tracker_enabled,
+                tracker_algorithm=self._settings.deepstream_tracker_algorithm,
+                tracker_lib_path=self._settings.deepstream_tracker_lib_path,
+                tracker_width=self._settings.deepstream_tracker_width,
+                tracker_height=self._settings.deepstream_tracker_height,
             )
         if self._mode == _INFERENCE_MODE:
             return DeepStreamInferenceProcessManager(
@@ -338,7 +359,7 @@ class DeepStreamWorker(Runtime):
             self._pm = self._pm_factory()
             await self._pm.start()
 
-            if self._mode == _METADATA_MODE:
+            if self._mode in (_METADATA_MODE, _TRACKER_MODE):
                 await self._drive_metadata_probe()
             elif self._mode == _INFERENCE_MODE:
                 await self._drive_inference()
@@ -562,12 +583,17 @@ class DeepStreamWorker(Runtime):
         queue_stats: dict[str, Any],
         last_app_summary: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Status payload for the metadata probe. Includes counters, queue
-        stats, and the in-container app's terminal summary if available.
-        Deliberately small — no per-frame samples are forwarded."""
+        """Status payload for the metadata / tracker probe. Includes
+        counters, queue stats, and the in-container app's terminal summary
+        if available. Deliberately small — no per-frame samples are
+        forwarded. In ``tracker_probe`` mode the payload also carries
+        ``tracker_enabled`` / ``unique_tracker_ids_count`` /
+        ``tracker_ids_sample`` so the operator can confirm stable IDs
+        without scraping container logs."""
+        tracker_enabled = self._mode == _TRACKER_MODE
         p: dict[str, Any] = {
             "runtime": "deepstream",
-            "mode": _METADATA_MODE,
+            "mode": self._mode,
             "metadata_enabled": True,
             "metadata_source": "pyds_pad_probe",
             "model": self._settings.deepstream_inference_model,
@@ -583,6 +609,11 @@ class DeepStreamWorker(Runtime):
             "sample_count": counters.sample_count,
             "queue_stats": queue_stats,
         }
+        if tracker_enabled:
+            p["tracker_enabled"] = True
+            p["tracker_algorithm"] = self._settings.deepstream_tracker_algorithm
+            p["unique_tracker_ids_count"] = len(counters.unique_tracker_ids)
+            p["tracker_ids_sample"] = list(counters.tracker_ids_sample)
         if last_app_summary is not None:
             p["app_summary"] = last_app_summary
         return p
@@ -643,7 +674,9 @@ class DeepStreamWorker(Runtime):
         # poll iteration to close the queue from its own ``finally``).
         self._metadata_queue = queue
         source = BridgeQueueMetadataSource(queue)
-        counters = _MetadataCounters()
+        counters = _MetadataCounters(
+            tracker_ids_sample_limit=int(self._settings.deepstream_tracker_ids_sample_limit),
+        )
         reader_state = _MetadataReaderState()
 
         async def _reader() -> None:

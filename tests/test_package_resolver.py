@@ -41,6 +41,18 @@ def test_resolves_deepstream_metadata_probe_package() -> None:
     assert spec.supports.get("decode_only") is None
 
 
+def test_resolves_deepstream_tracker_probe_package() -> None:
+    spec = resolve("deepstream.tracker_probe.v0")
+    assert spec.package_id == "deepstream.tracker_probe.v0"
+    assert spec.runtime == "deepstream"
+    assert spec.outputs == ()  # status/debug evidence only — no observations
+    assert spec.supports.get("tracker_probe") is True
+    # distinct from the other deepstream packages (most-specific-wins)
+    assert spec.supports.get("metadata_probe") is None
+    assert spec.supports.get("inference_probe") is None
+    assert spec.supports.get("decode_only") is None
+
+
 def test_rejects_unknown_package() -> None:
     with pytest.raises(PackageResolutionError, match="unknown package_id"):
         resolve("does.not.exist")

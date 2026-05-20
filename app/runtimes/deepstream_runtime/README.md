@@ -1,10 +1,19 @@
-# deepstream_runtime (decode / inference / metadata probes)
+# deepstream_runtime (decode / inference / metadata / tracker probes)
 
 The DeepStream runtime. Implements the same `app/runtimes/base.py:Runtime`
 interface as `mock_runtime`, so the supervisor / poller / status paths are
-unchanged. One `DeepStreamWorker` class, **three modes** selected by the
+unchanged. One `DeepStreamWorker` class, **four modes** selected by the
 resolved package's `supports` (most specific wins):
 
+- `tracker_probe` — `deepstream.tracker_probe.v0`,
+  `supports.tracker_probe` (**P3**). Same pyds pad probe as
+  `metadata_probe`, but the pipeline gains an `nvtracker` element
+  (default low-level: IOU, no ReID model) between `nvinfer` and
+  `nvvideoconvert`; the pad probe attaches to the tracker src pad so
+  `NvDsObjectMeta.object_id` is a real stable tracker id across frames.
+  Status payload adds `tracker_enabled`, `tracker_algorithm`,
+  `unique_tracker_ids_count`, and a bounded `tracker_ids_sample`. Still
+  **no observations**.
 - `metadata_probe` — `deepstream.metadata_probe.v0`,
   `supports.metadata_probe` (**P2**). Runs the pyds pad probe in a
   DS 8.0 + pyds container, walks NvDsBatchMeta / NvDsFrameMeta /
@@ -32,17 +41,23 @@ Files:
   `fakesink`, no display); exposes `kitti_stats()` (frame/detection
   counts as status evidence).
 - `metadata_probe.py` — pure `build_metadata_docker_command` +
-  `DeepStreamMetadataProcessManager`: the metadata probe owns a per-run
-  temp work dir with a PGIE config + a copy of `pyds_metadata_app.py`,
-  bind-mounted into the pyds-derived DS 8.0 image
+  `DeepStreamMetadataProcessManager`: the metadata / tracker probe owns
+  a per-run temp work dir with a PGIE config + a copy of
+  `pyds_metadata_app.py` (plus a generated `tracker_config.yml` when
+  tracker mode is on), bind-mounted into the pyds-derived DS 8.0 image
   (`upstream-deepstream:8.0-pyds-v1.2.2`). Runs the in-container app
   under `python3 -B` with `PYTHONDONTWRITEBYTECODE=1` so no root-owned
   `__pycache__` lands in the host work dir. Cleans the temp dir on stop.
+  Container naming distinguishes the two modes: `upstream-dsm-*` for
+  metadata-only, `upstream-dst-*` for tracker-on (P3).
 - `pyds_metadata_app.py` — the **in-container** pyds Python app
   (bind-mounted, never imported by other `app/` code). Builds the
-  proven pipeline programmatically, attaches a pad probe to
-  `nvinfer.src`, walks `pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta
-  → NvDsObjectMeta`, and emits structured stdout:
+  proven pipeline programmatically; in tracker mode (CLI
+  `--tracker-config-path` set) an `nvtracker` element is spliced
+  between `nvinfer` and `nvvideoconvert` and the pad probe attaches to
+  the tracker src pad so `NvDsObjectMeta.object_id` is populated.
+  Walks `pyds.gst_buffer_get_nvds_batch_meta → NvDsFrameMeta →
+  NvDsObjectMeta`, and emits structured stdout:
   - `UPSTREAM_METADATA=<json>` per frame (matches
     `NeutralFrameMetadata`).
   - terminal `UPSTREAM_METADATA_SUMMARY=<json>` with counters
@@ -79,15 +94,16 @@ Files:
     are idempotent.
 
 **No observations** in any mode. **No `ObservationWriter`** is wired up
-anywhere in `app/`. The metadata probe runs `pyds` but is still a probe:
-**no metadata adapter, no nvtracker, no nvdsanalytics, no line crossing /
-zones, no Triton.** KITTI / `UPSTREAM_METADATA` output is debug evidence
-only — *not* final metadata extraction. The webhook secret never enters
-the pyds container (the in-container app never calls UpStream APIs;
-status posting stays with the outer supervisor). Default images:
-**DeepStream 8.0** for decode/inference (`UPSTREAM_DEEPSTREAM_IMAGE`,
+anywhere in `app/`. The metadata / tracker probes run `pyds` (and, in
+tracker mode, `nvtracker`) but are still probes: **no metadata adapter,
+no nvdsanalytics, no line crossing / zones, no Triton.** KITTI /
+`UPSTREAM_METADATA` output is debug evidence only — *not* final
+metadata extraction. The webhook secret never enters the pyds container
+(the in-container app never calls UpStream APIs; status posting stays
+with the outer supervisor). Default images: **DeepStream 8.0** for
+decode/inference (`UPSTREAM_DEEPSTREAM_IMAGE`,
 `nvcr.io/nvidia/deepstream:8.0-samples-multiarch`), **pyds-derived DS 8.0**
-for metadata (`UPSTREAM_DEEPSTREAM_PYDS_IMAGE`,
+for metadata/tracker (`UPSTREAM_DEEPSTREAM_PYDS_IMAGE`,
 `upstream-deepstream:8.0-pyds-v1.2.2` built from `docker/Dockerfile.pyds`).
 The `deepstream` runtime is selected when the resolved package's
 `runtime == "deepstream"` (reachable in dev via

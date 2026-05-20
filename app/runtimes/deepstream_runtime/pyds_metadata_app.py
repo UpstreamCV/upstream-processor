@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P2 — supervisor-managed in-container pyds metadata app (DeepStream 8.0).
+"""P2 / P3 — supervisor-managed in-container pyds metadata app (DeepStream 8.0).
 
 **Runtime-only.** This module is intentionally NOT imported by any other
 ``app/`` code. It is bind-mounted into the DeepStream 8.0 + pyds container
@@ -7,13 +7,18 @@ by :class:`app.runtimes.deepstream_runtime.metadata_probe.DeepStreamMetadataProc
 and executed with ``python3 -B``. Mypy/ruff treat it as a runtime probe:
 the gi/pyds imports only resolve inside the container at run time.
 
-The pipeline mirrors the live-verified manual P2 pyds probe:
+The pipeline mirrors the live-verified manual P2 pyds probe; in **P3
+tracker mode** (CLI ``--tracker-config-path`` set) an ``nvtracker`` element
+is spliced in between ``nvinfer`` and ``nvvideoconvert`` and the pad probe
+moves from ``nvinfer.src`` to ``tracker.src`` so ``NvDsObjectMeta.object_id``
+is a real stable tracker id across frames:
 
     rtspsrc(tcp, latency=200) -> rtph264depay -> h264parse ->
     nvv4l2decoder -> nvstreammux(batch=1, 1280x720, live-source=1) ->
-    nvinfer(config=<pgie.txt>) -> nvvideoconvert -> fakesink
+    nvinfer(config=<pgie.txt>) -> [nvtracker(config=<tracker.yml>) ->]
+    nvvideoconvert -> fakesink
 
-A pad probe on the ``nvinfer`` src pad walks
+A pad probe walks
 ``pyds.gst_buffer_get_nvds_batch_meta -> NvDsFrameMeta -> NvDsObjectMeta``
 and emits one structured line **per frame** on stdout:
 
@@ -226,21 +231,38 @@ def _bus_call(_bus: Any, message: Any, loop: Any, _state: _State) -> bool:
     return True
 
 
-def _build_pipeline(rtsp_url: str, pgie_config: str, width: int, height: int) -> tuple[Any, Any]:
+def _build_pipeline(
+    rtsp_url: str,
+    pgie_config: str,
+    width: int,
+    height: int,
+    *,
+    tracker_config: str | None = None,
+    tracker_lib: str | None = None,
+    tracker_width: int = 960,
+    tracker_height: int = 544,
+) -> tuple[Any, Any]:
+    """Build the GStreamer pipeline. When ``tracker_config`` is given, an
+    ``nvtracker`` element is added after ``nvinfer`` and the function returns
+    its src pad's owner so the caller attaches the pad probe there (so the
+    probe sees populated ``NvDsObjectMeta.object_id``)."""
     Gst.init(None)
     pipeline = Gst.Pipeline.new("upstream-pyds-metadata")
 
-    elems: dict[str, Any] = {}
-    for name, factory in (
+    base_elems: list[tuple[str, str]] = [
         ("rtspsrc", "rtspsrc"),
         ("depay", "rtph264depay"),
         ("parse", "h264parse"),
         ("dec", "nvv4l2decoder"),
         ("mux", "nvstreammux"),
         ("pgie", "nvinfer"),
-        ("conv", "nvvideoconvert"),
-        ("sink", "fakesink"),
-    ):
+    ]
+    if tracker_config:
+        base_elems.append(("tracker", "nvtracker"))
+    base_elems.extend([("conv", "nvvideoconvert"), ("sink", "fakesink")])
+
+    elems: dict[str, Any] = {}
+    for name, factory in base_elems:
         el = Gst.ElementFactory.make(factory, name)
         if el is None:
             raise RuntimeError(f"missing GStreamer element: {factory}")
@@ -256,6 +278,13 @@ def _build_pipeline(rtsp_url: str, pgie_config: str, width: int, height: int) ->
     elems["mux"].set_property("batched-push-timeout", 40000)
     elems["pgie"].set_property("config-file-path", pgie_config)
     elems["pgie"].set_property("batch-size", 1)
+    if tracker_config:
+        elems["tracker"].set_property("tracker-width", int(tracker_width))
+        elems["tracker"].set_property("tracker-height", int(tracker_height))
+        elems["tracker"].set_property("gpu-id", 0)
+        if tracker_lib:
+            elems["tracker"].set_property("ll-lib-file", tracker_lib)
+        elems["tracker"].set_property("ll-config-file", tracker_config)
     elems["sink"].set_property("sync", False)
     elems["sink"].set_property("async", False)
 
@@ -273,10 +302,16 @@ def _build_pipeline(rtsp_url: str, pgie_config: str, width: int, height: int) ->
     if elems["dec"].get_static_pad("src").link(sinkpad) != Gst.PadLinkReturn.OK:
         raise RuntimeError("decoder -> streammux link failed")
     elems["mux"].link(elems["pgie"])
-    elems["pgie"].link(elems["conv"])
+    if tracker_config:
+        elems["pgie"].link(elems["tracker"])
+        elems["tracker"].link(elems["conv"])
+        probe_element = elems["tracker"]
+    else:
+        elems["pgie"].link(elems["conv"])
+        probe_element = elems["pgie"]
     elems["conv"].link(elems["sink"])
 
-    return pipeline, elems["pgie"]
+    return pipeline, probe_element
 
 
 def main() -> int:
@@ -292,6 +327,20 @@ def main() -> int:
         default=os.environ.get("STREAM_SESSION_ID", ""),
         help="Optional UpStream session id, echoed in NeutralFrameMetadata.",
     )
+    # P3: optional tracker. When --tracker-config-path is set, nvtracker is
+    # inserted after nvinfer and the pad probe attaches to its src pad.
+    ap.add_argument(
+        "--tracker-config-path",
+        default="",
+        help="Path to nvtracker low-level config YAML; if set, nvtracker is enabled.",
+    )
+    ap.add_argument(
+        "--tracker-lib-path",
+        default="",
+        help="Path to nvtracker ll-lib-file (libnvds_nvmultiobjecttracker.so).",
+    )
+    ap.add_argument("--tracker-width", type=int, default=960)
+    ap.add_argument("--tracker-height", type=int, default=544)
     args = ap.parse_args()
 
     if not args.rtsp:
@@ -300,10 +349,19 @@ def main() -> int:
     if not os.path.isfile(args.pgie_config):
         print(f"ERROR: pgie config not found: {args.pgie_config}", file=sys.stderr)
         return 2
+    tracker_config = args.tracker_config_path or None
+    if tracker_config and not os.path.isfile(tracker_config):
+        print(f"ERROR: tracker config not found: {tracker_config}", file=sys.stderr)
+        return 2
+    tracker_lib = args.tracker_lib_path or None
+    if tracker_config and tracker_lib and not os.path.isfile(tracker_lib):
+        print(f"ERROR: tracker lib not found: {tracker_lib}", file=sys.stderr)
+        return 2
 
     print(
         f"pyds metadata app starting url={_redact(args.rtsp)} "
-        f"pgie={args.pgie_config} seconds={args.seconds}",
+        f"pgie={args.pgie_config} seconds={args.seconds} "
+        f"tracker={'on' if tracker_config else 'off'}",
         flush=True,
     )
 
@@ -311,13 +369,22 @@ def main() -> int:
     state.stream_session_id = args.stream_session_id or None
 
     try:
-        pipeline, pgie = _build_pipeline(args.rtsp, args.pgie_config, args.width, args.height)
+        pipeline, probe_element = _build_pipeline(
+            args.rtsp,
+            args.pgie_config,
+            args.width,
+            args.height,
+            tracker_config=tracker_config,
+            tracker_lib=tracker_lib,
+            tracker_width=args.tracker_width,
+            tracker_height=args.tracker_height,
+        )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     probe = _make_pad_probe(state, args.width, args.height)
-    pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, probe, None)
+    probe_element.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, probe, None)
 
     loop = GLib.MainLoop()
     bus = pipeline.get_bus()

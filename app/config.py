@@ -101,6 +101,30 @@ class Settings(BaseSettings):
     # forwards these to the API).
     deepstream_metadata_sample_limit: int = 3
 
+    # --- P3 DeepStream tracker-probe runtime ----------------------------
+    # Tracker-probe mode (deepstream.tracker_probe.v0): same pyds metadata
+    # path as metadata_probe but inserts nvtracker between nvinfer and
+    # nvvideoconvert so NvDsObjectMeta.object_id becomes a real stable
+    # tracker id across frames. Pad probe attaches to the tracker src pad.
+    # Status payload gains tracker_enabled / unique_tracker_ids_count /
+    # tracker_ids_sample. Still NO observations, NO API writes.
+    #
+    # Library is in-container path; stable across DS 8.0 patch versions.
+    deepstream_tracker_lib_path: str = (
+        "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
+    )
+    # Low-level tracker algorithm. v0 supports the no-ReID IOU tracker which
+    # proves stable ids without needing a ReID model. NvDCF/NvSORT/NvDeepSORT
+    # are reserved for future tuning.
+    deepstream_tracker_algorithm: str = "iou"
+    # nvtracker tracker-width/height: must be multiples of 32 for NvDCF /
+    # NvDeepSORT (harmless for IOU). 960x544 matches the DS 8.0 sample.
+    deepstream_tracker_width: int = 960
+    deepstream_tracker_height: int = 544
+    # Bounded sample of distinct tracker ids surfaced in the status payload.
+    # Keep small — status payload should stay tiny.
+    deepstream_tracker_ids_sample_limit: int = 10
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

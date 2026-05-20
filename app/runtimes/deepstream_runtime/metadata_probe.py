@@ -29,6 +29,7 @@ from uuid import uuid4
 from app.redact import redact_rtsp
 from app.runtimes.deepstream_runtime.inference import (
     build_pgie_config,
+    build_tracker_config,
     resolve_model_dir,
 )
 
@@ -50,15 +51,32 @@ def build_metadata_docker_command(
     sample_limit: int,
     stream_session_id: str | None,
     rtsp_url: str,
+    tracker_enabled: bool = False,
+    tracker_lib_path: str = "",
+    tracker_width: int = 960,
+    tracker_height: int = 544,
 ) -> list[str]:
-    """Docker argv for one bounded metadata-probe run. Pure / side-effect
-    free so it is unit-testable without Docker. Mirrors the proven manual
-    P2 invocation (``--gpus all``, ``--network host``, work dir bind-
-    mounted at the same path so the app's absolute config paths resolve
-    inside the container) and runs the in-container app with
-    ``python3 -B`` so no ``__pycache__`` files land in the host work dir."""
+    """Docker argv for one bounded metadata- or tracker-probe run. Pure /
+    side-effect free so it is unit-testable without Docker. Mirrors the
+    proven manual P2 invocation (``--gpus all``, ``--network host``, work
+    dir bind-mounted at the same path so the app's absolute config paths
+    resolve inside the container) and runs the in-container app with
+    ``python3 -B`` so no ``__pycache__`` files land in the host work dir.
+
+    When ``tracker_enabled`` is set, the in-container app gets the extra
+    ``--tracker-config-path`` / ``--tracker-lib-path`` / ``--tracker-width``
+    / ``--tracker-height`` args so it splices ``nvtracker`` into the
+    pipeline and attaches the pad probe at the tracker src pad."""
     # Note: ``RTSP_URL`` env passes the URL to the in-container app; the
     # in-container app redacts it before any printing.
+    tracker_args = ""
+    if tracker_enabled:
+        tracker_args = (
+            f"--tracker-config-path {work_dir}/tracker_config.yml "
+            f"--tracker-lib-path {tracker_lib_path} "
+            f"--tracker-width {int(tracker_width)} "
+            f"--tracker-height {int(tracker_height)} "
+        )
     inner = (
         f"timeout -s INT {int(probe_timeout_seconds)} "
         f"python3 -B {work_dir}/pyds_metadata_app.py "
@@ -66,6 +84,7 @@ def build_metadata_docker_command(
         f"--seconds {int(probe_timeout_seconds)} "
         f"--sample-limit {int(sample_limit)} "
         f"--stream-session-id {stream_session_id or ''} "
+        f"{tracker_args}"
         "2>&1"
     )
     argv: list[str] = [
@@ -105,6 +124,11 @@ class DeepStreamMetadataProcessManager:
         stream_session_id: str | None,
         width: int,
         height: int,
+        tracker_enabled: bool = False,
+        tracker_algorithm: str = "iou",
+        tracker_lib_path: str = "",
+        tracker_width: int = 960,
+        tracker_height: int = 544,
     ) -> None:
         self._rtsp_url = rtsp_url
         self._image = image
@@ -119,7 +143,15 @@ class DeepStreamMetadataProcessManager:
         self._stream_session_id = stream_session_id
         self._width = width
         self._height = height
-        self._container = f"upstream-dsm-{uuid4().hex[:12]}"
+        self._tracker_enabled = tracker_enabled
+        self._tracker_algorithm = tracker_algorithm
+        self._tracker_lib_path = tracker_lib_path
+        self._tracker_width = tracker_width
+        self._tracker_height = tracker_height
+        # ``upstream-dst-`` distinguishes tracker-probe containers from
+        # metadata-probe ones (``upstream-dsm-``) in `docker ps`.
+        prefix = "upstream-dst" if tracker_enabled else "upstream-dsm"
+        self._container = f"{prefix}-{uuid4().hex[:12]}"
         self._work_dir: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._returncode: int | None = None
@@ -132,16 +164,26 @@ class DeepStreamMetadataProcessManager:
 
     def _prepare_work_dir(self) -> Path:
         model_dir = resolve_model_dir(self._model)  # may raise ValueError
+        if self._tracker_enabled:
+            # Validate the tracker algorithm up-front so a typo posts
+            # ``failed`` cleanly rather than failing inside the container.
+            build_tracker_config(self._tracker_algorithm)
         base = self._output_base_dir.strip() or None
         if base is not None:
             Path(base).mkdir(parents=True, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix="upstream-p2-meta.", dir=base))
+        prefix = "upstream-p3-tracker." if self._tracker_enabled else "upstream-p2-meta."
+        work = Path(tempfile.mkdtemp(prefix=prefix, dir=base))
         pgie_path = work / "pgie.txt"
         engine_path = work / "trafficcamnet_b1_gpu0_int8.engine"
         pgie_path.write_text(
             build_pgie_config(model_dir=model_dir, engine_path=str(engine_path)),
             encoding="utf-8",
         )
+        if self._tracker_enabled:
+            (work / "tracker_config.yml").write_text(
+                build_tracker_config(self._tracker_algorithm),
+                encoding="utf-8",
+            )
         # Copy (not symlink) the pyds app into the work dir so the
         # container, which bind-mounts only the work dir, can read it.
         shutil.copy(_PYDS_APP_PATH, work / "pyds_metadata_app.py")
@@ -172,16 +214,21 @@ class DeepStreamMetadataProcessManager:
             sample_limit=self._sample_limit,
             stream_session_id=self._stream_session_id,
             rtsp_url=self._rtsp_url,
+            tracker_enabled=self._tracker_enabled,
+            tracker_lib_path=self._tracker_lib_path,
+            tracker_width=self._tracker_width,
+            tracker_height=self._tracker_height,
         )
 
     async def start(self) -> None:
         self._work_dir = self._prepare_work_dir()
         argv = self.command()
         _log.info(
-            "deepstream metadata start: image=%s network=%s model=%s url=%s",
+            "deepstream metadata start: image=%s network=%s model=%s tracker=%s url=%s",
             self._image,
             self._network,
             self._model,
+            "on" if self._tracker_enabled else "off",
             redact_rtsp(self._rtsp_url),  # never log the real URL
         )
         self._proc = await asyncio.create_subprocess_exec(
