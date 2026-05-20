@@ -4,6 +4,68 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-19 - P2: MetadataSource Protocol + bounded bridge queue (app/ seam)
+
+### Summary
+Promotes the neutral metadata shape proven by the manual pyds probe into
+typed `app/`-side abstractions: pydantic models, a thread-safe bounded
+queue with explicit drop policy, and an async-iterable `MetadataSource`
+Protocol. Pure code, no GPU/Docker/live-stream test required. No pyds, gi,
+or Gst imports in `app/` or tests. **NO observations, NO API writes, NO
+runtime-worker pyds integration yet** — those land in the next milestones.
+
+### What changed
+- `app/observations/metadata_models.py` (new) — pydantic v2 models
+  (`extra="forbid"`): `BoundingBoxPixels`, `BoundingBoxNormalized`,
+  `NeutralObjectMetadata` (class_id / label? / confidence? / bbox_pixels?
+  / bbox_normalized? / tracker_id?: str), `NeutralFrame` (NonNegativeInt
+  frame_num / width / height / optional timestamp), `NeutralFrameMetadata`
+  (runtime / metadata_source / optional stream_session_id / frame /
+  objects[] / source + debug dicts). Helpers: `bbox_normalized_from_pixels`
+  (same rounding as the manual probe) and `tracker_id_from_pyds`
+  (`UNTRACKED_OBJECT_ID -> None`, else stringify uint64). The models accept
+  the EXACT dict the manual probe emitted live (asserted by test).
+- `app/observations/bridge_queue.py` (new) — `BoundedBridgeQueue` +
+  `DropPolicy` (DROP_NEWEST / DROP_OLDEST) + `BridgeQueueStats`. Producer
+  side `put_from_thread` is thread-safe and non-blocking (returns bool);
+  consumer side `get` is awaitable, returns `NeutralFrameMetadata | None`.
+  Internal `queue.Queue` (unbounded slot; maxsize gated under
+  `threading.Lock` so DROP_OLDEST can evict atomically) + `asyncio.to_thread`
+  for the async path + a close sentinel to wake waiting consumers.
+  Designed for a single async consumer (out of scope: fan-out).
+- `app/runtimes/metadata_source.py` (new) — `MetadataSource` Protocol
+  (`@runtime_checkable`, `__aiter__ -> AsyncIterator[NeutralFrameMetadata]`)
+  + `BridgeQueueMetadataSource` (canonical impl wrapping the queue).
+- `tests/test_metadata_models.py` (new, 12 tests), `tests/test_bridge_queue.py`
+  (new, 13 tests), `tests/test_metadata_source.py` (new, 6 tests): pydantic
+  shape/extra/blank-runtime validation, JSON round-trip, both drop
+  policies, close-wakes-on-empty, async-wakes-on-late-put, real
+  threading.Thread producer + slow asyncio consumer with bounded memory
+  and FIFO order, Protocol conformance.
+- Docs: architecture.md (P2 `app/` seam section), local-dev.md (developer
+  pointer), this entry.
+
+### Not changed
+NO `app/` runtime worker pyds integration. NO pad probe in `app/`. NO
+ObservationWriter integration. NO `POST /observations`. NO nvtracker, no
+nvdsanalytics, no line crossing, no zone analytics, no dashboard, no
+rules, no Triton, no API contract change. The DeepStream worker
+(decode_probe + inference_probe) is unchanged. The manual P2 pyds probe in
+`scripts/` is unchanged (it stays runtime-independent of `app/`).
+
+### Testing/checks
+`uv run pytest -q` **111 passed** (79 prior + 32 new). `ruff check`,
+`ruff format --check`, `mypy app`, `bash -n scripts/*.sh` — all clean. No
+Docker/GPU/pyds/gi imports anywhere in tests.
+
+### Follow-up TODOs
+- **P2 — supervisor-managed metadata probe worker**: use the proven manual
+  pyds probe path PLUS this MetadataSource/BridgeQueue seam under the real
+  processor supervisor lifecycle. Still no observations, no API writes.
+- Later: P3 (package / config generator) and P4 (observation adapter).
+
+---
+
 ## 2026-05-19 - P2: manual DeepStream pyds metadata probe (live-verified)
 
 ### Summary
