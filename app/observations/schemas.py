@@ -40,6 +40,18 @@ ObservationType = Literal[
     # NOT emit zone_exited.
     "processor.zone_entered",
     "processor.zone_exited",
+    # P4-E: dwell observations. Built on top of P4-D's stable zone
+    # membership. ``dwell_started`` fires once when ZoneMembershipState
+    # commits a stable enter; ``dwell_updated`` emits every
+    # ``UPSTREAM_DEEPSTREAM_DWELL_UPDATE_INTERVAL_SECONDS`` while the
+    # tracked object remains inside; ``dwell_exceeded`` fires once
+    # when the dwell duration crosses
+    # ``UPSTREAM_DEEPSTREAM_DWELL_EXCEEDED_THRESHOLD_SECONDS``. The
+    # session closes on the matching zone_exited (or never, mirroring
+    # the disappearance-does-not-emit invariant from P4-D).
+    "processor.dwell_started",
+    "processor.dwell_updated",
+    "processor.dwell_exceeded",
 ]
 
 OBSERVATION_TYPES: tuple[ObservationType, ...] = (
@@ -50,6 +62,9 @@ OBSERVATION_TYPES: tuple[ObservationType, ...] = (
     "processor.roi_occupancy",
     "processor.zone_entered",
     "processor.zone_exited",
+    "processor.dwell_started",
+    "processor.dwell_updated",
+    "processor.dwell_exceeded",
 )
 
 

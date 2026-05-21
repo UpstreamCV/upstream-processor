@@ -118,9 +118,9 @@ Files:
     `DeepStreamMetadataProcessManager.stop()` and `_cleanup_work_dir()`
     are idempotent.
 
-**P4-B / P4-C / P4-D widen this:** the `analytics_probe` mode now
-emits **four** real DeepStream-backed observation types via the
-existing `ObservationWriter`:
+**P4-B / P4-C / P4-D / P4-E widen this:** the `analytics_probe`
+mode now emits **seven** real DeepStream-backed observation types
+via the existing `ObservationWriter`:
 
 - `processor.line_crossing` (P4-B) — one per `objLCCumCnt`
   increment. Event-style; no policy gating needed.
@@ -145,12 +145,24 @@ existing `ObservationWriter`:
   only an observed-with-no-label trajectory does. Sequence is
   per-(track, zone, transition-type) so re-enter / re-exit
   produce distinct events with monotonic sequence numbers.
+- `processor.dwell_started` / `processor.dwell_updated` /
+  `processor.dwell_exceeded` (P4-E) — time-based observations
+  layered on P4-D's stable zone membership. ``dwell_started``
+  fires immediately after the matching ``zone_entered``.
+  ``dwell_updated`` emits every
+  `UPSTREAM_DEEPSTREAM_DWELL_UPDATE_INTERVAL_SECONDS`
+  (default 30s) while the track stays inside. ``dwell_exceeded``
+  fires once when the duration crosses
+  `UPSTREAM_DEEPSTREAM_DWELL_EXCEEDED_THRESHOLD_SECONDS`
+  (default 60s). The session closes on ``zone_exited`` (re-enter
+  starts a new ``dwell_session_id`` with a fresh threshold). No
+  ``dwell_ended`` event in P4-E.
 
 The ``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
 ``tracker_probe`` modes remain observation-free. The pyds
 container still does not call the UpStream API; the adapters +
 writer run in the host asyncio consumer loop. Everything else is
-still deferred: **no dwell observations yet, no
+still deferred: **no
 direction/track-update/telemetry types, no rules/events, no
 dashboard-driven geometry, no Triton.** KITTI / `UPSTREAM_METADATA` output is debug evidence —
 *not* final metadata extraction. The webhook secret never enters the pyds container

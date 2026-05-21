@@ -69,6 +69,12 @@ def fast_settings():  # type: ignore[no-untyped-def]
             # exercise the per-(track, zone) debounce explicitly
             # override.
             "deepstream_zone_membership_stability_frames": 1,
+            # P4-E: production defaults are 30s update interval and 60s
+            # exceeded threshold. Sub-second values keep dwell behavior
+            # exercisable without sleeping; specific tests override to
+            # exact wall-clock values via ``model_copy``.
+            "deepstream_dwell_update_interval_seconds": 0.05,
+            "deepstream_dwell_exceeded_threshold_seconds": 0.10,
         }
     )
 

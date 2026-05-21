@@ -212,6 +212,23 @@ class Settings(BaseSettings):
     # milestone. Values are validated at adapter construction.
     deepstream_analytics_class_ids: str = "all"
 
+    # --- P4-E dwell emission policy ----------------------------------
+    # ``dwell_update_interval_seconds`` is the periodic cadence for
+    # processor.dwell_updated. Default 30s matches the P4-C ROI
+    # occupancy heartbeat cadence (operationally the same idea: keep
+    # the observation stream alive on a slow scale without flooding).
+    # Tests override via ``fast_settings``; live verification typically
+    # uses 5-10s. Must be > 0.
+    deepstream_dwell_update_interval_seconds: float = 30.0
+
+    # ``dwell_exceeded_threshold_seconds`` is the duration after which
+    # processor.dwell_exceeded fires once per session. Default 60s;
+    # live verification typically uses 10-15s. Must be > 0. Setting
+    # this lower than ``update_interval_seconds`` is supported but
+    # means dwell_exceeded fires before any dwell_updated has been
+    # emitted for that session.
+    deepstream_dwell_exceeded_threshold_seconds: float = 60.0
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
