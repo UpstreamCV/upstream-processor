@@ -110,3 +110,22 @@ def test_deepstream_metadata_probe_env_overridable(monkeypatch) -> None:  # type
     assert s.deepstream_metadata_queue_maxsize == 512
     assert s.deepstream_metadata_queue_drop_policy == "drop_oldest"
     assert s.deepstream_metadata_sample_limit == 8
+
+
+def test_perception_snapshot_defaults() -> None:
+    # P5-C: enabled by default, ~1/s, 50-object cap.
+    s = get_settings()
+    assert s.perception_snapshot_enabled is True
+    assert s.perception_snapshot_interval_seconds == 1.0
+    assert s.perception_snapshot_max_objects == 50
+
+
+def test_perception_snapshot_env_overridable(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("UPSTREAM_PERCEPTION_SNAPSHOT_ENABLED", "false")
+    monkeypatch.setenv("UPSTREAM_PERCEPTION_SNAPSHOT_INTERVAL_SECONDS", "2.5")
+    monkeypatch.setenv("UPSTREAM_PERCEPTION_SNAPSHOT_MAX_OBJECTS", "10")
+    get_settings.cache_clear()
+    s = Settings()  # type: ignore[call-arg]
+    assert s.perception_snapshot_enabled is False
+    assert s.perception_snapshot_interval_seconds == 2.5
+    assert s.perception_snapshot_max_objects == 10

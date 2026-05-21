@@ -26,7 +26,9 @@ import contextlib
 import logging
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from app.redact import redact_rtsp
@@ -238,6 +240,117 @@ def normalize_analytics_class_ids(class_ids: str) -> str:
     return raw
 
 
+@dataclass(frozen=True)
+class GeometryPoint:
+    """One pixel-coordinate vertex (origin top-left)."""
+
+    x: int
+    y: int
+
+    def to_json(self) -> dict[str, int]:
+        return {"x": self.x, "y": self.y}
+
+
+@dataclass(frozen=True)
+class RoiGeometry:
+    """One analytics ROI as an ordered polygon (clockwise from top-left)."""
+
+    id: str
+    label: str
+    points: list[GeometryPoint]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "points": [p.to_json() for p in self.points],
+        }
+
+
+@dataclass(frozen=True)
+class LineGeometry:
+    """One crossing line as its two segment endpoints. The nvdsanalytics
+    direction-reference points are an LC implementation detail and are
+    deliberately excluded — a dashboard draws only the segment."""
+
+    id: str
+    label: str
+    points: list[GeometryPoint]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "points": [p.to_json() for p in self.points],
+        }
+
+
+@dataclass(frozen=True)
+class AnalyticsGeometry:
+    """The ROI/line geometry the analytics probe is configured with — the
+    single source shared by ``build_analytics_config`` (the nvdsanalytics
+    INI) and the P5-C perception-snapshot builder."""
+
+    rois: list[RoiGeometry]
+    lines: list[LineGeometry]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "rois": [r.to_json() for r in self.rois],
+            "lines": [line.to_json() for line in self.lines],
+        }
+
+
+def compute_analytics_geometry(
+    *,
+    frame_width: int = 1280,
+    frame_height: int = 720,
+    roi_margin_pct: float = 0.05,
+    roi_label: str = _DEFAULT_ROI_LABEL,
+    line_label: str = _DEFAULT_LINE_LABEL,
+) -> AnalyticsGeometry:
+    """The v0 analytics geometry: one near-full-frame ROI + one horizontal
+    crossing line. Pure / side-effect free. Single source of the geometry
+    numbers — ``build_analytics_config`` renders them into the nvdsanalytics
+    INI, and the P5-C perception-snapshot builder serializes them as JSON for
+    the dashboard overlay."""
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError(
+            f"frame_width and frame_height must be > 0; got {frame_width}x{frame_height}"
+        )
+    if not roi_label or not line_label:
+        raise ValueError("roi_label and line_label must be non-empty")
+    if not 0.0 <= roi_margin_pct < 0.5:
+        raise ValueError(f"roi_margin_pct must be in [0.0, 0.5); got {roi_margin_pct}")
+    # Near-full-frame ROI: default ``margin=0.05`` → 5%..95% on both axes.
+    # Polygon points clockwise from top-left as nvdsanalytics expects.
+    rx0 = int(frame_width * roi_margin_pct)
+    rx1 = int(frame_width * (1.0 - roi_margin_pct))
+    ry0 = int(frame_height * roi_margin_pct)
+    ry1 = int(frame_height * (1.0 - roi_margin_pct))
+    roi = RoiGeometry(
+        id=roi_label,
+        label=roi_label,
+        points=[
+            GeometryPoint(rx0, ry0),
+            GeometryPoint(rx1, ry0),
+            GeometryPoint(rx1, ry1),
+            GeometryPoint(rx0, ry1),
+        ],
+    )
+    # Horizontal line across the middle of the ROI — the two segment
+    # endpoints only (the LC direction-reference points stay INI-side).
+    line_y = frame_height // 2
+    lx0 = int(frame_width * 0.25)
+    lx1 = int(frame_width * 0.75)
+    line = LineGeometry(
+        id=line_label,
+        label=line_label,
+        points=[GeometryPoint(lx0, line_y), GeometryPoint(lx1, line_y)],
+    )
+    return AnalyticsGeometry(rois=[roi], lines=[line])
+
+
 def build_analytics_config(
     *,
     frame_width: int = 1280,
@@ -269,35 +382,28 @@ def build_analytics_config(
     Geometry tuning for specific scenes is out of scope for v0; this
     config exists to prove the analytics extraction path, not to ship
     production zones."""
-    if frame_width <= 0 or frame_height <= 0:
-        raise ValueError(
-            f"frame_width and frame_height must be > 0; got {frame_width}x{frame_height}"
-        )
-    if not roi_label or not line_label:
-        raise ValueError("roi_label and line_label must be non-empty")
-    if not 0.0 <= roi_margin_pct < 0.5:
-        raise ValueError(f"roi_margin_pct must be in [0.0, 0.5); got {roi_margin_pct}")
+    geometry = compute_analytics_geometry(
+        frame_width=frame_width,
+        frame_height=frame_height,
+        roi_margin_pct=roi_margin_pct,
+        roi_label=roi_label,
+        line_label=line_label,
+    )
     class_id_value = normalize_analytics_class_ids(class_ids)
-    # Near-full-frame ROI: default ``margin=0.05`` → 5%..95% on both
-    # axes (covers 90% x 90% of the frame area). Polygon points are
-    # clockwise from top-left as nvdsanalytics expects.
-    rx0 = int(frame_width * roi_margin_pct)
-    rx1 = int(frame_width * (1.0 - roi_margin_pct))
-    ry0 = int(frame_height * roi_margin_pct)
-    ry1 = int(frame_height * (1.0 - roi_margin_pct))
-    roi_points = f"{rx0};{ry0};{rx1};{ry0};{rx1};{ry1};{rx0};{ry1}"
-    # Horizontal line across the middle of the ROI. nvdsanalytics LC
-    # requires 4 (line-segment) + 2 (direction reference) point pairs:
-    # line_x0;line_y0;line_x1;line_y1;dir_x0;dir_y0;dir_x1;dir_y1
-    line_y = frame_height // 2
-    lx0 = int(frame_width * 0.25)
-    lx1 = int(frame_width * 0.75)
-    # Direction reference points: from above the line to below, so
-    # "downwards" trips the crossing event.
+    # ROI polygon — clockwise from top-left (see compute_analytics_geometry).
+    roi_points = ";".join(f"{p.x};{p.y}" for p in geometry.rois[0].points)
+    # nvdsanalytics LC requires the 2 line-segment endpoints PLUS 2 direction-
+    # reference point pairs: line_x0;line_y0;line_x1;line_y1;dir_x0;dir_y0;dir_x1;dir_y1.
+    # Direction reference points (from above the line to below, so "downwards"
+    # trips the crossing) are an LC detail kept here, not in the geometry.
+    line_points = geometry.lines[0].points
+    line_y = line_points[0].y
     dir_x = frame_width // 2
     dir_y0 = max(0, line_y - 80)
     dir_y1 = min(frame_height - 1, line_y + 80)
-    lc_points = f"{lx0};{line_y};{lx1};{line_y};{dir_x};{dir_y0};{dir_x};{dir_y1}"
+    lc_points = (
+        ";".join(f"{p.x};{p.y}" for p in line_points) + f";{dir_x};{dir_y0};{dir_x};{dir_y1}"
+    )
     return (
         "[property]\n"
         "enable=1\n"

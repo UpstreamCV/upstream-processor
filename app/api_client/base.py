@@ -15,6 +15,10 @@ from app.observations.schemas import (
     ProcessorStatusPayload,
     ProcessorStatusResponse,
 )
+from app.perception.schemas import (
+    PerceptionSnapshotPayload,
+    PerceptionSnapshotResponse,
+)
 
 
 class ProcessorApi(Protocol):
@@ -25,5 +29,9 @@ class ProcessorApi(Protocol):
     ) -> ProcessorStatusResponse: ...
 
     async def post_observation(self, observation: ObservationPayload) -> ObservationResponse: ...
+
+    async def post_perception_snapshot(
+        self, payload: PerceptionSnapshotPayload
+    ) -> PerceptionSnapshotResponse: ...
 
     async def aclose(self) -> None: ...

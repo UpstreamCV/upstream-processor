@@ -56,10 +56,13 @@ from app.observations.observation_adapter import (
 from app.observations.schemas import EligibleSession
 from app.observations.writer import ObservationWriter
 from app.packages.resolver import PackageSpec
+from app.perception.builder import build_perception_snapshot
+from app.perception.schemas import PerceptionSnapshotPayload
 from app.redact import redact_rtsp, scrub_rtsp_in_text
 from app.runtimes.base import Runtime, WorkerState
 from app.runtimes.deepstream_runtime.inference import (
     DeepStreamInferenceProcessManager,
+    compute_analytics_geometry,
 )
 from app.runtimes.deepstream_runtime.metadata_probe import (
     DeepStreamMetadataProcessManager,
@@ -217,6 +220,12 @@ class _MetadataCounters:
     dwell_write_errors: int = 0
     observation_write_errors: int = 0
     last_observation_at: datetime | None = None
+    # P5-C perception-snapshot counters. Deliberately separate from the
+    # observation counters above — perception is a dedicated latest-state
+    # path that posts directly via the API client, not the writer.
+    perception_snapshots_posted: int = 0
+    perception_snapshot_write_errors: int = 0
+    last_perception_snapshot_at: datetime | None = None
 
     def absorb(self, frame: NeutralFrameMetadata) -> None:
         self.frames_seen += 1
@@ -841,6 +850,25 @@ class DeepStreamWorker(Runtime):
                 )
             else:
                 p["observations_enabled"] = False
+            # P5-C: perception-snapshot counters. Independent of the writer
+            # (perception posts directly via the API client), so surfaced
+            # whenever the analytics mode is active. ``_enabled`` lets an
+            # operator tell "off by config" apart from "on but nothing
+            # posted yet".
+            p["perception_snapshots_enabled"] = bool(self._settings.perception_snapshot_enabled)
+            if self._settings.perception_snapshot_enabled:
+                p["perception_snapshots_posted"] = counters.perception_snapshots_posted
+                p["perception_snapshot_write_errors_count"] = (
+                    counters.perception_snapshot_write_errors
+                )
+                p["perception_snapshot_interval_seconds"] = float(
+                    self._settings.perception_snapshot_interval_seconds
+                )
+                p["last_perception_snapshot_at"] = (
+                    counters.last_perception_snapshot_at.isoformat()
+                    if counters.last_perception_snapshot_at is not None
+                    else None
+                )
         if last_app_summary is not None:
             p["app_summary"] = last_app_summary
         return p
@@ -975,6 +1003,22 @@ class DeepStreamWorker(Runtime):
             if observations_enabled
             else {}
         )
+        # P5-C: low-rate latest perception snapshot. Analytics mode only;
+        # does NOT require a writer (perception posts directly via the API
+        # client). The ROI/line geometry is frame-size-invariant for the
+        # session, so it is computed once here and reused every snapshot.
+        perception_enabled = (
+            self._mode == _ANALYTICS_MODE and self._settings.perception_snapshot_enabled
+        )
+        perception_geometry: dict[str, Any] = (
+            compute_analytics_geometry(
+                frame_width=self._session.approved.width,
+                frame_height=self._session.approved.height,
+                roi_margin_pct=self._settings.deepstream_analytics_roi_margin_pct,
+            ).to_json()
+            if perception_enabled
+            else {}
+        )
 
         async def _reader() -> None:
             assert self._pm is not None
@@ -1022,6 +1066,7 @@ class DeepStreamWorker(Runtime):
 
         async def _consumer() -> None:
             last_proc_post = 0.0
+            last_perception_post = 0.0
             attached = False
             processing = False
             async for frame in source:
@@ -1062,6 +1107,22 @@ class DeepStreamWorker(Runtime):
                         source_block=source_block,
                         counters=counters,
                     )
+                # P5-C: low-rate latest perception snapshot. Posted AFTER
+                # the observation emits so a perception failure can never
+                # disturb the observation path. At most once per interval;
+                # the first qualifying frame posts immediately.
+                if perception_enabled:
+                    now_mono = time.monotonic()
+                    if (
+                        now_mono - last_perception_post
+                        >= self._settings.perception_snapshot_interval_seconds
+                    ):
+                        last_perception_post = now_mono
+                        await self._emit_perception_snapshot(
+                            frame=frame,
+                            geometry=perception_geometry,
+                            counters=counters,
+                        )
                 if not attached:
                     attached = True
                     self._state = WorkerState.ATTACHED
@@ -1117,6 +1178,67 @@ class DeepStreamWorker(Runtime):
                 )
             finally:
                 self._metadata_queue = None
+
+    # --- P5-C: low-rate latest perception snapshot -----------------------
+
+    async def _emit_perception_snapshot(
+        self,
+        *,
+        frame: NeutralFrameMetadata,
+        geometry: dict[str, Any],
+        counters: _MetadataCounters,
+    ) -> None:
+        """Build + POST one latest perception snapshot.
+
+        Best-effort, and deliberately broader than the observation emits: a
+        perception failure must NEVER crash the consumer loop or disturb the
+        observation path. ``ApiSessionGoneError`` still propagates (the
+        session is gone — end the worker quietly via the outer handler);
+        every other error (transient API, contract drift, or a defensive
+        builder edge case) is counted and swallowed.
+
+        Unlike the observation emits this does NOT go through
+        ``ObservationWriter`` — a perception snapshot is not an observation;
+        it posts directly to the dedicated perception-snapshot endpoint.
+        """
+        observed_at = frame.frame.timestamp or now_utc()
+        try:
+            snapshot = build_perception_snapshot(
+                metadata=frame,
+                geometry=geometry,
+                camera_id=self._session.camera_id,
+                stream_session_id=self._session.session_id,
+                processor_id=self._settings.processor_id,
+                package_id=self._package.package_id,
+                runtime="deepstream",
+                metadata_source="pyds_pad_probe",
+                analytics_plugin="nvdsanalytics",
+                tracker_algorithm=self._settings.deepstream_tracker_algorithm,
+                observed_at=observed_at,
+                max_objects=self._settings.perception_snapshot_max_objects,
+            )
+            await self._api.post_perception_snapshot(
+                PerceptionSnapshotPayload(
+                    stream_session_id=self._session.session_id,
+                    processor_id=self._settings.processor_id,
+                    package_id=self._package.package_id,
+                    observed_at=observed_at,
+                    snapshot=snapshot,
+                )
+            )
+        except ApiSessionGoneError:
+            # Session gone — propagate so the outer run() handler ends quietly.
+            raise
+        except Exception as exc:
+            counters.perception_snapshot_write_errors += 1
+            _log.warning(
+                "perception snapshot post failed for %s: %s",
+                self.session_id,
+                exc,
+            )
+            return
+        counters.perception_snapshots_posted += 1
+        counters.last_perception_snapshot_at = observed_at
 
     # --- P4-B: per-frame line-crossing emission --------------------------
 
