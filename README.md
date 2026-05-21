@@ -216,13 +216,15 @@ UPSTREAM_PROCESSOR_ID=proc_p35_analytics_live \
 uv run upstream-processor
 ```
 
-## P4-B + P4-C + P4-D scope (four DeepStream-backed observation types)
+## P4-B + P4-C + P4-D + P4-E scope (seven DeepStream-backed observation types)
 
 - The api-server's `ProcessorObservationType` Literal is widened to
   include `processor.line_crossing` (P4-B),
-  `processor.roi_occupancy` (P4-C), `processor.zone_entered`
-  (P4-D), and `processor.zone_exited` (P4-D). No DB migration; all
-  other observation types stay rejected at the schema layer.
+  `processor.roi_occupancy` (P4-C), `processor.zone_entered` /
+  `processor.zone_exited` (P4-D), and `processor.dwell_started` /
+  `processor.dwell_updated` / `processor.dwell_exceeded` (P4-E).
+  No DB migration; all other observation types stay rejected at
+  the schema layer.
 - `DeepStreamWorker` (analytics mode only) instantiates a
   `LineCrossingState`, a `RoiOccupancyState`, AND a
   `ZoneMembershipState` per session. Each adapter state is fed by

@@ -1592,3 +1592,181 @@ Live evidence:
   (needs per-class sections).
 - Dwell observations (P4-E).
 - Server-side idempotency.
+
+## P4-E — Dwell Observations
+
+### Goal
+Layer time-based observations on top of P4-D's stable zone
+membership. When a tracked object enters a zone, emit
+``processor.dwell_started`` immediately. Emit
+``processor.dwell_updated`` periodically while the object remains
+inside. Emit ``processor.dwell_exceeded`` once when the dwell
+duration crosses a configured threshold.
+
+### Lockstep schema widening (no DB migration)
+- **upstream-api-server**:
+  ``src/upstream_api/schemas/processor.py`` — ``ProcessorObservationType``
+  Literal gains the three dwell strings.
+  ``tests/test_processor.py`` adds three pinned positive tests
+  and re-aims ``test_future_observation_types_still_rejected``
+  at track / direction / telemetry / debug.
+- **upstream-processor**:
+  ``app/observations/schemas.py`` widens
+  ``ObservationType`` Literal + ``OBSERVATION_TYPES`` tuple.
+  ``app/observations/observation_taxonomy.py`` flips the three
+  rows (``dwell_started`` / ``dwell_updated`` / ``dwell_exceeded``)
+  from ``deferred`` to ``api_supported``.
+
+### Adapter design — ``DwellState``
+**File:** ``app/observations/observation_adapter.py``.
+
+New constants ``CANDIDATE_DWELL_STARTED_TYPE`` /
+``CANDIDATE_DWELL_UPDATED_TYPE`` /
+``CANDIDATE_DWELL_EXCEEDED_TYPE`` join the CANDIDATE tuple. A
+single frozen dataclass ``DwellEvent`` covers all three variants;
+``type`` selects the Literal at the writer. Optional fields
+``update_sequence`` (dwell_updated only) and ``threshold_seconds``
+(dwell_exceeded only) are omitted from the other variants'
+payloads. Three idempotency key builders pin the wire contract:
+
+  - ``sess:<id>:processor.dwell_started:<zone>:<track>:<dwell_session_id>``
+  - ``sess:<id>:processor.dwell_updated:<zone>:<track>:<dwell_session_id>:<update_sequence>``
+  - ``sess:<id>:processor.dwell_exceeded:<zone>:<track>:<dwell_session_id>:<int(threshold)>``
+
+The ``dwell_session_id`` is
+``<zone>:<track>:<zone_entered.sequence>`` — re-entering a zone
+produces a NEW session id with sequence=2 (then 3, 4, …) so the
+exceeded threshold can fire again in the new session.
+
+**State per (track_id, zone_id):**
+
+- ``_ActiveDwell.dwell_session_id`` — committed session id.
+- ``_ActiveDwell.started_at`` — anchored to the zone_entered's
+  ``occurred_at`` (NOT now).
+- ``_ActiveDwell.last_update_at`` — for the update interval gate.
+- ``_ActiveDwell.update_sequence`` — increments per dwell_updated
+  emit; rides in the payload and the idempotency key.
+- ``_ActiveDwell.exceeded_emitted`` — single-shot guard.
+
+**Inputs:**
+
+- ``absorb_zone_event(zone_event)`` — called by the worker after
+  ZoneMembershipState commits a transition. ``zone_entered``
+  starts the session (idempotent — a duplicate zone_entered does
+  NOT emit a second dwell_started); ``zone_exited`` closes the
+  session silently (no ``dwell_ended`` event in P4-E).
+- ``tick(occurred_at)`` — called once per frame after the zone
+  transitions are processed. Emits ``dwell_updated`` when
+  ``occurred_at - last_update_at >= update_interval_seconds`` and
+  ``dwell_exceeded`` (once) when ``occurred_at - started_at >=
+  exceeded_threshold_seconds``.
+
+### Crucial invariants
+- **Object disappearance does NOT close the dwell session.** Same
+  rationale as P4-D's zone disappearance invariant: a tracker
+  drop-frame can't be distinguished from a real exit, so we only
+  close on the explicit ``zone_exited``. The session can therefore
+  outlive the visible track; the worker restart on the supervisor
+  cycle is the only forced close.
+- **``dwell_exceeded`` is single-shot per session.** Once
+  ``exceeded_emitted=True``, no more exceeded events fire even if
+  the track stays in the zone forever. A re-enter starts a NEW
+  ``dwell_session_id`` with ``exceeded_emitted=False``.
+- **``update_sequence`` advances per emit, not per tick.** A 30s
+  update interval with a tick at 35s emits seq=1; a tick at 50s
+  (only 15s since last emit) does NOT fire.
+- **No dwell events without ``track_id``** (already guaranteed by
+  ZoneMembershipState's input filter).
+- **Started anchor.** ``started_at`` is the ``zone_entered``'s
+  ``occurred_at``, not ``now`` — keeps the duration math identical
+  in tests and live.
+
+### Worker integration
+``DeepStreamWorker._drive_metadata_probe`` instantiates
+``dwell_state`` alongside ``line_state`` / ``roi_state`` /
+``zone_state`` when analytics mode is active and a writer is
+wired. The consumer loop is now:
+
+1. Line crossing emit.
+2. ROI occupancy emit.
+3. Zone transition emit. After each successful ``zone_entered`` /
+   ``zone_exited`` emit, the worker calls
+   ``dwell_state.absorb_zone_event(event)`` and writes any
+   returned ``dwell_started`` events through the writer.
+4. **Dwell tick.** ``dwell_state.tick(occurred_at)`` is called
+   per frame (gated on ``active_session_count() > 0``);
+   ``dwell_updated`` and ``dwell_exceeded`` events fire from
+   here.
+
+A new single-event helper ``_emit_one_dwell_event`` is shared
+between the zone-event-driven path and the per-frame tick path
+so the error handling lives in one place: ``ApiSessionGoneError``
+propagates; ``ApiValidationError`` / ``TRANSIENT_API_ERRORS`` are
+logged + counted (both into the shared ``observation_write_errors``
+counter AND into a P4-E-specific ``dwell_write_errors`` so an
+operator can grep the dwell path independently); the worker
+continues.
+
+### Settings + env
+- ``deepstream_dwell_update_interval_seconds: float = 30.0``
+  (env: ``UPSTREAM_DEEPSTREAM_DWELL_UPDATE_INTERVAL_SECONDS``).
+  Must be > 0. Tests / live verification typically use
+  sub-second / 5-10s values.
+- ``deepstream_dwell_exceeded_threshold_seconds: float = 60.0``
+  (env: ``UPSTREAM_DEEPSTREAM_DWELL_EXCEEDED_THRESHOLD_SECONDS``).
+  Must be > 0. Live verification uses 10-15s for visibility.
+- ``tests/conftest.py`` ``fast_settings`` overrides both to
+  sub-second values for fast tests.
+
+### Status payload diagnostics
+The analytics-mode status payload gains:
+
+- ``dwell_observations_enabled`` (always True when writer + mode).
+- ``dwell_started_observations_emitted``,
+  ``dwell_updated_observations_emitted``,
+  ``dwell_exceeded_observations_emitted`` — per-type counters.
+- ``dwell_write_errors_count`` — dwell-specific writer-error
+  counter (the shared
+  ``observation_write_errors_count`` also advances).
+- ``dwell_update_interval_seconds`` /
+  ``dwell_exceeded_threshold_seconds`` — operator-visible
+  configuration values for triage.
+
+### Coverage
+- ``tests/test_dwell_state.py`` — **25 pure-adapter tests** for
+  validation, dwell_started semantics, duplicate-enter guard,
+  update interval cadence, exceeded single-shot, zone_exited
+  closes session, no updates / exceeded after exit, re-enter
+  starts new dwell_session_id, multi-track / multi-zone
+  independence, payload shape (class_id / class_label preserved
+  + None handling, duration rounded to 2 dp), idempotency key
+  format (no frame_num), top-level runtime-neutral, optional
+  field exclusivity (update_sequence only on updated,
+  threshold_seconds only on exceeded).
+- ``tests/test_deepstream_dwell_emit.py`` — **15 worker
+  integration tests**: schema lock-step, dwell_started on
+  zone_entered, dwell_updated at interval, dwell_exceeded once,
+  no dwell without zone membership, no dwell without tracker_id,
+  zone_exited closes session, re-enter starts new session_id,
+  writer=None silent, metadata/tracker modes don't emit,
+  transient ApiServerError raises shared+dwell counters without
+  crashing, status payload exposes counters + config, status
+  payload distinguishes the three counters after a full cycle.
+
+### What this milestone did NOT change
+- ``LineCrossingState`` / ``RoiOccupancyState`` / ``ZoneMembershipState``
+  (no semantic changes).
+- ``processor.line_crossing`` / ``processor.roi_occupancy`` /
+  ``processor.zone_entered`` / ``processor.zone_exited`` emit
+  paths (unchanged).
+- DB schema (no migration).
+- Pyds metadata app (no change; reuses P3.5 surface).
+- Tracker / inference config.
+
+### Out of scope (P4-F+)
+- ``processor.dwell_ended`` (intentionally not introduced;
+  zone_exited carries the same signal).
+- Server-side ``idempotency_key`` column + UNIQUE constraint.
+- Per-zone configurable dwell thresholds (one global setting).
+- Dashboard-driven dwell thresholds.
+- Direction / track-update / telemetry types.

@@ -57,17 +57,16 @@ def test_roi_occupancy_now_in_observation_types_tuple() -> None:
 
 
 def test_future_event_types_still_unsupported() -> None:
-    """P4-D widened the whitelist with zone_entered + zone_exited (the
-    test file's name predates P4-D; the remaining future types are
-    dwell variants, direction, track types, telemetry). The two
-    zone types are intentionally NOT in this list anymore."""
+    """P4-E widened the whitelist with the three dwell types. The
+    remaining future types are direction, track types, telemetry,
+    debug. The dwell types are intentionally NOT in this list."""
     for t in (
-        "processor.dwell_started",
-        "processor.dwell_updated",
-        "processor.dwell_exceeded",
         "processor.direction_detected",
         "processor.track_state",
         "processor.track_update",
+        "processor.detection_seen",
+        "processor.frame_summary",
+        "processor.scene_quality_warning",
     ):
         assert t not in OBSERVATION_TYPES, t
 

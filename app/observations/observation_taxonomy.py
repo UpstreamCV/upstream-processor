@@ -161,9 +161,73 @@ INITIAL_TAXONOMY: tuple[ObservationSpec, ...] = (
         dependencies=("processor.zone_entered",),
     ),
     ObservationSpec(
+        type="processor.dwell_started",
+        category="event",
+        # P4-E: emitted by DwellState immediately after the matching
+        # ZoneMembershipState ``zone_entered``. One event per
+        # (track, zone, enter sequence) — re-entering starts a new
+        # dwell_session_id.
+        status="api_supported",
+        description=(
+            "A tracked object's dwell timer has started in a zone "
+            "(immediately after the matching zone_entered). "
+            "One event per (track, zone, dwell_session)."
+        ),
+        payload_keys=(
+            "zone_id",
+            "zone_label",
+            "track_id",
+            "dwell_session_id",
+            "started_at",
+            "duration_seconds",
+        ),
+        idempotency_key_pattern=(
+            "sess:<session_id>:processor.dwell_started:<zone_id>:<track_id>:<dwell_session_id>"
+        ),
+        source_signal="DwellState.absorb_zone_event(zone_entered)",
+        requires_tracker_id=True,
+        requires_zone_geometry=True,
+        dependencies=("processor.zone_entered",),
+    ),
+    ObservationSpec(
+        type="processor.dwell_updated",
+        category="state",
+        # P4-E: periodic heartbeat while the tracked object remains
+        # inside the zone. Default interval 30s; tests override via
+        # ``fast_settings`` and live verification uses 5-10s.
+        status="api_supported",
+        description=(
+            "Periodic update on an active dwell session (default 30s "
+            "interval). One event per (track, zone, dwell_session, "
+            "update_sequence)."
+        ),
+        payload_keys=(
+            "zone_id",
+            "zone_label",
+            "track_id",
+            "dwell_session_id",
+            "started_at",
+            "duration_seconds",
+            "update_sequence",
+        ),
+        idempotency_key_pattern=(
+            "sess:<session_id>:processor.dwell_updated:"
+            "<zone_id>:<track_id>:<dwell_session_id>:<update_sequence>"
+        ),
+        source_signal="DwellState.tick(...) at interval elapsed",
+        requires_tracker_id=True,
+        requires_zone_geometry=True,
+        dependencies=("processor.zone_entered",),
+    ),
+    ObservationSpec(
         type="processor.dwell_exceeded",
         category="event",
-        status="deferred",
+        # P4-E: fires once when the dwell duration crosses the
+        # configured threshold. The session closes only on the matching
+        # zone_exited (or never, mirroring P4-D's disappearance
+        # invariant); a re-enter starts a NEW dwell_session_id with
+        # a fresh threshold.
+        status="api_supported",
         description=(
             "A tracked object has been inside a zone continuously for "
             "longer than the configured threshold (e.g. 30s / 5min). "
@@ -182,7 +246,7 @@ INITIAL_TAXONOMY: tuple[ObservationSpec, ...] = (
             "sess:<session_id>:processor.dwell_exceeded:"
             "<zone_id>:<track_id>:<dwell_session_id>:<threshold_seconds>"
         ),
-        source_signal="DwellState.update(...) crossing a configured threshold",
+        source_signal="DwellState.tick(...) crossing a configured threshold",
         requires_tracker_id=True,
         requires_zone_geometry=True,
         dependencies=("processor.zone_entered", "processor.zone_exited"),

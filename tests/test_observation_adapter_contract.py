@@ -74,16 +74,20 @@ def test_zone_exited_now_in_server_whitelist() -> None:
     assert "processor.zone_exited" in OBSERVATION_TYPES
 
 
-def test_dwell_track_telemetry_types_still_unsupported() -> None:
-    """P4-D widens exactly two types (zone_entered + zone_exited).
-    The next candidates (dwell variants, direction, track-state /
-    track-update, telemetry) MUST NOT have been accidentally widened —
-    this is the spiritual successor to the P4-C ROI guard, now
-    pointed at the still-deferred types."""
+def test_dwell_types_now_in_server_whitelist() -> None:
+    """P4-E widened the api-server + this repo's whitelist with the
+    three dwell types in lock-step."""
+    assert "processor.dwell_started" in OBSERVATION_TYPES
+    assert "processor.dwell_updated" in OBSERVATION_TYPES
+    assert "processor.dwell_exceeded" in OBSERVATION_TYPES
+
+
+def test_direction_track_telemetry_types_still_unsupported() -> None:
+    """P4-E widens exactly three types (the dwell triplet). The next
+    candidates (direction, track, telemetry, debug) MUST NOT have
+    been accidentally widened — this is the spiritual successor to
+    the P4-D zone guard, now pointed at the still-deferred types."""
     future_types = (
-        "processor.dwell_started",
-        "processor.dwell_updated",
-        "processor.dwell_exceeded",
         "processor.direction_detected",
         "processor.track_state",
         "processor.track_update",
@@ -93,9 +97,9 @@ def test_dwell_track_telemetry_types_still_unsupported() -> None:
     )
     for t in future_types:
         assert t not in OBSERVATION_TYPES, (
-            f"{t!r} unexpectedly in OBSERVATION_TYPES — P4-D only widens "
-            "the two zone transition types; dwell / direction / track / "
-            "telemetry types stay deferred"
+            f"{t!r} unexpectedly in OBSERVATION_TYPES — P4-E only widens "
+            "the three dwell types; direction / track / telemetry / "
+            "debug types stay deferred"
         )
 
 

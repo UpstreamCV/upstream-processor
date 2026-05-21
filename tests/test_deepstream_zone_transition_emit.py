@@ -52,16 +52,16 @@ def test_zone_types_now_in_observation_types_tuple() -> None:
     assert "processor.zone_exited" in OBSERVATION_TYPES
 
 
-def test_dwell_track_telemetry_types_still_unsupported() -> None:
-    """P4-D widens exactly two types. Dwell variants, direction, track
-    types, telemetry stay out."""
+def test_direction_track_telemetry_types_still_unsupported() -> None:
+    """P4-E widens the three dwell types. Direction, track-state,
+    track-update, and telemetry types stay deferred."""
     for t in (
-        "processor.dwell_started",
-        "processor.dwell_updated",
-        "processor.dwell_exceeded",
         "processor.direction_detected",
         "processor.track_state",
         "processor.track_update",
+        "processor.detection_seen",
+        "processor.frame_summary",
+        "processor.scene_quality_warning",
     ):
         assert t not in OBSERVATION_TYPES, t
 

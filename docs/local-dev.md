@@ -919,6 +919,93 @@ rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
 rm -rf /tmp/upstream-live-p4d-fu
 ```
 
+## Live verification checklist (P4-E — dwell observations)
+
+P4-E builds on the P4-D + P4-D follow-up live signal (per-object
+``roi_labels`` + stable zone transitions). Both the api-server
+widening and the processor change must be deployed. **Use short
+timers for live verification so you can confirm all three event
+types in a single ~30s cycle.**
+
+### Launch (with short dwell timers)
+
+```sh
+umask 077
+mkdir -p /tmp/upstream-live-p4e
+printf 'UPSTREAM_PROCESSOR_WEBHOOK_SECRET=%s\n' '<value>' \
+  > /tmp/upstream-live-p4e/secret.env
+chmod 600 /tmp/upstream-live-p4e/secret.env
+
+cd /tmp/upstream-live-p4e/repo
+set -a; . /tmp/upstream-live-p4e/secret.env; set +a
+UPSTREAM_API_BASE_URL=https://api.upstreamcv.com \
+UPSTREAM_PROCESSOR_ID=proc_p4e_dwell_live \
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.analytics_probe.v0 \
+UPSTREAM_DEEPSTREAM_PYDS_IMAGE=upstream-deepstream:8.0-pyds-v1.2.2 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=180 \
+UPSTREAM_DEEPSTREAM_ZONE_MEMBERSHIP_STABILITY_FRAMES=5 \
+UPSTREAM_DEEPSTREAM_DWELL_UPDATE_INTERVAL_SECONDS=5 \
+UPSTREAM_DEEPSTREAM_DWELL_EXCEEDED_THRESHOLD_SECONDS=10 \
+UPSTREAM_DEEPSTREAM_ANALYTICS_ROI_MARGIN_PCT=0.05 \
+UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS=all \
+UPSTREAM_LOG_LEVEL=INFO \
+nohup /tmp/upstream-live-p4e/venv/bin/python -m app.main \
+  > /tmp/upstream-live-p4e/run.log 2>&1 &
+sleep 1
+pgrep -f "/tmp/upstream-live-p4e/venv/bin/python -m app\.main" -n \
+  > /tmp/upstream-live-p4e/processor.pid
+```
+
+### Operator script
+
+1. Start outside the central ROI if possible. Stand still 5-10s.
+2. Walk into the center of the frame; stand still inside the ROI
+   for **at least 20 seconds** (so we see started + updated at
+   +5/10/15/20s + exceeded at +10s).
+3. (Optional) Walk out, stay outside ~5s, walk back in for
+   another short cycle.
+4. SIGINT.
+
+### Triage checklist (read status payload after stop)
+
+```
+[ ] analytics_object_class_id_counts non-zero (model detected)
+[ ] objects_with_roi_labels_count non-zero (analytics tagged)
+[ ] zone_entered_observations_emitted >= 1
+[ ] dwell_observations_enabled is True
+[ ] dwell_update_interval_seconds matches env (5)
+[ ] dwell_exceeded_threshold_seconds matches env (10)
+[ ] dwell_started_observations_emitted >= 1
+[ ] dwell_updated_observations_emitted >= 1 (probably >= 3 if
+    operator stayed 20s with 5s interval)
+[ ] dwell_exceeded_observations_emitted >= 1
+[ ] dwell_write_errors_count == 0
+[ ] zero 422s, zero non-2xx
+[ ] clean shutdown
+[ ] no secrets in run.log; no leftover containers; no temp dirs
+```
+
+### Failure mode classification (only #5 is a P4-E regression)
+
+1. **No detections.** Detection / TrafficCamNet issue. Not P4-E.
+2. **No stable tracker_id.** Tracker issue. Not P4-E.
+3. **No roi_labels.** Analytics geometry / class filter issue.
+   Not P4-E (use P4-D follow-up's diagnostics to triage).
+4. **No zone_entered observations.** ZoneMembershipState issue.
+   Not P4-E.
+5. **zone_entered fired but no dwell_started / dwell_updated /
+   dwell_exceeded.** **P4-E adapter regression.** Capture status
+   payload + run log.
+
+### Cleanup (operator)
+
+```sh
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+  | grep -E "upstream-dsa|upstream-dst|upstream-dsm" || true
+rm -rf /tmp/upstream-p35-analytics.* 2>/dev/null || true
+rm -rf /tmp/upstream-live-p4e
+```
+
 ### What was verified during M8.2B build
 
 - Full suite **51 tests** green; ruff + ruff-format + `mypy app` clean.

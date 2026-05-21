@@ -58,12 +58,21 @@ CANDIDATE_ROI_OCCUPANCY_TYPE = "processor.roi_occupancy"
 # wire) and the idempotency-key namespace is per-transition-type.
 CANDIDATE_ZONE_ENTERED_TYPE = "processor.zone_entered"
 CANDIDATE_ZONE_EXITED_TYPE = "processor.zone_exited"
+# P4-E dwell observation types. Layered on top of P4-D's
+# ZoneMembershipState — DwellState ingests zone_entered / zone_exited
+# events and emits the three dwell observations.
+CANDIDATE_DWELL_STARTED_TYPE = "processor.dwell_started"
+CANDIDATE_DWELL_UPDATED_TYPE = "processor.dwell_updated"
+CANDIDATE_DWELL_EXCEEDED_TYPE = "processor.dwell_exceeded"
 
 CANDIDATE_OBSERVATION_TYPES: tuple[str, ...] = (
     CANDIDATE_LINE_CROSSING_TYPE,
     CANDIDATE_ROI_OCCUPANCY_TYPE,
     CANDIDATE_ZONE_ENTERED_TYPE,
     CANDIDATE_ZONE_EXITED_TYPE,
+    CANDIDATE_DWELL_STARTED_TYPE,
+    CANDIDATE_DWELL_UPDATED_TYPE,
+    CANDIDATE_DWELL_EXCEEDED_TYPE,
 )
 
 
@@ -756,6 +765,357 @@ class ZoneMembershipState:
                 )
             )
         return events
+
+
+# --- P4-E: dwell observations ----------------------------------------
+
+
+@dataclass(frozen=True)
+class DwellEvent:
+    """One ``processor.dwell_started`` / ``dwell_updated`` /
+    ``dwell_exceeded`` event.
+
+    A single dataclass covers all three transition variants because
+    the payloads share zone_id / track_id / dwell_session_id /
+    started_at / duration_seconds — only ``update_sequence`` (for
+    ``dwell_updated``) and ``threshold_seconds`` (for
+    ``dwell_exceeded``) are type-specific, and both are optional /
+    omitted in the other variants' payloads. ``type`` selects the
+    Literal at the writer."""
+
+    type: str  # CANDIDATE_DWELL_* — must be one of the three.
+    stream_session_id: UUID
+    occurred_at: datetime
+    zone_id: str
+    zone_label: str
+    track_id: str
+    dwell_session_id: str
+    started_at: datetime
+    duration_seconds: float
+    idempotency_key: str
+    class_id: int | None = None
+    class_label: str | None = None
+    # Only set for ``dwell_updated``; the rolling per-session sequence.
+    update_sequence: int | None = None
+    # Only set for ``dwell_exceeded``; the threshold that was crossed.
+    threshold_seconds: float | None = None
+    source: dict[str, Any] = field(default_factory=dict)
+    debug: dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        """Body for ``ObservationPayload.payload``. Top-level fields are
+        runtime-neutral; ``source`` / ``debug`` carry DeepStream
+        provenance + raw frame numbers. Optional fields
+        (``class_id`` / ``class_label`` / ``update_sequence`` /
+        ``threshold_seconds``) are omitted when None so the
+        ``dwell_started`` payload doesn't carry ``"update_sequence":
+        null`` noise."""
+        body: dict[str, Any] = {
+            "zone_id": self.zone_id,
+            "zone_label": self.zone_label,
+            "track_id": self.track_id,
+            "dwell_session_id": self.dwell_session_id,
+            "started_at": self.started_at.isoformat(),
+            # Round to 2 dp so payloads are stable across small clock
+            # jitter (the rounded value still encodes ~10 ms).
+            "duration_seconds": round(float(self.duration_seconds), 2),
+            "idempotency_key": self.idempotency_key,
+            "source": dict(self.source),
+            "debug": dict(self.debug),
+        }
+        if self.class_id is not None:
+            body["class_id"] = int(self.class_id)
+        if self.class_label is not None:
+            body["class_label"] = self.class_label
+        if self.update_sequence is not None:
+            body["update_sequence"] = int(self.update_sequence)
+        if self.threshold_seconds is not None:
+            body["threshold_seconds"] = round(float(self.threshold_seconds), 2)
+        return body
+
+
+def build_dwell_started_idempotency_key(
+    *,
+    stream_session_id: UUID,
+    zone_id: str,
+    track_id: str,
+    dwell_session_id: str,
+) -> str:
+    """``sess:<id>:processor.dwell_started:<zone>:<track>:<dwell_session_id>``.
+
+    ``dwell_session_id`` already contains
+    ``<zone>:<track>:<enter_sequence>`` (so the prefix duplicates
+    ``<zone>:<track>``); the duplication is intentional — it makes the
+    key independently parseable as a single string without re-parsing
+    ``dwell_session_id``, and keeps the prefix consistent with the
+    other dwell event types."""
+    return (
+        f"sess:{stream_session_id}:{CANDIDATE_DWELL_STARTED_TYPE}:"
+        f"{zone_id}:{track_id}:{dwell_session_id}"
+    )
+
+
+def build_dwell_updated_idempotency_key(
+    *,
+    stream_session_id: UUID,
+    zone_id: str,
+    track_id: str,
+    dwell_session_id: str,
+    update_sequence: int,
+) -> str:
+    """Adds ``:<update_sequence>`` after the dwell_session_id so each
+    periodic update inside a session has a unique deterministic key."""
+    return (
+        f"sess:{stream_session_id}:{CANDIDATE_DWELL_UPDATED_TYPE}:"
+        f"{zone_id}:{track_id}:{dwell_session_id}:{int(update_sequence)}"
+    )
+
+
+def build_dwell_exceeded_idempotency_key(
+    *,
+    stream_session_id: UUID,
+    zone_id: str,
+    track_id: str,
+    dwell_session_id: str,
+    threshold_seconds: float,
+) -> str:
+    """Adds ``:<threshold_seconds>`` (as int) after the dwell_session_id.
+    Casting to int avoids floating-point key drift between calls
+    while still uniquely identifying configurable thresholds (e.g.
+    60 vs 300)."""
+    return (
+        f"sess:{stream_session_id}:{CANDIDATE_DWELL_EXCEEDED_TYPE}:"
+        f"{zone_id}:{track_id}:{dwell_session_id}:{int(threshold_seconds)}"
+    )
+
+
+@dataclass
+class _ActiveDwell:
+    """Per-(track, zone) dwell session bookkeeping. Created on
+    zone_entered; closed (removed from the map) on zone_exited.
+
+    ``update_sequence`` starts at 0 and increments to 1, 2, 3, … on
+    each ``dwell_updated`` emit. ``exceeded_emitted`` is the
+    single-shot guard for ``dwell_exceeded``."""
+
+    dwell_session_id: str
+    started_at: datetime
+    last_update_at: datetime
+    update_sequence: int = 0
+    exceeded_emitted: bool = False
+    class_id: int | None = None
+    class_label: str | None = None
+    zone_label: str = ""
+
+
+@dataclass
+class DwellState:
+    """Per-stream-per-worker adapter state for dwell observations.
+
+    Inputs come from two channels:
+      - ``absorb_zone_event(zone_event)`` — start or close a dwell
+        session when ZoneMembershipState commits a transition.
+      - ``tick(occurred_at)`` — periodic check on each frame to fire
+        ``dwell_updated`` (when ``update_interval_seconds`` elapsed)
+        and ``dwell_exceeded`` (when ``exceeded_threshold_seconds``
+        is crossed).
+
+    Important invariants (mirror P4-D's disappearance guard):
+      - A track disappearing from a frame does NOT close the dwell
+        session. The session stays active until the matching
+        ``zone_exited`` arrives, or until the supervisor restarts the
+        worker.
+      - After a dwell session is closed by ``zone_exited``, no more
+        ``dwell_updated`` / ``dwell_exceeded`` events fire for that
+        session. A subsequent ``zone_entered`` (re-enter) starts a NEW
+        ``dwell_session_id`` with a fresh threshold-emitted state.
+      - ``dwell_exceeded`` is single-shot per session — even if the
+        track stays in the zone forever, the event fires exactly once.
+      - ``track_id`` and ``zone_id`` are required (already guaranteed
+        by ZoneMembershipState's contract)."""
+
+    stream_session_id: UUID
+    # Default 30s matches Settings.deepstream_dwell_update_interval_seconds.
+    update_interval_seconds: float = 30.0
+    # Default 60s matches Settings.deepstream_dwell_exceeded_threshold_seconds.
+    exceeded_threshold_seconds: float = 60.0
+    # Active dwell sessions per (track_id, zone_id). Created on
+    # zone_entered; popped on zone_exited.
+    active_dwells: dict[tuple[str, str], _ActiveDwell] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.update_interval_seconds <= 0:
+            raise ValueError(
+                f"update_interval_seconds must be > 0; got {self.update_interval_seconds}"
+            )
+        if self.exceeded_threshold_seconds <= 0:
+            raise ValueError(
+                f"exceeded_threshold_seconds must be > 0; got {self.exceeded_threshold_seconds}"
+            )
+
+    def absorb_zone_event(
+        self,
+        zone_event: ZoneTransitionEvent,
+        *,
+        source: dict[str, Any] | None = None,
+        debug: dict[str, Any] | None = None,
+    ) -> list[DwellEvent]:
+        """Process a single ``zone_entered`` / ``zone_exited`` event:
+          - ``zone_entered`` → start a new session (idempotent — if an
+            active session already exists for this (track, zone), do
+            NOT emit another ``dwell_started``; the duplicate guard
+            mirrors P4-D's stability invariant).
+          - ``zone_exited`` → close the session silently (no
+            ``dwell_ended`` in P4-E).
+        Returns at most one ``dwell_started`` event."""
+        events: list[DwellEvent] = []
+        key = (zone_event.track_id, zone_event.zone_id)
+        if zone_event.type == CANDIDATE_ZONE_ENTERED_TYPE:
+            if key in self.active_dwells:
+                # Defensive: ZoneMembershipState should never emit two
+                # zone_entered events back-to-back for the same
+                # (track, zone), but if it does, don't duplicate the
+                # dwell_started.
+                return events
+            dwell_session_id = f"{zone_event.zone_id}:{zone_event.track_id}:{zone_event.sequence}"
+            active = _ActiveDwell(
+                dwell_session_id=dwell_session_id,
+                started_at=zone_event.occurred_at,
+                last_update_at=zone_event.occurred_at,
+                class_id=zone_event.class_id,
+                class_label=zone_event.class_label,
+                zone_label=zone_event.zone_label,
+            )
+            self.active_dwells[key] = active
+            idem = build_dwell_started_idempotency_key(
+                stream_session_id=self.stream_session_id,
+                zone_id=zone_event.zone_id,
+                track_id=zone_event.track_id,
+                dwell_session_id=dwell_session_id,
+            )
+            merged_debug: dict[str, Any] = {"trigger": "zone_entered", **(debug or {})}
+            events.append(
+                DwellEvent(
+                    type=CANDIDATE_DWELL_STARTED_TYPE,
+                    stream_session_id=self.stream_session_id,
+                    occurred_at=zone_event.occurred_at,
+                    zone_id=zone_event.zone_id,
+                    zone_label=zone_event.zone_label,
+                    track_id=zone_event.track_id,
+                    dwell_session_id=dwell_session_id,
+                    started_at=zone_event.occurred_at,
+                    duration_seconds=0.0,
+                    idempotency_key=idem,
+                    class_id=zone_event.class_id,
+                    class_label=zone_event.class_label,
+                    source=dict(source or {}),
+                    debug=merged_debug,
+                )
+            )
+        elif zone_event.type == CANDIDATE_ZONE_EXITED_TYPE:
+            # Close the session silently. dwell_ended is intentionally
+            # deferred — when the matching zone_exited has stable
+            # semantics from ZoneMembershipState we know the operator
+            # is gone; further updates would be noise.
+            self.active_dwells.pop(key, None)
+        # Other zone event types (none currently) are no-ops.
+        return events
+
+    def tick(
+        self,
+        *,
+        occurred_at: datetime,
+        source: dict[str, Any] | None = None,
+        debug: dict[str, Any] | None = None,
+    ) -> list[DwellEvent]:
+        """Per-frame check: emit dwell_updated (if the update interval
+        has elapsed since the last update / start) and dwell_exceeded
+        (if the total duration crosses the threshold for the first
+        time). Updates come BEFORE the exceeded check inside the same
+        tick — operationally identical because both are idempotent
+        per session but the order makes the sequence numbering
+        deterministic in tests."""
+        events: list[DwellEvent] = []
+        for (track_id, zone_id), active in list(self.active_dwells.items()):
+            duration = (occurred_at - active.started_at).total_seconds()
+            since_last = (occurred_at - active.last_update_at).total_seconds()
+            # dwell_updated: emits at every full update_interval since
+            # the last emit (NOT since session start). After
+            # dwell_started, this is the next emission this session
+            # produces. Update_sequence increments per emit.
+            if since_last >= self.update_interval_seconds:
+                active.update_sequence += 1
+                active.last_update_at = occurred_at
+                idem = build_dwell_updated_idempotency_key(
+                    stream_session_id=self.stream_session_id,
+                    zone_id=zone_id,
+                    track_id=track_id,
+                    dwell_session_id=active.dwell_session_id,
+                    update_sequence=active.update_sequence,
+                )
+                merged_debug: dict[str, Any] = {"trigger": "interval", **(debug or {})}
+                events.append(
+                    DwellEvent(
+                        type=CANDIDATE_DWELL_UPDATED_TYPE,
+                        stream_session_id=self.stream_session_id,
+                        occurred_at=occurred_at,
+                        zone_id=zone_id,
+                        zone_label=active.zone_label,
+                        track_id=track_id,
+                        dwell_session_id=active.dwell_session_id,
+                        started_at=active.started_at,
+                        duration_seconds=duration,
+                        idempotency_key=idem,
+                        class_id=active.class_id,
+                        class_label=active.class_label,
+                        update_sequence=active.update_sequence,
+                        source=dict(source or {}),
+                        debug=merged_debug,
+                    )
+                )
+            # dwell_exceeded: single-shot per session. Once emitted,
+            # never re-emitted even if the track stays inside forever
+            # (re-entering produces a NEW session_id with a fresh
+            # exceeded_emitted=False).
+            if not active.exceeded_emitted and duration >= self.exceeded_threshold_seconds:
+                active.exceeded_emitted = True
+                idem_exc = build_dwell_exceeded_idempotency_key(
+                    stream_session_id=self.stream_session_id,
+                    zone_id=zone_id,
+                    track_id=track_id,
+                    dwell_session_id=active.dwell_session_id,
+                    threshold_seconds=self.exceeded_threshold_seconds,
+                )
+                merged_debug_exc: dict[str, Any] = {
+                    "trigger": "threshold",
+                    **(debug or {}),
+                }
+                events.append(
+                    DwellEvent(
+                        type=CANDIDATE_DWELL_EXCEEDED_TYPE,
+                        stream_session_id=self.stream_session_id,
+                        occurred_at=occurred_at,
+                        zone_id=zone_id,
+                        zone_label=active.zone_label,
+                        track_id=track_id,
+                        dwell_session_id=active.dwell_session_id,
+                        started_at=active.started_at,
+                        duration_seconds=duration,
+                        idempotency_key=idem_exc,
+                        class_id=active.class_id,
+                        class_label=active.class_label,
+                        threshold_seconds=self.exceeded_threshold_seconds,
+                        source=dict(source or {}),
+                        debug=merged_debug_exc,
+                    )
+                )
+        return events
+
+    def active_session_count(self) -> int:
+        """For the status payload — count of currently-open dwell
+        sessions. Helpful triage signal: if this stays 0 but
+        zone_entered events are flowing, that's a DwellState bug."""
+        return len(self.active_dwells)
 
 
 # --- ergonomic helper --------------------------------------------------

@@ -117,6 +117,23 @@ def test_zone_exited_is_now_api_supported() -> None:
     assert "processor.zone_exited" not in DEFERRED_TYPES
 
 
+def test_dwell_started_is_now_api_supported() -> None:
+    """P4-E flipped the three dwell rows from ``deferred`` to
+    ``api_supported`` in lock-step with the api-server widening."""
+    assert "processor.dwell_started" in API_SUPPORTED_TYPES
+    assert "processor.dwell_started" not in DEFERRED_TYPES
+
+
+def test_dwell_updated_is_now_api_supported() -> None:
+    assert "processor.dwell_updated" in API_SUPPORTED_TYPES
+    assert "processor.dwell_updated" not in DEFERRED_TYPES
+
+
+def test_dwell_exceeded_is_now_api_supported() -> None:
+    assert "processor.dwell_exceeded" in API_SUPPORTED_TYPES
+    assert "processor.dwell_exceeded" not in DEFERRED_TYPES
+
+
 def test_no_proposed_type_is_already_supported() -> None:
     """``proposed_first_api_add`` and ``api_supported`` are mutually
     exclusive — once a type is supported it must be flipped to

@@ -47,6 +47,7 @@ from app.errors import (
 from app.observations.bridge_queue import BoundedBridgeQueue, DropPolicy
 from app.observations.metadata_models import NeutralFrameMetadata
 from app.observations.observation_adapter import (
+    DwellState,
     LineCrossingState,
     RoiOccupancyState,
     ZoneMembershipState,
@@ -205,6 +206,15 @@ class _MetadataCounters:
     # counter; the worker error path doesn't distinguish per-type.
     zone_entered_observations_emitted: int = 0
     zone_exited_observations_emitted: int = 0
+    # P4-E: per-type dwell counters. Same shared error counter
+    # (writer failures land in observation_write_errors); a separate
+    # dwell_write_errors_count is also surfaced for the operator
+    # so they can tell if the dwell tick path is silently dropping
+    # events vs the zone path.
+    dwell_started_observations_emitted: int = 0
+    dwell_updated_observations_emitted: int = 0
+    dwell_exceeded_observations_emitted: int = 0
+    dwell_write_errors: int = 0
     observation_write_errors: int = 0
     last_observation_at: datetime | None = None
 
@@ -800,6 +810,29 @@ class DeepStreamWorker(Runtime):
                 p["zone_membership_stability_frames"] = int(
                     self._settings.deepstream_zone_membership_stability_frames
                 )
+                # P4-E: dwell counters + configured timers. ``_enabled``
+                # mirrors ``observations_enabled`` since dwell lives or
+                # dies with the writer + analytics mode. The active
+                # session count is a triage signal — non-zero means
+                # the worker has been seeing stable zone_entered events
+                # without a matching zone_exited yet.
+                p["dwell_observations_enabled"] = True
+                p["dwell_started_observations_emitted"] = (
+                    counters.dwell_started_observations_emitted
+                )
+                p["dwell_updated_observations_emitted"] = (
+                    counters.dwell_updated_observations_emitted
+                )
+                p["dwell_exceeded_observations_emitted"] = (
+                    counters.dwell_exceeded_observations_emitted
+                )
+                p["dwell_write_errors_count"] = counters.dwell_write_errors
+                p["dwell_update_interval_seconds"] = float(
+                    self._settings.deepstream_dwell_update_interval_seconds
+                )
+                p["dwell_exceeded_threshold_seconds"] = float(
+                    self._settings.deepstream_dwell_exceeded_threshold_seconds
+                )
                 p["observation_write_errors_count"] = counters.observation_write_errors
                 p["last_observation_at"] = (
                     counters.last_observation_at.isoformat()
@@ -918,6 +951,22 @@ class DeepStreamWorker(Runtime):
             if observations_enabled
             else None
         )
+        # P4-E: DwellState ingests zone transition events from
+        # ``zone_state`` (via ``_emit_zone_transitions``) and emits
+        # dwell_started immediately + dwell_updated periodically +
+        # dwell_exceeded once. Same observations_enabled gate; the
+        # state always exists when zone state does (and vice versa).
+        dwell_state: DwellState | None = (
+            DwellState(
+                stream_session_id=self._session.session_id,
+                update_interval_seconds=(self._settings.deepstream_dwell_update_interval_seconds),
+                exceeded_threshold_seconds=(
+                    self._settings.deepstream_dwell_exceeded_threshold_seconds
+                ),
+            )
+            if observations_enabled
+            else None
+        )
         source_block: dict[str, Any] = (
             deepstream_source_block(
                 package_id=self._package.package_id,
@@ -995,6 +1044,21 @@ class DeepStreamWorker(Runtime):
                     await self._emit_zone_transitions(
                         frame=frame,
                         zone_state=zone_state,
+                        source_block=source_block,
+                        counters=counters,
+                        dwell_state=dwell_state,
+                    )
+                # P4-E: tick the dwell state machine AFTER zone events
+                # are processed for this frame so a freshly-emitted
+                # dwell_started's interval-counter starts at the right
+                # ``last_update_at``. Even when no zone events fire
+                # this frame, the tick may emit dwell_updated /
+                # dwell_exceeded for sessions that started on prior
+                # frames.
+                if dwell_state is not None:
+                    await self._emit_dwell_tick(
+                        frame=frame,
+                        dwell_state=dwell_state,
                         source_block=source_block,
                         counters=counters,
                     )
@@ -1227,6 +1291,7 @@ class DeepStreamWorker(Runtime):
         zone_state: ZoneMembershipState,
         source_block: dict[str, Any],
         counters: _MetadataCounters,
+        dwell_state: DwellState | None = None,
     ) -> None:
         """Walk each tracked object in the frame, hand its
         ``roi_labels`` to ``ZoneMembershipState`` along with the set of
@@ -1309,6 +1374,102 @@ class DeepStreamWorker(Runtime):
                 else:
                     counters.zone_exited_observations_emitted += 1
                 counters.last_observation_at = event.occurred_at
+                # P4-E: feed the zone event into DwellState. For
+                # zone_entered this produces a dwell_started event we
+                # emit immediately; for zone_exited it silently closes
+                # the dwell session.
+                if dwell_state is not None:
+                    dwell_events = dwell_state.absorb_zone_event(
+                        event,
+                        source=source_block,
+                        debug={
+                            "frame_num": int(frame.frame.frame_num),
+                            "geometry_source": "probe_default",
+                        },
+                    )
+                    for dev in dwell_events:
+                        await self._emit_one_dwell_event(dev, counters=counters)
+
+    async def _emit_dwell_tick(
+        self,
+        *,
+        frame: NeutralFrameMetadata,
+        dwell_state: DwellState,
+        source_block: dict[str, Any],
+        counters: _MetadataCounters,
+    ) -> None:
+        """Per-frame dwell tick: emit periodic ``dwell_updated`` events
+        and the single-shot ``dwell_exceeded`` event for any active
+        session whose timers have elapsed.
+
+        Bails early if there are no active dwell sessions (most
+        frames). ``occurred_at`` is taken from the frame's timestamp
+        when available so unit tests can drive deterministic clock
+        progression; live frames fall back to ``now_utc()``."""
+        assert self._writer is not None  # gated by the caller
+        if dwell_state.active_session_count() == 0:
+            return
+        occurred_at = frame.frame.timestamp or now_utc()
+        events = dwell_state.tick(
+            occurred_at=occurred_at,
+            source=source_block,
+            debug={
+                "frame_num": int(frame.frame.frame_num),
+                "geometry_source": "probe_default",
+            },
+        )
+        for event in events:
+            await self._emit_one_dwell_event(event, counters=counters)
+
+    async def _emit_one_dwell_event(
+        self,
+        event: Any,  # DwellEvent — typed loosely to avoid top-level forward ref
+        *,
+        counters: _MetadataCounters,
+    ) -> None:
+        """Single-event emit path used by both the zone-event-driven
+        path (dwell_started) and the per-frame tick path
+        (dwell_updated / dwell_exceeded). Error handling mirrors the
+        other emit helpers exactly."""
+        assert self._writer is not None
+        try:
+            await self._writer.emit(
+                stream_session_id=self._session.session_id,
+                obs_type=event.type,
+                payload=event.to_payload(),
+                package_id=self._package.package_id,
+                observed_at=event.occurred_at,
+            )
+        except ApiSessionGoneError:
+            raise
+        except ApiValidationError as exc:
+            counters.observation_write_errors += 1
+            counters.dwell_write_errors += 1
+            _log.error(
+                "wire contract drift on dwell emit (%s) for %s: %s",
+                event.type,
+                self.session_id,
+                exc,
+            )
+            return
+        except TRANSIENT_API_ERRORS as exc:
+            counters.observation_write_errors += 1
+            counters.dwell_write_errors += 1
+            _log.warning(
+                "transient dwell emit (%s) for %s: %s",
+                event.type,
+                self.session_id,
+                exc,
+            )
+            return
+        counters.observations_emitted += 1
+        if event.type == "processor.dwell_started":
+            counters.dwell_started_observations_emitted += 1
+        elif event.type == "processor.dwell_updated":
+            counters.dwell_updated_observations_emitted += 1
+        elif event.type == "processor.dwell_exceeded":
+            counters.dwell_exceeded_observations_emitted += 1
+        counters.last_observation_at = event.occurred_at
 
     # --- helpers ----------------------------------------------------------
 

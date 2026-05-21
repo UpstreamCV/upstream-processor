@@ -4,6 +4,98 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-21 - P4-E: Dwell Observations
+
+### Summary
+Layers time-based observations on top of P4-D's stable zone
+membership. ``processor.dwell_started`` fires immediately after
+the matching ``zone_entered``; ``processor.dwell_updated`` emits
+periodically while the tracked object remains inside;
+``processor.dwell_exceeded`` fires once when the dwell duration
+crosses a configured threshold. Re-entering a zone produces a NEW
+``dwell_session_id`` with a fresh threshold. Coordinated two-repo
+change (api-server widens the Literal first; processor adds
+DwellState + worker emit path in lockstep). **No DB migration.**
+
+### What changed
+- **upstream-api-server** (separate commit `feat: allow processor
+  dwell observations`): widens ``ProcessorObservationType`` with
+  three new strings; adds three positive tests + re-aims the
+  future-types guard at track / direction / telemetry / debug.
+- **upstream-processor**:
+  - ``app/observations/schemas.py`` — widen ``ObservationType``
+    Literal + ``OBSERVATION_TYPES`` tuple.
+  - ``app/observations/observation_taxonomy.py`` — flip the
+    three dwell rows from ``deferred`` to ``api_supported``;
+    update ``dwell_started`` / ``dwell_updated`` row payloads.
+  - ``app/observations/observation_adapter.py``:
+    - new ``CANDIDATE_DWELL_*`` constants in the tuple;
+    - ``DwellEvent`` frozen dataclass + three idempotency-key
+      builders;
+    - ``_ActiveDwell`` per-(track, zone) bookkeeping (started_at,
+      last_update_at, update_sequence, exceeded_emitted);
+    - ``DwellState`` adapter — ingests zone events via
+      ``absorb_zone_event`` and per-frame ticks via ``tick``.
+      Single-shot exceeded; per-emit update_sequence; disappearance
+      does NOT close the session.
+  - ``app/config.py`` — two new ``Settings`` fields:
+    ``deepstream_dwell_update_interval_seconds: float = 30.0`` and
+    ``deepstream_dwell_exceeded_threshold_seconds: float = 60.0``
+    (env-overridable; both validated > 0).
+  - ``app/runtimes/deepstream_runtime/worker.py``:
+    - imports DwellState;
+    - instantiates ``dwell_state`` parallel to the other states;
+    - ``_emit_zone_transitions`` gains an optional ``dwell_state``
+      arg and feeds zone events into DwellState after each
+      successful zone emit, writing ``dwell_started`` events
+      immediately;
+    - new ``_emit_dwell_tick`` consumer-loop helper runs each
+      frame to emit ``dwell_updated`` + ``dwell_exceeded`` events;
+    - new ``_emit_one_dwell_event`` helper shared by the
+      zone-event-driven path and the tick path;
+    - ``_MetadataCounters`` gains four counters
+      (started / updated / exceeded / dwell_write_errors);
+    - analytics status payload gains six new fields
+      (dwell_observations_enabled, the three per-type counters,
+      the write-error counter, the two configured timers).
+  - ``.env.example`` documents the two new env vars.
+  - ``tests/conftest.py`` ``fast_settings`` adds sub-second
+    defaults for both dwell timers.
+
+### Tests
+- **363 passing** in upstream-processor (323 prior + 40 net new).
+  ruff + ruff-format + ``mypy app`` clean.
+- **260 passing** in upstream-api-server (257 prior + 3 new).
+- ``tests/test_dwell_state.py`` — NEW, 25 pure-adapter tests.
+- ``tests/test_deepstream_dwell_emit.py`` — NEW, 15 worker tests.
+- ``tests/test_observation_adapter_contract.py`` — split P4-D
+  ``test_dwell_track_telemetry_types_still_unsupported`` into a
+  new ``test_dwell_types_now_in_server_whitelist`` (positive) and
+  ``test_direction_track_telemetry_types_still_unsupported`` (the
+  re-aimed guard).
+- ``tests/test_observation_taxonomy.py`` — three new
+  ``test_dwell_*_is_now_api_supported`` invariants.
+- ``tests/test_deepstream_roi_occupancy_emit.py`` /
+  ``tests/test_deepstream_zone_transition_emit.py`` — drop the
+  three dwell types from their now-stale future-types guards.
+
+### Accuracy caveat
+TrafficCamNet misses frames; nvtracker can drop/reassign IDs;
+nvdsanalytics ROI labels can flap. **P4-E is judged by DwellState
+correctness given stable zone events, not by perfect scene
+accuracy.** Live verification is a smoke test. The classification
+rubric: detection / tracker / analytics / zone-state issues are
+NOT P4-E regressions — only a DwellState bug is.
+
+### Out of scope (next milestones)
+- ``processor.dwell_ended`` (zone_exited already signals end).
+- Server-side idempotency.
+- Per-zone configurable dwell thresholds.
+- Dashboard-driven thresholds.
+- Direction / track-update / telemetry types.
+
+---
+
 ## 2026-05-21 - P4-D Follow-up: ROI Label / Analytics Class Filter Fix
 
 ### Summary
