@@ -229,6 +229,21 @@ class Settings(BaseSettings):
     # emitted for that session.
     deepstream_dwell_exceeded_threshold_seconds: float = 60.0
 
+    # --- P5-C latest perception snapshot -----------------------------
+    # A low-rate (~1/s) JSON snapshot of what the analytics worker
+    # currently sees — detected objects + configured ROI/line geometry —
+    # POSTed to the dedicated perception-snapshot endpoint. This is NOT
+    # an observation: it is latest-state for a dashboard overlay (P5-D),
+    # stored as one upserted row per camera, separate from the
+    # append-only observations log. Only the analytics runtime posts it.
+    perception_snapshot_enabled: bool = True
+    # Minimum seconds between snapshot POSTs (~1/s default). Never posts
+    # per-frame. Tests override via ``fast_settings``.
+    perception_snapshot_interval_seconds: float = 1.0
+    # Hard cap on the objects[] list in one snapshot to bound payload
+    # size; ``debug.objects_seen`` still reports the true count.
+    perception_snapshot_max_objects: int = 50
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

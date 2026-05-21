@@ -75,6 +75,10 @@ def fast_settings():  # type: ignore[no-untyped-def]
             # exact wall-clock values via ``model_copy``.
             "deepstream_dwell_update_interval_seconds": 0.05,
             "deepstream_dwell_exceeded_threshold_seconds": 0.10,
+            # P5-C: interval 0.0 so the analytics worker posts a perception
+            # snapshot on every consumed frame in tests; the low-rate test
+            # overrides this to a large value to prove the rate limit.
+            "perception_snapshot_interval_seconds": 0.0,
         }
     )
 

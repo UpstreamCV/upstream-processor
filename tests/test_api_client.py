@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
@@ -16,6 +18,7 @@ from app.errors import (
     ApiValidationError,
 )
 from app.observations.schemas import ObservationPayload, ProcessorStatusPayload
+from app.perception.schemas import PerceptionSnapshotPayload
 
 from tests.conftest import eligible_session_dict
 
@@ -23,6 +26,7 @@ _BASE = "https://api.test"
 _ELIGIBLE = f"{_BASE}/v1/internal/processor/eligible-sessions"
 _STATUS = f"{_BASE}/v1/internal/processor/status"
 _OBS = f"{_BASE}/v1/internal/processor/observations"
+_PERCEPTION = f"{_BASE}/v1/internal/processor/perception-snapshots"
 
 
 def _client() -> UpstreamApiClient:
@@ -159,3 +163,71 @@ async def test_secret_never_appears_in_exception_text() -> None:
         assert secret not in str(exc)
         assert secret not in repr(exc)
     await api.aclose()
+
+
+@respx.mock
+async def test_post_perception_snapshot_path_and_envelope() -> None:
+    sid = uuid4()
+    now = "2026-05-21T12:00:00Z"
+    record = {
+        "id": str(uuid4()),
+        "camera_id": str(uuid4()),
+        "stream_session_id": str(sid),
+        "processor_id": "proc-1",
+        "package_id": "deepstream.analytics_probe.v0",
+        "snapshot": {"objects": [], "geometry": {}},
+        "observed_at": now,
+        "updated_at": now,
+    }
+    route = respx.post(_PERCEPTION).mock(
+        return_value=httpx.Response(200, json={"snapshot": record})
+    )
+    api = _client()
+    resp = await api.post_perception_snapshot(
+        PerceptionSnapshotPayload(
+            stream_session_id=sid,
+            processor_id="proc-1",
+            package_id="deepstream.analytics_probe.v0",
+            observed_at=datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC),
+            snapshot={"objects": []},
+        )
+    )
+    await api.aclose()
+    assert resp.snapshot.snapshot == {"objects": [], "geometry": {}}
+    body = json.loads(route.calls.last.request.content)
+    assert body["stream_session_id"] == str(sid)
+    assert body["observed_at"].startswith("2026-05-21T12:00:00")
+
+
+@respx.mock
+async def test_post_perception_snapshot_omits_unset_optional_ids() -> None:
+    """``exclude_none`` drops unset processor_id / package_id from the wire."""
+    route = respx.post(_PERCEPTION).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "snapshot": {
+                    "id": str(uuid4()),
+                    "camera_id": str(uuid4()),
+                    "stream_session_id": str(uuid4()),
+                    "processor_id": None,
+                    "package_id": None,
+                    "snapshot": {},
+                    "observed_at": "2026-05-21T12:00:00Z",
+                    "updated_at": "2026-05-21T12:00:00Z",
+                }
+            },
+        )
+    )
+    api = _client()
+    await api.post_perception_snapshot(
+        PerceptionSnapshotPayload(
+            stream_session_id=uuid4(),
+            observed_at=datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC),
+            snapshot={},
+        )
+    )
+    await api.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert "processor_id" not in body
+    assert "package_id" not in body

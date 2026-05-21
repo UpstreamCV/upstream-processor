@@ -33,6 +33,10 @@ from app.observations.schemas import (
     ProcessorStatusPayload,
     ProcessorStatusResponse,
 )
+from app.perception.schemas import (
+    PerceptionSnapshotPayload,
+    PerceptionSnapshotResponse,
+)
 
 _log = logging.getLogger("upstream_processor.api")
 
@@ -40,6 +44,7 @@ _BASE_PATH = "/v1/internal/processor"
 _ELIGIBLE = f"{_BASE_PATH}/eligible-sessions"
 _STATUS = f"{_BASE_PATH}/status"
 _OBSERVATIONS = f"{_BASE_PATH}/observations"
+_PERCEPTION_SNAPSHOTS = f"{_BASE_PATH}/perception-snapshots"
 
 _AUTH_HEADER = "X-Upstream-Webhook-Secret"
 
@@ -161,3 +166,13 @@ class UpstreamApiClient:
             json=observation.model_dump(mode="json", exclude_none=True),
         )
         return self._parse(resp, ObservationResponse)
+
+    async def post_perception_snapshot(
+        self, payload: PerceptionSnapshotPayload
+    ) -> PerceptionSnapshotResponse:
+        resp = await self._send(
+            "POST",
+            _PERCEPTION_SNAPSHOTS,
+            json=payload.model_dump(mode="json", exclude_none=True),
+        )
+        return self._parse(resp, PerceptionSnapshotResponse)

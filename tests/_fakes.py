@@ -13,6 +13,11 @@ from app.observations.schemas import (
     ProcessorStatusPayload,
     ProcessorStatusResponse,
 )
+from app.perception.schemas import (
+    PerceptionSnapshotPayload,
+    PerceptionSnapshotRecord,
+    PerceptionSnapshotResponse,
+)
 
 
 class FakeApi:
@@ -21,11 +26,13 @@ class FakeApi:
     def __init__(self) -> None:
         self.statuses: list[ProcessorStatusPayload] = []
         self.observations: list[ObservationPayload] = []
+        self.perception_snapshots: list[PerceptionSnapshotPayload] = []
         # Queue of eligible-session batches; the last batch repeats forever.
         self._eligible: deque[list[EligibleSession]] = deque()
         self.eligible_error: Exception | None = None
         self.status_error: Exception | None = None
         self.observation_error: Exception | None = None
+        self.perception_snapshot_error: Exception | None = None
         self.closed = False
 
     # configuration -------------------------------------------------------
@@ -73,6 +80,28 @@ class FakeApi:
         if self.observation_error is not None:
             raise self.observation_error
         return ObservationResponse(id=uuid4(), count=1)
+
+    async def post_perception_snapshot(
+        self, payload: PerceptionSnapshotPayload
+    ) -> PerceptionSnapshotResponse:
+        self.perception_snapshots.append(payload)
+        if self.perception_snapshot_error is not None:
+            raise self.perception_snapshot_error
+        from datetime import UTC, datetime
+
+        now = datetime.now(tz=UTC)
+        return PerceptionSnapshotResponse(
+            snapshot=PerceptionSnapshotRecord(
+                id=uuid4(),
+                camera_id=uuid4(),
+                stream_session_id=payload.stream_session_id,
+                processor_id=payload.processor_id,
+                package_id=payload.package_id,
+                snapshot=payload.snapshot,
+                observed_at=payload.observed_at,
+                updated_at=now,
+            )
+        )
 
     async def aclose(self) -> None:
         self.closed = True

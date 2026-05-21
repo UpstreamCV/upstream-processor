@@ -4,6 +4,75 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-21 - P5-C: Publish Latest Perception Snapshots
+
+### Summary
+The analytics worker now publishes a low-rate (~1/s) **latest
+perception snapshot** — a JSON description of what it currently
+sees: detected objects (bbox pixel + normalized, tracker id, class,
+confidence, ROI labels) plus the configured ROI/line geometry. It
+POSTs to the dedicated ``POST /v1/internal/processor/perception-
+snapshots`` api-server endpoint, which upserts one latest row per
+camera. This is a **dedicated latest-state path, separate from
+observations** (the append-only event log): separate package,
+builder, API-client method, counters — nothing added to
+ObservationType / ObservationWriter. A future dashboard overlay
+(P5-D) consumes it. **No DB migration in this repo.**
+
+### What changed
+- New ``app/perception/`` package: ``schemas.py`` (the
+  ``PerceptionSnapshotPayload`` request + response envelope) and
+  ``builder.py`` (``build_perception_snapshot`` — a pure, fully
+  defensive ``NeutralFrameMetadata`` → snapshot-dict converter;
+  object list capped at ``perception_snapshot_max_objects``).
+- ``app/runtimes/deepstream_runtime/inference.py`` — extracted
+  ``compute_analytics_geometry`` + geometry dataclasses
+  (``GeometryPoint`` / ``RoiGeometry`` / ``LineGeometry`` /
+  ``AnalyticsGeometry``) as the single source of the ROI/line
+  numbers. ``build_analytics_config`` now consumes it; its INI
+  output is byte-identical (pinned by a golden test).
+- ``app/api_client/`` — ``post_perception_snapshot`` on
+  ``UpstreamApiClient`` + the ``ProcessorApi`` Protocol.
+- ``app/config.py`` — ``perception_snapshot_enabled`` (default
+  true), ``perception_snapshot_interval_seconds`` (1.0),
+  ``perception_snapshot_max_objects`` (50).
+- ``app/runtimes/deepstream_runtime/worker.py`` — analytics-mode
+  consumer posts a snapshot at most once per interval, AFTER the
+  observation emits, best-effort (a failure increments a counter
+  and is swallowed — it never crashes the loop or disturbs
+  observations). New ``_MetadataCounters`` perception fields +
+  status-payload keys (``perception_snapshots_enabled`` /
+  ``_posted`` / ``_write_errors_count`` / ``_interval_seconds`` /
+  ``last_perception_snapshot_at``).
+
+### Files
+- ``app/perception/__init__.py`` / ``schemas.py`` / ``builder.py`` (new).
+- ``app/runtimes/deepstream_runtime/inference.py`` — geometry helper.
+- ``app/api_client/base.py`` / ``upstream_api.py`` — new method.
+- ``app/config.py`` — three ``UPSTREAM_PERCEPTION_SNAPSHOT_*`` settings.
+- ``app/runtimes/deepstream_runtime/worker.py`` — emit path + counters.
+- ``tests/test_perception_geometry.py`` / ``test_perception_builder.py``
+  / ``test_perception_emit.py`` (new); ``tests/test_api_client.py`` /
+  ``test_config.py`` / ``tests/_fakes.py`` / ``tests/conftest.py`` —
+  perception coverage + ``FakeApi.post_perception_snapshot``.
+- ``.env.example`` — three new env vars.
+
+### Test runs
+``uv run pytest`` — all pass (57 new). ``uv run ruff check .`` /
+``ruff format --check .`` — clean. ``uv run mypy app`` — clean (strict).
+
+### Strict non-goals
+- No dashboard overlay / bounding-box drawing (P5-D).
+- No geometry editor, no dashboard-driven geometry, no rules/events.
+- Latest-state only — no historical snapshots. Observations unchanged.
+
+### Deploy note
+Deploy the api-server P5-C endpoints first; the processor emitter is
+best-effort, so a mixed-version window only produces error-counter
+noise, never a crash.
+
+---
+
 ## 2026-05-21 - P4-E: Dwell Observations
 
 ### Summary
