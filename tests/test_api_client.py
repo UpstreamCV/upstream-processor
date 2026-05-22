@@ -17,7 +17,11 @@ from app.errors import (
     ApiSessionGoneError,
     ApiValidationError,
 )
-from app.observations.schemas import ObservationPayload, ProcessorStatusPayload
+from app.observations.schemas import (
+    EligibleSession,
+    ObservationPayload,
+    ProcessorStatusPayload,
+)
 from app.perception.schemas import PerceptionSnapshotPayload
 
 from tests.conftest import eligible_session_dict
@@ -57,6 +61,41 @@ async def test_parses_eligible_sessions_envelope() -> None:
     await api.aclose()
     assert len(resp.sessions) == 1
     assert resp.sessions[0].runtime == "mock"
+
+
+def test_eligible_session_geometry_config_defaults_to_none() -> None:
+    """P6-A: ``geometry_config`` defaults to None when absent from the
+    payload — a camera with no saved config (and the renamed-away
+    ``zones_lines`` is no longer a field)."""
+    payload = eligible_session_dict()
+    del payload["geometry_config"]
+    session = EligibleSession.model_validate(payload)
+    assert session.geometry_config is None
+
+
+@respx.mock
+async def test_eligible_session_parses_geometry_config_envelope() -> None:
+    """P6-A: a saved geometry config arrives as a ``{revision, config}``
+    envelope and is wire-carried as an opaque dict (not consumed until P6-C)."""
+    envelope = {
+        "revision": 3,
+        "config": {
+            "version": 1,
+            "frame": {"width": 1280, "height": 720, "coordinate_space": "normalized"},
+            "rois": [],
+            "lines": [],
+        },
+    }
+    respx.get(_ELIGIBLE).mock(
+        return_value=httpx.Response(
+            200,
+            json={"sessions": [eligible_session_dict(geometry_config=envelope)]},
+        )
+    )
+    api = _client()
+    resp = await api.get_eligible_sessions()
+    await api.aclose()
+    assert resp.sessions[0].geometry_config == envelope
 
 
 @respx.mock

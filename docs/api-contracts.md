@@ -17,11 +17,17 @@ mirror of this contract.
   "package_id": "mock.detect.v0", "runtime": "mock",
   "approved": {"codec","width","height","fps","bitrate_kbps"},
   "validation": {"passed","observed","expected","mismatch_fields","created_at"},
-  "zones_lines": null, "started_at": "<iso|null>", "processor_eligible": true
+  "geometry_config": null, "started_at": "<iso|null>", "processor_eligible": true
 } ] }
 ```
 
 `internal_rtsp_url` is parsed but **never used** in M8.1.
+
+`geometry_config` (P6-A) is the camera's dashboard-authored ROI/line geometry
+config — `null` when none is saved, otherwise a `{"revision": <int>,
+"config": {...}}` envelope. It replaces the former always-null `zones_lines`
+placeholder. Parsed into `EligibleSession.geometry_config` but **not consumed
+yet** — the DeepStream worker begins applying it in P6-C.
 
 ## `POST /status`
 

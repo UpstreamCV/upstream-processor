@@ -4,6 +4,42 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-22 - P6-A: Geometry config in eligible-session schema
+
+### Summary
+Lock-step wire-contract rename to match the api-server P6-A geometry config
+API. The eligible-session placeholder field `zones_lines` (always null, never
+consumed) is renamed to `geometry_config`. The api-server now populates it
+with the camera's dashboard-authored ROI/line geometry as a
+`{"revision": <int>, "config": {...}}` envelope (or null when none is saved).
+
+This is a **schema/contract change only** — no runtime behavior changes. The
+field is kept loosely typed (`dict[str, Any] | None`) and is **not consumed**:
+the DeepStream worker continues to use the hard-coded
+`compute_analytics_geometry()` probe default. Actually applying the saved
+geometry is P6-C.
+
+### Files touched
+- `app/observations/schemas.py` — `EligibleSession.zones_lines` →
+  `geometry_config: dict[str, Any] | None`.
+- `tests/conftest.py` — `eligible_session_dict()` fixture key rename.
+- `tests/test_api_client.py` — two new cases: `geometry_config` defaults to
+  None when absent; a `{revision, config}` envelope parses and round-trips.
+- `docs/api-contracts.md` — eligible-sessions example + field note.
+
+### Testing/checks
+- `uv run pytest -q` — all pass.
+- `uv run ruff check .` / `ruff format --check .` — clean.
+- `uv run mypy app` — clean.
+- No runtime / DeepStream / observation behavior changed.
+
+### Follow-up TODOs
+- P6-C: the DeepStream worker loads `geometry_config` from the eligible
+  session, converts normalized coords to pixels, and builds the
+  nvdsanalytics config from it (replacing the probe default).
+
+---
+
 ## 2026-05-21 - P5-C: Publish Latest Perception Snapshots
 
 ### Summary

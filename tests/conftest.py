@@ -106,7 +106,7 @@ def eligible_session_dict(**overrides: Any) -> dict[str, Any]:
             "mismatch_fields": [],
             "created_at": datetime.now(tz=UTC).isoformat(),
         },
-        "zones_lines": None,
+        "geometry_config": None,
         "started_at": datetime.now(tz=UTC).isoformat(),
         "processor_eligible": True,
     }
