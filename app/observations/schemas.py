@@ -99,7 +99,12 @@ class EligibleSession(BaseModel):
     runtime: str
     approved: ApprovedConfig
     validation: ValidationSummary
-    zones_lines: Any | None = None
+    # P6-A: the camera's dashboard-authored ROI/line geometry config, or
+    # null when the camera has no saved config. The api-server carries it as
+    # a ``{"revision": int, "config": {...}}`` envelope. Kept loosely typed
+    # and NOT consumed yet — the DeepStream worker begins applying it in
+    # P6-C; P6-A is the lock-step wire rename only (was ``zones_lines``).
+    geometry_config: dict[str, Any] | None = None
     started_at: datetime | None = None
     processor_eligible: bool = True
 
