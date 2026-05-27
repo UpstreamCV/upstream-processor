@@ -4,6 +4,113 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-27 - P6-C: Processor consumes saved geometry
+
+### Summary
+The DeepStream analytics worker now applies operator-saved geometry from the
+eligible-session envelope (P6-A wire-carry) to its nvdsanalytics runtime
+config. Before this commit the worker always rendered the hard-coded probe
+default (one near-full-frame ROI + one horizontal line) regardless of what
+the dashboard saved. After this commit:
+
+- saved counting lines and polygon ROIs flow from the dashboard through the
+  `/v1/internal/processor/eligible-sessions` envelope into the nvdsanalytics
+  INI on the *next eligible session* (restart-time only; mid-session reload
+  is out of scope),
+- normalized `[0,1]` operator coordinates are converted to runtime pixels
+  via the session's approved frame dimensions (truncate, then clamp to
+  `[0, dim-1]`),
+- the rendered INI emits one `roi-<id>=` / `line-crossing-<id>=` key per
+  saved geometry (multi-line / multi-ROI works),
+- nvdsanalytics direction-reference points are computed per-line as the
+  perpendicular to the segment (was hard-coded vertical offsets; new math
+  reduces to the prior values for the horizontal probe default, so the P5-C
+  golden test stays byte-identical),
+- the perception snapshot now embeds the *applied* geometry so the
+  dashboard overlay matches the rules nvdsanalytics is actually running,
+- every processor status post carries `payload.applied_geometry` with
+  `source` / `revision` / `line_count` / `roi_count`,
+- emitted line-crossing / ROI-occupancy observations carry
+  `source.geometry_source` and `source.geometry_revision` lineage so a
+  count can be correlated to a specific dashboard save.
+
+### Fallback policy
+- **No saved geometry** → probe default, `applied_geometry.source="default"`.
+- **Operator-saved geometry, valid** → applied,
+  `applied_geometry.source="operator_saved"` + the saved revision number.
+- **Operator-saved geometry, invalid** (bad coordinate space, malformed
+  envelope, all `enabled=false`) → fall back to probe default *and* surface
+  `error_code="geometry_invalid"` on processor status. The camera keeps
+  running so it doesn't go dark while operators fix the save. The supervisor
+  would otherwise thrash on a persistently-bad config (fail → retry → poll
+  same envelope → fail), which is why "hard fail" was rejected.
+
+### Files touched
+- `app/geometry/__init__.py` — new package marker.
+- `app/geometry/session_geometry.py` — pydantic models mirroring the
+  api-server's `GeometryConfig` wire contract (slug IDs, normalized point
+  bounds, polygon/line cardinality, `extra="forbid"` to surface api drift).
+- `app/geometry/resolver.py` — `resolve_session_geometry()` envelope →
+  `AnalyticsGeometry` conversion with `ResolvedGeometry` lineage wrapper.
+- `app/runtimes/deepstream_runtime/inference.py` — `build_analytics_config`
+  accepts an optional pre-built `AnalyticsGeometry`, loops over rois/lines,
+  emits perpendicular line-crossing reference points.
+- `app/runtimes/deepstream_runtime/metadata_probe.py` —
+  `DeepStreamMetadataProcessManager` accepts `analytics_geometry`; forwarded
+  to both validation + INI-write call sites.
+- `app/runtimes/deepstream_runtime/worker.py` — resolves geometry once in
+  `__init__` (analytics mode only), forwards to PM factory + perception
+  snapshot, injects `applied_geometry` into `_build()` status payload, sets
+  `error_code="geometry_invalid"` on degrade.
+- `app/observations/observation_adapter.py` — `deepstream_source_block`
+  accepts `geometry_source` / `geometry_revision` kwargs (flat, omitted when
+  None — keeps probe-only test fixtures unchanged).
+- `tests/test_session_geometry_models.py` — new pydantic validation tests.
+- `tests/test_session_geometry_resolver.py` — new resolver behavior tests
+  covering null, valid, invalid, all-disabled, IDs/labels, pixel clamp.
+- `tests/test_worker_geometry_resolution.py` — new worker integration tests
+  for resolution, status payload, factory forwarding, error_code policy.
+- `tests/test_perception_geometry.py` — new multi-line / multi-ROI INI
+  rendering tests + diagonal-line perpendicular reference math; the P5-C
+  golden test remains.
+- `tests/test_observation_adapter_contract.py` — `deepstream_source_block`
+  geometry-lineage variants.
+- `docs/api-contracts.md` *(api-server repo)* — P6-A "consumed in P6-C" note
+  past-tensed.
+
+### Testing/checks
+- `uv run ruff check .` / `ruff format --check .` — clean.
+- `uv run mypy app` — clean.
+- `uv run pytest -q` — all pass.
+
+### Known caveats / follow-ups
+- **`direction` not enforced at runtime.** Operator-saved
+  `direction: "in"|"out"` is preserved in observation lineage (and is
+  validated in the pydantic model) but nvdsanalytics still runs `mode=loose`
+  — a count fires on any crossing. Strict-direction enforcement requires
+  swapping the perpendicular reference-point order on `"out"` and switching
+  to `mode=strict`; deferred to a follow-up.
+- **ID collision with the probe default.** If an operator saves an ROI with
+  `id=entry-roi` (the probe-default ID), observation rows from the two
+  sources can't be distinguished by ID alone. Not a runtime issue, but
+  downstream historical-analysis consumers should join on
+  `source.geometry_source` + `source.geometry_revision` to disambiguate.
+- **Restart-time only.** A mid-session dashboard save bumps the revision
+  but the running worker keeps the old geometry. The worker picks up the
+  new revision on its next eligible session. Mid-session reload would
+  require shutting the analytics container down and restarting it cleanly;
+  out of scope for P6-C.
+- **No dashboard "applied geometry" chip yet.** The lineage flows in the
+  processor status payload (`processor_statuses.payload.applied_geometry`)
+  and on observation `source` blocks, but there's no `/v1/cameras/{id}/
+  processor-status` surface for the dashboard to consume cleanly. The
+  follow-up is to add that endpoint + a Monitor-tab chip.
+- **P6-D end-to-end verification** (run a live session, walk through the
+  scene, confirm observations reference the saved IDs and revision) is a
+  separate milestone.
+
+---
+
 ## 2026-05-22 - P6-A: Geometry config in eligible-session schema
 
 ### Summary

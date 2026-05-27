@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -351,20 +352,65 @@ def compute_analytics_geometry(
     return AnalyticsGeometry(rois=[roi], lines=[line])
 
 
+def _line_perpendicular_reference_points(
+    p1: GeometryPoint,
+    p2: GeometryPoint,
+    *,
+    frame_width: int,
+    frame_height: int,
+    offset: int = 80,
+) -> tuple[GeometryPoint, GeometryPoint]:
+    """The two direction-reference points nvdsanalytics needs for a line.
+
+    Perpendicular to the line segment, on opposite sides of its midpoint, at
+    ``offset`` pixels (clamped to the frame). For the horizontal probe-default
+    line this reduces to ``(midpoint - (0, 80), midpoint + (0, 80))`` —
+    byte-identical to the prior hardcoded math, which the P5-C golden test
+    pins. For diagonal operator-drawn lines the reference points now align
+    with the line's normal instead of being stuck on the frame's vertical
+    axis, which is required for any future ``mode=strict`` direction work.
+    """
+    mid_x = (p1.x + p2.x) // 2
+    mid_y = (p1.y + p2.y) // 2
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+    length = math.sqrt(dx * dx + dy * dy) or 1.0
+    # Rotate (dx, dy) by 90° CCW → (-dy, dx); scale to ``offset`` px length.
+    norm_x = -dy / length * offset
+    norm_y = dx / length * offset
+    ref0_x = max(0, min(frame_width - 1, int(mid_x - norm_x)))
+    ref0_y = max(0, min(frame_height - 1, int(mid_y - norm_y)))
+    ref1_x = max(0, min(frame_width - 1, int(mid_x + norm_x)))
+    ref1_y = max(0, min(frame_height - 1, int(mid_y + norm_y)))
+    return GeometryPoint(ref0_x, ref0_y), GeometryPoint(ref1_x, ref1_y)
+
+
 def build_analytics_config(
     *,
     frame_width: int = 1280,
     frame_height: int = 720,
+    geometry: AnalyticsGeometry | None = None,
     roi_label: str = _DEFAULT_ROI_LABEL,
     line_label: str = _DEFAULT_LINE_LABEL,
     roi_margin_pct: float = 0.05,
     class_ids: str = "all",
 ) -> str:
-    """``nvdsanalytics`` config (INI-style) covering one ROI + one line
-    crossing. Modelled on the DS 8.0 sample
-    ``config_nvdsanalytics.txt`` but stripped to the two rules we
-    actually surface in the status payload (ROI + LC). Pure / side-effect
-    free so it is unit-testable without DeepStream.
+    """``nvdsanalytics`` config (INI-style) for the supplied ROIs + line
+    crossings. Pure / side-effect free so it is unit-testable without
+    DeepStream.
+
+    Two call modes:
+
+    - ``geometry=None`` (legacy): build a probe-default geometry from
+      ``roi_margin_pct`` / ``roi_label`` / ``line_label`` via
+      ``compute_analytics_geometry``. Preserves the pre-P6-C behavior the
+      probe tests still exercise.
+    - ``geometry=...`` (P6-C): use the supplied ``AnalyticsGeometry``
+      directly, emitting one ``roi-<id>=`` per ROI and one
+      ``line-crossing-<id>=`` per line under the single
+      ``[roi-filtering-stream-0]`` / ``[line-crossing-stream-0]`` sections
+      that nvdsanalytics expects. ``roi_margin_pct`` / ``roi_label`` /
+      ``line_label`` are ignored in this mode.
 
     The ROI is a near-full-frame rectangle (covers ~90% x 90% by
     default after the 5% margin on each side) — wide enough that an
@@ -375,35 +421,53 @@ def build_analytics_config(
     line. Coordinates are in pixels of the ``config-width`` /
     ``config-height`` (set to the nvstreammux output).
 
-    ``roi_margin_pct`` controls the inset on each side of the frame
-    in [0, 0.49]; ``class_ids`` controls the per-section class
-    filter (see ``normalize_analytics_class_ids``).
-
-    Geometry tuning for specific scenes is out of scope for v0; this
-    config exists to prove the analytics extraction path, not to ship
-    production zones."""
-    geometry = compute_analytics_geometry(
-        frame_width=frame_width,
-        frame_height=frame_height,
-        roi_margin_pct=roi_margin_pct,
-        roi_label=roi_label,
-        line_label=line_label,
-    )
+    ``class_ids`` controls the per-section class filter (see
+    ``normalize_analytics_class_ids``).
+    """
+    if geometry is None:
+        geometry = compute_analytics_geometry(
+            frame_width=frame_width,
+            frame_height=frame_height,
+            roi_margin_pct=roi_margin_pct,
+            roi_label=roi_label,
+            line_label=line_label,
+        )
     class_id_value = normalize_analytics_class_ids(class_ids)
-    # ROI polygon — clockwise from top-left (see compute_analytics_geometry).
-    roi_points = ";".join(f"{p.x};{p.y}" for p in geometry.rois[0].points)
-    # nvdsanalytics LC requires the 2 line-segment endpoints PLUS 2 direction-
-    # reference point pairs: line_x0;line_y0;line_x1;line_y1;dir_x0;dir_y0;dir_x1;dir_y1.
-    # Direction reference points (from above the line to below, so "downwards"
-    # trips the crossing) are an LC detail kept here, not in the geometry.
-    line_points = geometry.lines[0].points
-    line_y = line_points[0].y
-    dir_x = frame_width // 2
-    dir_y0 = max(0, line_y - 80)
-    dir_y1 = min(frame_height - 1, line_y + 80)
-    lc_points = (
-        ";".join(f"{p.x};{p.y}" for p in line_points) + f";{dir_x};{dir_y0};{dir_x};{dir_y1}"
-    )
+
+    roi_lines: list[str] = []
+    for roi in geometry.rois:
+        # ROI polygon — clockwise from top-left (see compute_analytics_geometry).
+        # The DS 8.0 nvdsanalytics property parser keys ROIs off "roi-"-prefixed
+        # properties: the label is the suffix after "roi-" in the KEY name
+        # (NOT in the value); the value is the polygon point list.
+        # See sources/gst-plugins/gst-nvdsanalytics/nvdsanalytics_property_parser.cpp
+        # (DSANALYTICS_PROPERTY_ROI = "roi-"). Verified against the DS 8.0
+        # sample at sample_apps/deepstream-nvdsanalytics-test/config_nvdsanalytics.txt
+        # which uses ``roi-RF=`` with "RF" as the label.
+        points = ";".join(f"{p.x};{p.y}" for p in roi.points)
+        roi_lines.append(f"roi-{roi.id}={points}\n")
+
+    lc_lines: list[str] = []
+    for line in geometry.lines:
+        # nvdsanalytics LC requires the 2 line-segment endpoints PLUS 2
+        # direction-reference point pairs:
+        #   line_x0;line_y0;line_x1;line_y1;dir_x0;dir_y0;dir_x1;dir_y1
+        # The reference points are perpendicular to the segment so the math
+        # works for any line orientation (not just the horizontal probe-default).
+        endpoints = line.points
+        ref0, ref1 = _line_perpendicular_reference_points(
+            endpoints[0],
+            endpoints[1],
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        lc_points = (
+            ";".join(f"{p.x};{p.y}" for p in endpoints) + f";{ref0.x};{ref0.y};{ref1.x};{ref1.y}"
+        )
+        # line-crossing-<Label>=<line-coords>;<direction-coords> — label is
+        # part of the key (parser strips the "line-crossing-" prefix).
+        lc_lines.append(f"line-crossing-{line.id}={lc_points}\n")
+
     return (
         "[property]\n"
         "enable=1\n"
@@ -414,33 +478,26 @@ def build_analytics_config(
         "display-font-size=12\n"
         f"[roi-filtering-stream-{_ANALYTICS_STREAM_ID}]\n"
         "enable=1\n"
-        # The DS 8.0 nvdsanalytics property parser keys ROIs off "roi-"-
-        # prefixed properties: the label is the suffix after "roi-" in the
-        # KEY name (NOT in the value); the value is the polygon point list.
-        # See sources/gst-plugins/gst-nvdsanalytics/nvdsanalytics_property_parser.cpp
-        # (DSANALYTICS_PROPERTY_ROI = "roi-"). Verified against the DS 8.0
-        # sample at sample_apps/deepstream-nvdsanalytics-test/config_nvdsanalytics.txt
-        # which uses ``roi-RF=`` with "RF" as the label.
-        f"roi-{roi_label}={roi_points}\n"
+        + "".join(roi_lines)
         # inverse-roi=0: count objects INSIDE the polygon (vs outside).
-        "inverse-roi=0\n"
+        + "inverse-roi=0\n"
         # P4-D follow-up: class filter is env-driven via
         # ``UPSTREAM_DEEPSTREAM_ANALYTICS_CLASS_IDS``. Default ``-1``
         # (all classes) — the live run showed TrafficCamNet sometimes
         # misclassifies people as cars, so probe-default-all is the
         # safe choice. Production scenes can narrow per-deployment.
-        f"class-id={class_id_value}\n"
-        f"[line-crossing-stream-{_ANALYTICS_STREAM_ID}]\n"
-        "enable=1\n"
-        # line-crossing-<Label>=<line-coords>;<direction-coords> — label
-        # is part of the key (parser strips the "line-crossing-" prefix).
-        f"line-crossing-{line_label}={lc_points}\n"
+        + f"class-id={class_id_value}\n"
+        + f"[line-crossing-stream-{_ANALYTICS_STREAM_ID}]\n"
+        + "enable=1\n"
+        + "".join(lc_lines)
         # Same class filter as the ROI section.
-        f"class-id={class_id_value}\n"
-        "extended=0\n"
+        + f"class-id={class_id_value}\n"
+        + "extended=0\n"
         # mode=loose: count any crossing without strict direction
         # adherence; we want to prove events flow, not enforce direction.
-        "mode=loose\n"
+        # P6-C preserves operator ``direction: "in"|"out"`` in observation
+        # lineage only — strict-direction enforcement is a follow-up.
+        + "mode=loose\n"
     )
 
 
