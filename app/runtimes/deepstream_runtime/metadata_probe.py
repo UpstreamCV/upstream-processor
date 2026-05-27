@@ -28,6 +28,7 @@ from uuid import uuid4
 
 from app.redact import redact_rtsp
 from app.runtimes.deepstream_runtime.inference import (
+    AnalyticsGeometry,
     build_analytics_config,
     build_pgie_config,
     build_tracker_config,
@@ -148,6 +149,10 @@ class DeepStreamMetadataProcessManager:
         # so existing callers/tests don't need to update.
         analytics_roi_margin_pct: float = 0.05,
         analytics_class_ids: str = "all",
+        # P6-C: when supplied, the resolved (operator-saved or fallback)
+        # geometry is rendered into the nvdsanalytics INI instead of the
+        # probe-default. ``analytics_roi_margin_pct`` is ignored in this case.
+        analytics_geometry: AnalyticsGeometry | None = None,
     ) -> None:
         if analytics_enabled and not tracker_enabled:
             raise ValueError(
@@ -175,6 +180,7 @@ class DeepStreamMetadataProcessManager:
         self._analytics_enabled = analytics_enabled
         self._analytics_roi_margin_pct = analytics_roi_margin_pct
         self._analytics_class_ids = analytics_class_ids
+        self._analytics_geometry = analytics_geometry
         # Container name prefix encodes the mode for easy `docker ps`
         # grouping: -dsm (metadata), -dst (tracker), -dsa (analytics).
         if analytics_enabled:
@@ -205,6 +211,7 @@ class DeepStreamMetadataProcessManager:
             build_analytics_config(
                 frame_width=self._width,
                 frame_height=self._height,
+                geometry=self._analytics_geometry,
                 roi_margin_pct=self._analytics_roi_margin_pct,
                 class_ids=self._analytics_class_ids,
             )
@@ -234,6 +241,7 @@ class DeepStreamMetadataProcessManager:
                 build_analytics_config(
                     frame_width=self._width,
                     frame_height=self._height,
+                    geometry=self._analytics_geometry,
                     roi_margin_pct=self._analytics_roi_margin_pct,
                     class_ids=self._analytics_class_ids,
                 ),

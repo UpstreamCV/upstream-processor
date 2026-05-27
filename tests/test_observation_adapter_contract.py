@@ -784,6 +784,49 @@ def test_deepstream_source_block_without_tracker() -> None:
     assert src["runtime"] == "deepstream"
 
 
+def test_deepstream_source_block_carries_geometry_lineage() -> None:
+    """P6-C: line-crossing / ROI observations stamp the resolved geometry
+    revision + source so downstream consumers can correlate emitted events
+    to a specific dashboard save. Flat keys (consistent with the existing
+    ``runtime`` / ``analytics_plugin`` shape)."""
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0",
+        tracker_algorithm="iou",
+        geometry_source="operator_saved",
+        geometry_revision=5,
+    )
+    assert src["geometry_source"] == "operator_saved"
+    assert src["geometry_revision"] == 5
+    # Existing keys untouched.
+    assert src["runtime"] == "deepstream"
+    assert src["package_id"] == "deepstream.analytics_probe.v0"
+
+
+def test_deepstream_source_block_omits_geometry_when_unset() -> None:
+    """Probe-only fixtures and pre-P6-C call sites that don't pass geometry
+    kwargs should still get the legacy source block — keeps test data and
+    older code paths from leaking a misleading ``geometry_source=null``."""
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0", tracker_algorithm="iou"
+    )
+    assert "geometry_source" not in src
+    assert "geometry_revision" not in src
+
+
+def test_deepstream_source_block_default_source_carries_no_revision() -> None:
+    """When the camera has no saved geometry, ``geometry_source="default"``
+    and ``geometry_revision`` is omitted (the resolver passes ``None`` and
+    the helper drops it). This is the probe-default lineage."""
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0",
+        tracker_algorithm="iou",
+        geometry_source="default",
+        geometry_revision=None,
+    )
+    assert src["geometry_source"] == "default"
+    assert "geometry_revision" not in src
+
+
 # --- malformed inputs are skipped, not crashing ------------------------
 
 

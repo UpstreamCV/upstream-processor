@@ -1125,10 +1125,18 @@ def deepstream_source_block(
     *,
     package_id: str,
     tracker_algorithm: str | None = None,
+    geometry_source: str | None = None,
+    geometry_revision: int | None = None,
 ) -> dict[str, Any]:
     """Stable provenance block for the ``source`` field on events from
     the DeepStream analytics path. Pulled out so worker code does NOT
-    inline these literals at the emit site."""
+    inline these literals at the emit site.
+
+    P6-C: ``geometry_source`` / ``geometry_revision`` are flat (consistent
+    with the existing ``runtime`` / ``analytics_plugin`` / etc keys) so
+    downstream consumers can index on the lineage without parsing nested
+    objects. Omitted when None — keeps probe-only test fixtures unchanged.
+    """
     src: dict[str, Any] = {
         "runtime": "deepstream",
         "package_id": package_id,
@@ -1137,6 +1145,10 @@ def deepstream_source_block(
     }
     if tracker_algorithm is not None:
         src["tracker_algorithm"] = tracker_algorithm
+    if geometry_source is not None:
+        src["geometry_source"] = geometry_source
+    if geometry_revision is not None:
+        src["geometry_revision"] = geometry_revision
     return src
 
 

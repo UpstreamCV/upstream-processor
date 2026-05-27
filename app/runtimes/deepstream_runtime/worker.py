@@ -44,6 +44,7 @@ from app.errors import (
     ApiSessionGoneError,
     ApiValidationError,
 )
+from app.geometry.resolver import ResolvedGeometry, resolve_session_geometry
 from app.observations.bridge_queue import BoundedBridgeQueue, DropPolicy
 from app.observations.metadata_models import NeutralFrameMetadata
 from app.observations.observation_adapter import (
@@ -61,6 +62,7 @@ from app.perception.schemas import PerceptionSnapshotPayload
 from app.redact import redact_rtsp, scrub_rtsp_in_text
 from app.runtimes.base import Runtime, WorkerState
 from app.runtimes.deepstream_runtime.inference import (
+    AnalyticsGeometry,
     DeepStreamInferenceProcessManager,
     compute_analytics_geometry,
 )
@@ -375,6 +377,38 @@ class DeepStreamWorker(Runtime):
             maximum=settings.backoff_max_seconds,
             jitter=settings.backoff_jitter,
         )
+        # P6-C: resolve operator-saved geometry once. Only analytics-mode
+        # workers consume geometry (line crossings, ROI occupancy, etc.); the
+        # other modes ignore it. Resolution is restart-time only — a mid-
+        # session revision bump is picked up on the next eligible session.
+        self._resolved_geometry: ResolvedGeometry | None = None
+        if self._mode == _ANALYTICS_MODE:
+            fallback = compute_analytics_geometry(
+                frame_width=session.approved.width,
+                frame_height=session.approved.height,
+                roi_margin_pct=settings.deepstream_analytics_roi_margin_pct,
+            )
+            self._resolved_geometry = resolve_session_geometry(
+                session.geometry_config,
+                frame_width=session.approved.width,
+                frame_height=session.approved.height,
+                fallback=fallback,
+            )
+            _log.info(
+                "geometry resolved: camera_id=%s stream_session_id=%s source=%s "
+                "revision=%s line_count=%d roi_count=%d%s",
+                session.camera_id,
+                session.session_id,
+                self._resolved_geometry.source,
+                self._resolved_geometry.revision,
+                self._resolved_geometry.line_count,
+                self._resolved_geometry.roi_count,
+                (
+                    f" error_reason={self._resolved_geometry.error_reason!r}"
+                    if self._resolved_geometry.error_reason
+                    else ""
+                ),
+            )
 
     # --- Runtime interface ------------------------------------------------
 
@@ -420,6 +454,13 @@ class DeepStreamWorker(Runtime):
         if self._mode in (_METADATA_MODE, _TRACKER_MODE, _ANALYTICS_MODE):
             tracker_enabled = self._mode in (_TRACKER_MODE, _ANALYTICS_MODE)
             analytics_enabled = self._mode == _ANALYTICS_MODE
+            # P6-C: forward the resolved operator-saved (or fallback) geometry
+            # to the analytics process manager. None outside of analytics mode.
+            analytics_geometry: AnalyticsGeometry | None = (
+                self._resolved_geometry.geometry
+                if analytics_enabled and self._resolved_geometry is not None
+                else None
+            )
             return DeepStreamMetadataProcessManager(
                 rtsp_url=self._session.internal_rtsp_url,
                 image=self._settings.deepstream_pyds_image,
@@ -442,6 +483,7 @@ class DeepStreamWorker(Runtime):
                 analytics_enabled=analytics_enabled,
                 analytics_roi_margin_pct=(self._settings.deepstream_analytics_roi_margin_pct),
                 analytics_class_ids=self._settings.deepstream_analytics_class_ids,
+                analytics_geometry=analytics_geometry,
             )
         if self._mode == _INFERENCE_MODE:
             return DeepStreamInferenceProcessManager(
@@ -999,6 +1041,17 @@ class DeepStreamWorker(Runtime):
             deepstream_source_block(
                 package_id=self._package.package_id,
                 tracker_algorithm=self._settings.deepstream_tracker_algorithm,
+                # P6-C: stamp every emitted line-crossing / ROI observation
+                # with the geometry lineage so downstream consumers can
+                # correlate counts back to a specific dashboard save.
+                geometry_source=(
+                    self._resolved_geometry.source if self._resolved_geometry is not None else None
+                ),
+                geometry_revision=(
+                    self._resolved_geometry.revision
+                    if self._resolved_geometry is not None
+                    else None
+                ),
             )
             if observations_enabled
             else {}
@@ -1007,16 +1060,15 @@ class DeepStreamWorker(Runtime):
         # does NOT require a writer (perception posts directly via the API
         # client). The ROI/line geometry is frame-size-invariant for the
         # session, so it is computed once here and reused every snapshot.
+        # P6-C: the snapshot embeds the *applied* geometry — operator-saved
+        # when available, otherwise probe-default — so the dashboard overlay
+        # matches the rules nvdsanalytics is running with.
         perception_enabled = (
             self._mode == _ANALYTICS_MODE and self._settings.perception_snapshot_enabled
         )
         perception_geometry: dict[str, Any] = (
-            compute_analytics_geometry(
-                frame_width=self._session.approved.width,
-                frame_height=self._session.approved.height,
-                roi_margin_pct=self._settings.deepstream_analytics_roi_margin_pct,
-            ).to_json()
-            if perception_enabled
+            self._resolved_geometry.geometry.to_json()
+            if perception_enabled and self._resolved_geometry is not None
             else {}
         )
 
@@ -1604,6 +1656,20 @@ class DeepStreamWorker(Runtime):
             _log.warning("error stopping decode process: %s", exc)
 
     def _build(self, status: str, **fields: Any) -> Any:
+        # P6-C: every status post from an analytics worker carries the
+        # geometry lineage block in ``payload.applied_geometry``. On invalid
+        # operator-saved geometry the worker also surfaces
+        # ``error_code="geometry_invalid"`` — but only when the caller didn't
+        # set a more-specific error (container crash, model load failure,
+        # etc.), so runtime errors keep their own taxonomy.
+        if self._resolved_geometry is not None:
+            payload = dict(fields.pop("payload", None) or {})
+            payload.setdefault("applied_geometry", self._resolved_geometry.status_payload())
+            fields["payload"] = payload
+            if self._resolved_geometry.source == "fallback_default_on_error":
+                fields.setdefault("error_code", "geometry_invalid")
+                if self._resolved_geometry.error_reason:
+                    fields.setdefault("error_message", self._resolved_geometry.error_reason)
         return build_status_request(
             session=self._session,
             processor_id=self._settings.processor_id,
