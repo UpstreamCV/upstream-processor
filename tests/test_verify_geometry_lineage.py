@@ -94,6 +94,7 @@ def _observation(
     type_: str,
     line_id: str | None = None,
     roi_id: str | None = None,
+    zone_id: str | None = None,
     geometry_source: str = "operator_saved",
     geometry_revision: int = 9,
     observed_at: str = "2026-05-27T15:31:00Z",
@@ -111,6 +112,8 @@ def _observation(
         payload["line_id"] = line_id
     if roi_id is not None:
         payload["roi_id"] = roi_id
+    if zone_id is not None:
+        payload["zone_id"] = zone_id
     return {
         "id": obs_id or "00000000-0000-0000-0000-000000000001",
         "camera_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
@@ -226,6 +229,10 @@ def _all_obs(verify, **per_type: list[dict[str, Any]]) -> dict[str, list[dict[st
 
 
 def test_observations_pass(verify) -> None:  # type: ignore[no-untyped-def]
+    """Mirrors the real wire shapes the analytics worker emits:
+    ``processor.roi_occupancy`` uses ``payload.roi_id`` while
+    ``processor.zone_entered`` and ``processor.dwell_started`` use
+    ``payload.zone_id`` (both encode the same operator slug)."""
     rows_by_type = _all_obs(
         verify,
         line_crossing=[
@@ -233,8 +240,8 @@ def test_observations_pass(verify) -> None:  # type: ignore[no-untyped-def]
             _observation(type_=verify._OBS_TYPE_LINE, line_id="line-1"),
         ],
         roi_occupancy=[_observation(type_=verify._OBS_TYPE_ROI, roi_id="roi-1")],
-        zone_entered=[_observation(type_=verify._OBS_TYPE_ZONE, roi_id="roi-1")],
-        dwell_started=[_observation(type_=verify._OBS_TYPE_DWELL, roi_id="roi-1")],
+        zone_entered=[_observation(type_=verify._OBS_TYPE_ZONE, zone_id="roi-1")],
+        dwell_started=[_observation(type_=verify._OBS_TYPE_DWELL, zone_id="roi-1")],
     )
     r = verify.check_observations(
         rows_by_type,
@@ -245,6 +252,54 @@ def test_observations_pass(verify) -> None:  # type: ignore[no-untyped-def]
         stream_session_id=None,
     )
     assert r.verdict == verify.Verdict.PASS
+
+
+def test_observations_handles_per_type_slug_key(verify) -> None:  # type: ignore[no-untyped-def]
+    """Pin the slug-key contract per observation type. P6-D-live found the
+    verifier originally only checked ``payload.roi_id`` and so false-FAILed
+    on zone/dwell rows (which use ``payload.zone_id``). This regression test
+    ensures both keys are accepted for the ROI/zone/dwell types."""
+    # All three ROI-family types reference the same operator slug, just via
+    # a different payload key. Build one row per type using the type's real
+    # key shape and confirm the verifier accepts all of them.
+    rows_by_type = _all_obs(
+        verify,
+        roi_occupancy=[_observation(type_=verify._OBS_TYPE_ROI, roi_id="roi-1")],
+        zone_entered=[_observation(type_=verify._OBS_TYPE_ZONE, zone_id="roi-1")],
+        dwell_started=[_observation(type_=verify._OBS_TYPE_DWELL, zone_id="roi-1")],
+    )
+    r = verify.check_observations(
+        rows_by_type,
+        expected_revision=9,
+        expected_lines=None,
+        expected_rois=["roi-1"],
+        since=None,
+        stream_session_id=None,
+    )
+    # Line absence → PARTIAL (no --expected-lines supplied); ROI-family
+    # rows must all be accepted as referencing ``roi-1`` regardless of which
+    # key the analytics worker chose for that type.
+    assert r.verdict == verify.Verdict.PARTIAL
+    assert any("roi slugs observed: ['roi-1']" in d for d in r.details)
+
+
+def test_observations_fail_on_unknown_zone_slug(verify) -> None:  # type: ignore[no-untyped-def]
+    """A zone_entered row whose ``payload.zone_id`` is not in the expected
+    set is still a real lineage mismatch and must FAIL (not be hidden by
+    the roi_id fallback)."""
+    rows_by_type = _all_obs(
+        verify,
+        zone_entered=[_observation(type_=verify._OBS_TYPE_ZONE, zone_id="stale-slug")],
+    )
+    r = verify.check_observations(
+        rows_by_type,
+        expected_revision=9,
+        expected_lines=None,
+        expected_rois=["roi-1"],
+        since=None,
+        stream_session_id=None,
+    )
+    assert r.verdict == verify.Verdict.FAIL
 
 
 def test_observations_partial_when_no_line_rows(verify) -> None:  # type: ignore[no-untyped-def]
