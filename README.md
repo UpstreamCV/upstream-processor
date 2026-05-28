@@ -325,3 +325,13 @@ handler scrubs it, the header, and JWT-shaped strings as defence-in-depth).
 ```sh
 make check     # ruff check + ruff format --check + mypy app + pytest
 ```
+
+## Project Tracking
+
+We use GitHub Issues as a lightweight tracker for meaningful bugs,
+features, follow-ups, and milestone work. Issues should include clear
+context and acceptance criteria, but should not become heavy process.
+Small fast-moving implementation details can stay in PRs, commit logs,
+or working notes.
+
+The cross-repo plan lives in `../docs/github-issues-plan.md`.
