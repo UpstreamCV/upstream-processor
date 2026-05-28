@@ -353,12 +353,18 @@ def check_observations(
                         f"not in expected {sorted(expected_lines_set)}"
                     )
             else:
-                slug = payload.get("roi_id")
+                # The ROI slug lives under different keys depending on type:
+                #   processor.roi_occupancy → payload.roi_id
+                #   processor.zone_entered  → payload.zone_id
+                #   processor.dwell_started → payload.zone_id
+                # All three encode the same operator slug; fall back through
+                # both so the verifier doesn't false-FAIL on zone/dwell rows.
+                slug = payload.get("roi_id") or payload.get("zone_id")
                 if slug:
                     seen_roi_slugs.add(slug)
                 if expected_rois_set is not None and slug not in expected_rois_set:
                     failures.append(
-                        f"{obs_type} row {row.get('id')}: roi_id={slug!r} "
+                        f"{obs_type} row {row.get('id')}: roi/zone slug={slug!r} "
                         f"not in expected {sorted(expected_rois_set)}"
                     )
 
