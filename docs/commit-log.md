@@ -4,6 +4,107 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-27 - P6-D: End-to-end geometry lineage verification
+
+### Summary
+P6-C is live-verified ad-hoc (tail the log, grep the temp INI, eyeball the
+dashboard). P6-D formalizes that proof as a single repeatable command that
+exits with a machine-checkable verdict code, so the same loop can be run on
+demand without rebuilding a stream.
+
+The verification reads three witnesses from the api-server (no shell access
+to the processor host required) plus an optional fourth from disk:
+
+1. `GET /v1/cameras/{id}/processor-status/latest` — the new caller-authed
+   read endpoint that exposes the full `processor_statuses` row, including
+   the `payload.applied_geometry` lineage block P6-C stamps.
+2. `GET /v1/cameras/{id}/observations/recent?type=<...>` (already existed)
+   for each of `processor.line_crossing`, `processor.roi_occupancy`,
+   `processor.zone_entered`, `processor.dwell_started`. Each row's
+   `payload.source.geometry_source/geometry_revision` and
+   `payload.line_id`/`payload.roi_id` are checked against expected slugs.
+3. `GET /v1/cameras/{id}/perception/latest` (already existed) — an
+   independent witness from a different table; the snapshot embeds the
+   applied geometry, so its `snapshot.geometry.lines[].id` and
+   `snapshot.geometry.rois[].id` must match expected.
+4. Optional: `--analytics-config-path /tmp/.../analytics_config.txt`
+   parses the live nvdsanalytics INI and pins that operator slugs are
+   present AND the probe-default `roi-entry-roi=64;36;…` is not leaked
+   alongside them.
+
+### Verdict matrix
+- **PASS** (exit 0) — every witness confirms operator lineage.
+- **PARTIAL** (exit 1) — processor status + ROI/zone/dwell + snapshot pass,
+  but `line_crossing` rows are absent (most common: operator walked
+  parallel to a vertical saved line). Not a P6-C bug; re-walk perpendicular.
+- **FAIL** (exit 2) — lineage is wrong somewhere: `geometry_source=default`
+  on a row, revision mismatch, unknown slug, `error_code=geometry_invalid`
+  on status, or probe-default ROI leaked into the runtime INI.
+- **BLOCKED** (exit 3) — processor never reported (`processor_status_not_found`),
+  HTTP 4xx/5xx, or `UPSTREAM_API_TOKEN` missing.
+
+The processor-status-blocked case vetoes any PARTIAL/PASS (we can't credibly
+judge the rest without that witness). A missing perception snapshot is a
+soft block on just that witness — it does not veto PASS by itself.
+
+### Files touched
+
+In `upstream-api-server`:
+- `src/upstream_api/schemas/processor.py` — new `ProcessorStatusRecord` (full
+  row, including `payload`/`fps_*`/`error_*` that the write-side
+  `ProcessorStatusResponse` deliberately omitted) + `LatestProcessorStatusResponse`.
+- `src/upstream_api/services/processor.py` — new `fetch_latest_processor_status`
+  + `_LATEST_PROCESSOR_STATUS_SQL` with an optional `stream_session_id`
+  filter (tri-state predicate, matches every row when null).
+- `src/upstream_api/routers/cameras.py` — new `GET /v1/cameras/{id}/processor-status/latest`
+  route. Caller-authed, account-scoped, 404
+  `processor_status_not_found` mirroring `perception/latest`.
+- `tests/test_processor_status_latest.py` — 10 new tests covering happy
+  path, `applied_geometry` payload flow-through, `error_code` round-trip,
+  query scoping (account, camera, optional stream_session_id), 401, 404
+  on missing row, 404 on cross-account, and the SQL-predicate-pin
+  regression guard.
+- `docs/api-contracts.md` — endpoint documented alongside the existing
+  observations/perception reads, with the `applied_geometry` shape and the
+  `error_code=geometry_invalid` degrade contract spelled out.
+
+In `upstream-processor`:
+- `scripts/verify_geometry_lineage.py` — argparse CLI, self-contained read
+  client using `httpx` + Bearer auth, pure verdict logic factored out for
+  unit testing, exit codes 0/1/2/3, `--debug` dumps with `rtsp://...`
+  scrubbed via `app.redact.scrub_rtsp_in_text`. Token sourced from
+  `UPSTREAM_API_TOKEN` env-only; never printed.
+- `tests/test_verify_geometry_lineage.py` — 35 tests:
+  pure verdict-logic tests for each `check_*` helper covering the full
+  verdict matrix (PASS / PARTIAL / FAIL / BLOCKED on each path),
+  `aggregate_verdict` rules, `respx`-mocked end-to-end tests proving
+  Bearer auth + URL routing + the stream_session_id query param threads
+  through, redaction test proving `--debug` masks RTSP paths and never
+  prints the bearer token, and exit-code pin.
+- `docs/p6-d-geometry-lineage-verification.md` — operator-facing
+  step-by-step checklist (save geometry → restart processor → confirm
+  `geometry resolved` line for the new session → walk the perpendicular
+  pattern → run the verify script → read the verdict).
+
+### Testing/checks
+- `uv run ruff check .` / `ruff format --check .` — clean.
+- `uv run mypy app` — clean.
+- `uv run pytest -q` — all pass.
+
+### Known caveats / follow-ups
+- **No CI hook yet.** The script is run-on-demand. A future CI job could
+  run a canned synthetic walk and gate on FAIL/BLOCKED (not PARTIAL — line
+  crossings depend on physical motion).
+- **Dashboard "applied geometry" Monitor-tab chip** — deferred per the
+  P6-D guardrails. The new processor-status/latest endpoint makes it cheap
+  to add as a follow-up; it would consume the same `payload.applied_geometry`
+  block the verify script reads.
+- **Strict-direction enforcement, mid-session reload, reliability findings,
+  rectangle/box ROI authoring** — all still tracked as P6-C follow-ups; not
+  touched by P6-D.
+
+---
+
 ## 2026-05-27 - P6-C: Processor consumes saved geometry
 
 ### Summary
