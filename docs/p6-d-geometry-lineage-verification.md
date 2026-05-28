@@ -6,6 +6,63 @@
 > wire-carry, processor resolver, nvdsanalytics translation, or observation
 > emission).
 
+## Current status (as of 2026-05-27)
+
+**P6-C:** ✅ PASS — complete. Dashboard-saved geometry flows
+API → processor → nvdsanalytics → observations. Operator slugs reach the
+runtime; ROI/zone/dwell observations carry geometry lineage.
+
+**P6-D:** 🟡 **PARTIAL PASS** — infrastructure verified end-to-end on three of
+four witnesses; the line_crossing witness is still pending. Decision:
+keep at PARTIAL PASS and run a targeted line-crossing follow-up later
+rather than blocking next reliability work on it.
+
+| Witness | Status |
+|---|---|
+| Applied geometry on processor status (`payload.applied_geometry`) | ✅ verified |
+| Runtime nvdsanalytics config (saved slugs, no probe-default leakage) | ✅ verified |
+| ROI / zone / dwell observation lineage (`payload.source.geometry_*`) | ✅ verified |
+| Perception snapshot embedded geometry | ✅ verified |
+| Line-crossing observation lineage | ⏸️ pending — live walk didn't produce rows (detection quality, not a P6-C/P6-D bug) |
+
+**Verifier:** `scripts/verify_geometry_lineage.py` at processor commit
+`90f3f8d` + `a2acfef` (the `zone_id` slug fix from the first live run). All
+37 verifier unit tests pass; full processor suite passes at 480/480.
+
+**Dashboard Applied Geometry chip:** ✅ implemented, tested, and pushed at
+dashboard commit `90f079a`. Reads the same
+`processor_statuses.payload.applied_geometry` block the verifier reads.
+First visible reliability surface backed by P6-D lineage. Seven render
+variants: operator_saved (positive), default (warning), fallback (warning),
+geometry_invalid (danger), no_status (muted), missing_applied_geometry
+(muted), unknown_source (forward-compat).
+
+## Follow-up queue
+
+In order of value, post-closeout:
+
+1. **First reliability finding** — alert / notification when an actively-running
+   processor session reports `source = default`, `source =
+   fallback_default_on_error`, or `error_code = geometry_invalid`. The chip
+   surfaces these visually today; the alert turns them into an action.
+2. **Targeted line-crossing live test** — re-run P6-D with a walk that
+   crosses the saved vertical lines perpendicular (and at sufficient
+   detection confidence) to escalate the verdict from PARTIAL to PASS.
+3. **Rename `payload.debug.geometry_source = "probe_default"`** on
+   observations — cosmetic. The authoritative `payload.source.geometry_source`
+   is correct; the debug field is the in-container pyds app's self-report
+   and is misleading because it doesn't know the supervisor stamped
+   operator geometry over its head.
+4. **Strict line-direction enforcement** — honor saved
+   `direction: "in" | "out"` at the nvdsanalytics layer (`mode=strict`).
+   Today the runtime is `mode=loose`; direction is preserved in lineage but
+   not enforced.
+5. **Mid-session geometry reload** — currently restart-time only. Pick up a
+   new revision without restarting the session.
+6. **Rectangle / box ROI authoring** in the geometry editor.
+
+None of these block the next milestone.
+
 ## What this verifies
 
 Five witnesses, three of them from the api-server (no shell access to the
