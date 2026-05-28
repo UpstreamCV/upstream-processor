@@ -1,0 +1,89 @@
+[Unit]
+# Upstream Processor supervisor (long-running).
+#
+# Polls api.upstreamcv.com every ~5s for eligible stream sessions and spawns
+# one worker per session (mock runtime or DeepStream subprocess). Workers are
+# what use the GPU; the supervisor itself is a lightweight HTTP client.
+#
+# When this unit is running but no cameras are streaming (or all cameras
+# have processing_enabled=false once that flag lands), the supervisor sits
+# idle at ``reconcile: eligible=0 active=0`` consuming negligible resources.
+# So "the processor is always on" is fine -- what saves GPU is workers not
+# spawning, controlled by eligibility (M3 Phase 2/3).
+Description=Upstream Processor supervisor (DeepStream / mock workers)
+Documentation=https://github.com/UpstreamCV/upstream-processor
+
+# Wait for the network stack and docker. DeepStream workers may launch
+# subprocess containers; we don't want startup races if this unit fires
+# before docker.socket is ready on boot.
+After=network-online.target docker.service
+Wants=network-online.target
+
+# Burst limit lives in [Unit] on systemd 255 (Ubuntu 24.04). Newer systemd
+# also accepts it in [Service]; older only in [Unit]. Five restart attempts
+# within 60s and then systemd holds the unit failed.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+# ``exec`` (not ``simple``): systemd waits for the binary's execve() call
+# to complete before considering the unit started. Catches missing-binary
+# / EPERM / etc. at start time rather than silently restarting forever.
+Type=exec
+User=crowdcounts2
+Group=crowdcounts2
+
+WorkingDirectory=/home/crowdcounts2/Documents/Upstream/upstream-processor
+
+# Existing .env is already KEY=VALUE format. Keep secrets in that file
+# (mode 600, owned by crowdcounts2) -- this unit reads them at start.
+# Confirmed keys: UPSTREAM_API_BASE_URL, UPSTREAM_DEEPSTREAM_*, etc.
+EnvironmentFile=/home/crowdcounts2/Documents/Upstream/upstream-processor/.env
+
+# Full path to uv since systemd doesn't run a login shell -- no PATH
+# augmentation from .bashrc / .profile.
+ExecStart=/home/crowdcounts2/.local/bin/uv run python -m app.main
+
+# uv writes its lock/temp/cache files under ~/.cache/uv by default, which
+# the ProtectHome=read-only sandbox blocks. Relocate the cache to /tmp
+# (already in ReadWritePaths) instead of weakening the sandbox.
+Environment="UV_CACHE_DIR=/tmp/upstream-processor-uv-cache"
+
+# Restart policy.
+#
+# The supervisor's documented exit codes (app/main.py:72):
+#   0  clean shutdown (SIGTERM / SIGINT)   -- don't restart
+#   1  unexpected error                    -- restart with backoff
+#   2  auth failure                        -- do NOT restart (operator must fix .env)
+#   3  contract error                      -- do NOT restart (api-server contract drift)
+#
+# RestartPreventExitStatus pins 2 + 3 so we don't loop on misconfigured creds
+# or an api-server upgrade that breaks the contract.
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=2 3
+
+# Graceful shutdown. The supervisor's shutdown path waits up to ~25s for
+# its workers to drain (worker_manager.py:49 -- overall_shutdown_timeout=25).
+# Give a bit more headroom so SIGKILL doesn't fire mid-drain.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=40s
+
+# Journal logging. Replaces the ad-hoc /tmp/upstream-live-p6c/*.log files
+# we've been using during dev.
+#   View live:    journalctl -u upstream-processor -f
+#   Last 200:     journalctl -u upstream-processor -n 200 --no-pager
+#   Since boot:   journalctl -u upstream-processor -b
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=upstream-processor
+
+# Mild sandboxing. Doesn't lock us out of docker / GPU access.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/crowdcounts2/Documents/Upstream/upstream-processor /tmp
+
+[Install]
+WantedBy=multi-user.target
