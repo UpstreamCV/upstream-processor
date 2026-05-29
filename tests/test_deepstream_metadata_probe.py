@@ -692,3 +692,61 @@ async def test_pm_keep_temp_files_preserves_workdir(tmp_path, monkeypatch) -> No
     # (operator may want to inspect contents post-run).
     assert wd.exists()
     assert pm._work_dir is wd
+
+
+async def test_pm_stop_bounded_when_killed_proc_does_not_reap(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Regression: a long-running --gpus container killed mid-stream can leave
+    the docker-run client stalled on teardown, so ``self._proc.wait()`` after
+    kill never returns. stop() must NOT hang on that wait forever -- worker
+    teardown is awaited by the supervisor, so an unbounded wait wedges the
+    whole reconcile loop (observed live after the continuous-mode change).
+
+    Model a proc whose wait() never returns and whose terminate() doesn't make
+    it exit (so the kill path runs), then assert stop() still completes within
+    a bounded time."""
+
+    class _HangingProc:
+        def __init__(self) -> None:
+            self.returncode: int | None = None  # stays alive -> kill path runs
+            self.stdout = None
+
+        async def wait(self) -> int:
+            await asyncio.sleep(3600)  # never returns within the test window
+            return -9
+
+        def terminate(self) -> None:
+            pass  # does not cause exit -> the first wait_for times out
+
+        def kill(self) -> None:
+            pass  # SIGKILL "sent" but wait() still hangs (stalled reap)
+
+    class _QuickStopper:
+        async def wait(self) -> int:
+            return 0
+
+    async def _fake_exec(*args: object, **_k: object):  # type: ignore[no-untyped-def]
+        if args and args[0] == "docker" and len(args) > 1 and args[1] == "stop":
+            return _QuickStopper()
+        return _HangingProc()
+
+    monkeypatch.setattr(meta_mod.asyncio, "create_subprocess_exec", _fake_exec)
+    pm = DeepStreamMetadataProcessManager(
+        rtsp_url=_URL,
+        image="upstream-deepstream:8.0-pyds-v1.2.2",
+        network="host",
+        rtsp_transport="tcp",
+        probe_timeout_seconds=5,
+        stop_timeout_seconds=0.01,
+        model="trafficcamnet",
+        output_base_dir=str(tmp_path),
+        keep_temp_files=False,
+        sample_limit=3,
+        stream_session_id="abc-123",
+        width=1280,
+        height=720,
+    )
+    await pm.start()
+    # The whole point: stop() must return promptly despite the hanging reap.
+    # The outer wait_for guards the suite so a regression fails loudly instead
+    # of stalling forever. stop_timeout=0.01 -> two ~10ms timeouts inside.
+    await asyncio.wait_for(pm.stop(), timeout=2.0)

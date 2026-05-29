@@ -149,7 +149,19 @@ class DeepStreamProcessManager:
                 )
                 with contextlib.suppress(ProcessLookupError):
                     self._proc.kill()
-                await self._proc.wait()
+                # Bound the post-kill reap; an unbounded wait() can hang
+                # teardown (and the supervisor that awaits it) if the killed
+                # docker-run client stalls on container/GPU cleanup. Same
+                # rationale as metadata_probe.stop().
+                try:
+                    await asyncio.wait_for(
+                        self._proc.wait(), timeout=self._stop_timeout
+                    )
+                except TimeoutError:
+                    _log.warning(
+                        "decode subprocess did not reap after kill; "
+                        "abandoning wait so teardown can proceed",
+                    )
         self._returncode = self._proc.returncode
 
     @property
