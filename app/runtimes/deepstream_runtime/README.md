@@ -158,6 +158,41 @@ via the existing `ObservationWriter`:
   starts a new ``dwell_session_id`` with a fresh threshold). No
   ``dwell_ended`` event in P4-E.
 
+**P5-C — latest perception snapshot (analytics mode):** alongside the
+seven observation types, `analytics_probe` also posts a low-rate "latest
+perception snapshot" — the current frame's objects + applied geometry —
+to the dedicated `POST .../perception` endpoint (NOT via
+`ObservationWriter`; a snapshot is not an observation). It drives the
+dashboard's live detection overlay. Throttled to at most one per
+`UPSTREAM_PERCEPTION_SNAPSHOT_INTERVAL_SECONDS` (and gated by
+`UPSTREAM_PERCEPTION_SNAPSHOT_ENABLED`); object count capped at
+`UPSTREAM_PERCEPTION_SNAPSHOT_MAX_OBJECTS`. Best-effort: an
+`ApiSessionGoneError` ends the worker quietly; any other failure is
+counted (`perception_snapshot_write_errors`) and swallowed so it can
+never disturb the observation path.
+
+**The upload runs OFF the frame loop — and must stay that way.** This
+POST is a ~330ms round-trip to the cloud API. The consumer's per-frame
+loop builds the snapshot locally (`_build_perception_payload`, cheap) and
+drops it into a single **coalescing slot**; a background sender task
+drains the slot and does the POST (`_post_perception_payload`). The slot
+keeps only the freshest snapshot (intermediate ones are dropped if a POST
+is in flight), so the overlay always shows the latest frame and never a
+backlog. The sender is **flushed** (not cancelled) at consumer teardown
+so the terminal status post reflects accurate perception counters, and it
+relays an `ApiSessionGoneError` back to the loop via a `fatal` field.
+
+> ⚠️ **Pitfall (regression history):** the POST used to be `await`ed
+> *inline* in the per-frame loop. Because the round-trip (~330ms) was
+> longer than the emit interval (0.1s on production), the loop posted
+> back-to-back and became entirely network-round-trip-bound at **~3 FPS**
+> — and this throttled the *whole* loop, so even observation sampling
+> (line crossings / ROIs / zones / dwell) dropped to 3 FPS on an idle GPU
+> with a 30 FPS source. Do **not** re-introduce an inline `await` on any
+> per-frame network call. `test_slow_perception_post_does_not_block_frame_loop`
+> guards this by holding the upload open and asserting a later frame's
+> observation still emits.
+
 The ``decode_probe`` / ``inference_probe`` / ``metadata_probe`` /
 ``tracker_probe`` modes remain observation-free. The pyds
 container still does not call the UpStream API; the adapters +
@@ -176,3 +211,16 @@ The `deepstream` runtime is selected when the resolved package's
 `runtime == "deepstream"` (reachable in dev via
 `UPSTREAM_FORCE_PACKAGE_ID`). Unit tests inject a fake `ProcessManager`,
 so no Docker / GPU is needed.
+
+**GPU selection (`UPSTREAM_DEEPSTREAM_GPUS`):** every worker container is
+launched with `docker run --gpus <value>`, where `<value>` is the literal
+`UPSTREAM_DEEPSTREAM_GPUS` setting (default `"all"`), threaded into all
+four command builders (decode / inference / metadata-tracker-analytics).
+To pin workers to a specific card on a multi-GPU box, set the device
+selector, e.g. `UPSTREAM_DEEPSTREAM_GPUS="device=1"` exposes only physical
+GPU 1 to the container (all DeepStream elements run at `gpu-id=0`, which
+then maps onto that single visible card). **Mind docker's semantics:** a
+bare integer is a *count* of GPUs, not an index — use `device=N` to target
+a specific card. Used in production to keep the processor off GPU 0 (which
+runs a separate crowd-count workload). Does not affect throughput when the
+GPU isn't the bottleneck — it is an isolation knob, not a performance one.
