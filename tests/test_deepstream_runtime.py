@@ -118,6 +118,32 @@ def test_command_builder_has_gpus_and_network_host() -> None:
     assert "--gpus" in dpm.command()
 
 
+def test_command_builder_pins_gpu_device_when_configured() -> None:
+    # UPSTREAM_DEEPSTREAM_GPUS="device=1" must place "device=1" right after
+    # --gpus so only physical GPU 1 is visible to the container.
+    cmd = build_docker_command(
+        rtsp_url=_URL,
+        image="img",
+        network="host",
+        rtsp_transport="tcp",
+        probe_timeout_seconds=30,
+        container_name="upstream-ds-test",
+        gpus="device=1",
+    )
+    assert cmd[cmd.index("--gpus") + 1] == "device=1"
+    dpm = DeepStreamProcessManager(
+        rtsp_url=_URL,
+        image="img",
+        network="host",
+        rtsp_transport="tcp",
+        probe_timeout_seconds=5,
+        stop_timeout_seconds=1,
+        gpus="device=1",
+    )
+    cmd2 = dpm.command()
+    assert cmd2[cmd2.index("--gpus") + 1] == "device=1"
+
+
 # --- worker lifecycle -----------------------------------------------------
 
 

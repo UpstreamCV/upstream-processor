@@ -228,6 +228,23 @@ def test_build_metadata_docker_command_has_gpus_network_and_mount() -> None:
     assert "--stream-session-id abc-123" in inner
 
 
+def test_build_metadata_docker_command_pins_gpu_device() -> None:
+    # UPSTREAM_DEEPSTREAM_GPUS="device=1" pins the metadata/analytics worker
+    # to physical GPU 1 (only that card visible inside the container).
+    cmd = build_metadata_docker_command(
+        work_dir="/tmp/wd",
+        image="img",
+        network="host",
+        probe_timeout_seconds=60,
+        container_name="upstream-dsm-test",
+        sample_limit=3,
+        stream_session_id="abc-123",
+        rtsp_url=_URL,
+        gpus="device=1",
+    )
+    assert cmd[cmd.index("--gpus") + 1] == "device=1"
+
+
 # --- lifecycle ----------------------------------------------------------
 
 

@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     deepstream_probe_timeout_seconds: float = 30.0
     deepstream_process_stop_timeout_seconds: float = 5.0
     deepstream_docker_network: str = "host"
+    # Literal value for ``docker run --gpus`` on every DeepStream worker
+    # container. "all" exposes every GPU (the container then runs on gpu-id=0
+    # = physical GPU 0). To pin workers to a specific card, set the device
+    # selector, e.g. UPSTREAM_DEEPSTREAM_GPUS="device=1" so only physical GPU
+    # 1 is visible and all DeepStream elements (gpu-id=0) map onto it. Mind
+    # docker's semantics: a bare integer is a COUNT of GPUs, not an index —
+    # use "device=N" to target a specific card.
+    deepstream_gpus: str = "all"
 
     # --- M8.2C1-B DeepStream inference-probe runtime ---------------------
     # Bounded nvinfer smoke under the supervisor (TrafficCamNet sample model).

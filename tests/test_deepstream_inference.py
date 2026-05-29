@@ -152,6 +152,18 @@ def test_inference_docker_command_gpus_network_mount() -> None:
     assert "timeout -s INT 60" in inner
 
 
+def test_inference_docker_command_pins_gpu_device() -> None:
+    cmd = build_inference_docker_command(
+        work_dir="/tmp/wd",
+        image="nvcr.io/nvidia/deepstream:8.0-samples-multiarch",
+        network="host",
+        probe_timeout_seconds=60,
+        container_name="upstream-dsi-test",
+        gpus="device=1",
+    )
+    assert cmd[cmd.index("--gpus") + 1] == "device=1"
+
+
 def test_pgie_and_app_config_contents() -> None:
     pgie = build_pgie_config(model_dir="/m/Primary_Detector", engine_path="/tmp/e.engine")
     assert "onnx-file=/m/Primary_Detector/resnet18_trafficcamnet_pruned.onnx" in pgie
