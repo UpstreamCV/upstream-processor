@@ -348,7 +348,23 @@ class DeepStreamMetadataProcessManager:
                         )
                         with contextlib.suppress(ProcessLookupError):
                             self._proc.kill()
-                        await self._proc.wait()
+                        # Bound the post-kill reap. A long-running --gpus
+                        # container killed mid-stream can leave the docker-run
+                        # client stalled on device/container teardown, so an
+                        # unbounded wait() here hangs ``stop()`` forever — and
+                        # because the supervisor awaits worker teardown, that
+                        # wedges the whole reconcile loop. The process is
+                        # already SIGKILLed; the OS reaps it eventually. Don't
+                        # block teardown on it.
+                        try:
+                            await asyncio.wait_for(
+                                self._proc.wait(), timeout=self._stop_timeout
+                            )
+                        except TimeoutError:
+                            _log.warning(
+                                "metadata subprocess did not reap after kill; "
+                                "abandoning wait so teardown can proceed",
+                            )
                 self._returncode = self._proc.returncode
         finally:
             self._cleanup_work_dir()
