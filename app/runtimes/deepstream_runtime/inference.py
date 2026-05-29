@@ -508,17 +508,19 @@ def build_inference_docker_command(
     network: str,
     probe_timeout_seconds: float,
     container_name: str,
+    gpus: str = "all",
 ) -> list[str]:
     """The docker argv for the bounded inference run. Pure/side-effect free
     so it is unit-testable without Docker. Mirrors the proven M8.2C1-A
-    invocation (``--gpus all``, ``--network``, work dir bind-mounted at the
-    same path so the configs' absolute paths resolve inside the container)."""
+    invocation (``--network``, work dir bind-mounted at the same path so the
+    configs' absolute paths resolve inside the container). ``gpus`` is the
+    literal ``docker run --gpus`` value ("all" or e.g. "device=1")."""
     inner = (
         f"timeout -s INT {int(probe_timeout_seconds)} deepstream-app -c {work_dir}/ds_app.txt 2>&1"
     )
     return [
         "docker", "run", "--rm", "--name", container_name,
-        "--gpus", "all", "--network", network,
+        "--gpus", gpus, "--network", network,
         "-v", f"{work_dir}:{work_dir}", image,
         "bash", "-lc", inner,
     ]  # fmt: skip
@@ -548,6 +550,7 @@ class DeepStreamInferenceProcessManager:
         keep_temp_files: bool,
         width: int,
         height: int,
+        gpus: str = "all",
     ) -> None:
         self._rtsp_url = rtsp_url
         self._image = image
@@ -560,6 +563,7 @@ class DeepStreamInferenceProcessManager:
         self._keep_temp_files = keep_temp_files
         self._width = width
         self._height = height
+        self._gpus = gpus
         self._container = f"upstream-dsi-{uuid4().hex[:12]}"
         self._work_dir: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -635,6 +639,7 @@ class DeepStreamInferenceProcessManager:
             network=self._network,
             probe_timeout_seconds=self._probe_timeout,
             container_name=self._container,
+            gpus=self._gpus,
         )
 
     async def start(self) -> None:

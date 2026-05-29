@@ -46,9 +46,11 @@ def build_docker_command(
     rtsp_transport: str,
     probe_timeout_seconds: float,
     container_name: str,
+    gpus: str = "all",
 ) -> list[str]:
     """The docker argv. The RTSP URL appears only here (subprocess), never
-    in logs. Mirrors the proven M8.2A pipeline."""
+    in logs. Mirrors the proven M8.2A pipeline. ``gpus`` is the literal
+    ``docker run --gpus`` value ("all" or e.g. "device=1" to pin a card)."""
     pipeline = (
         f'rtspsrc location="{rtsp_url}" protocols={rtsp_transport} latency=200 ! '
         "rtph264depay ! h264parse ! nvv4l2decoder ! nvvideoconvert ! "
@@ -57,7 +59,7 @@ def build_docker_command(
     inner = f"timeout -s INT {int(probe_timeout_seconds)} gst-launch-1.0 -e -v {pipeline} 2>&1"
     return [
         "docker", "run", "--rm", "--name", container_name,
-        "--gpus", "all", "--network", network, image,
+        "--gpus", gpus, "--network", network, image,
         "bash", "-lc", inner,
     ]  # fmt: skip
 
@@ -74,6 +76,7 @@ class DeepStreamProcessManager:
         rtsp_transport: str,
         probe_timeout_seconds: float,
         stop_timeout_seconds: float,
+        gpus: str = "all",
     ) -> None:
         self._rtsp_url = rtsp_url
         self._image = image
@@ -81,6 +84,7 @@ class DeepStreamProcessManager:
         self._rtsp_transport = rtsp_transport
         self._probe_timeout = probe_timeout_seconds
         self._stop_timeout = stop_timeout_seconds
+        self._gpus = gpus
         self._container = f"upstream-ds-{uuid4().hex[:12]}"
         self._proc: asyncio.subprocess.Process | None = None
         self._returncode: int | None = None
@@ -93,6 +97,7 @@ class DeepStreamProcessManager:
             rtsp_transport=self._rtsp_transport,
             probe_timeout_seconds=self._probe_timeout,
             container_name=self._container,
+            gpus=self._gpus,
         )
 
     async def start(self) -> None:

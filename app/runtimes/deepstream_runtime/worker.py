@@ -80,6 +80,10 @@ _log = logging.getLogger("upstream_processor.deepstream.worker")
 
 _TERMINAL_STATUS_ATTEMPTS = 3
 _READLINE_POLL_SECONDS = 0.5
+# Bound on draining the background perception sender at consumer teardown so
+# the terminal status post reflects the final perception counters. Best-effort:
+# a stuck upload is abandoned after this so teardown can never wedge.
+_PERCEPTION_FLUSH_TIMEOUT = 5.0
 # gst -e on SIGINT, or `timeout` self-terminating the bounded probe, are
 # graceful endings (124 = timeout, 130 = SIGINT, 137 = SIGKILL after stop).
 _CLEAN_EXIT_CODES = frozenset({0, 124, 130, 137})
@@ -484,6 +488,7 @@ class DeepStreamWorker(Runtime):
                 analytics_roi_margin_pct=(self._settings.deepstream_analytics_roi_margin_pct),
                 analytics_class_ids=self._settings.deepstream_analytics_class_ids,
                 analytics_geometry=analytics_geometry,
+                gpus=self._settings.deepstream_gpus,
             )
         if self._mode == _INFERENCE_MODE:
             return DeepStreamInferenceProcessManager(
@@ -498,6 +503,7 @@ class DeepStreamWorker(Runtime):
                 keep_temp_files=self._settings.deepstream_keep_temp_files,
                 width=self._session.approved.width,
                 height=self._session.approved.height,
+                gpus=self._settings.deepstream_gpus,
             )
         return DeepStreamProcessManager(
             rtsp_url=self._session.internal_rtsp_url,
@@ -506,6 +512,7 @@ class DeepStreamWorker(Runtime):
             rtsp_transport=self._settings.deepstream_rtsp_transport,
             probe_timeout_seconds=self._settings.deepstream_probe_timeout_seconds,
             stop_timeout_seconds=self._settings.deepstream_process_stop_timeout_seconds,
+            gpus=self._settings.deepstream_gpus,
         )
 
     async def run(self) -> None:
@@ -1072,6 +1079,41 @@ class DeepStreamWorker(Runtime):
             else {}
         )
 
+        # P5-C follow-up: decouple the perception upload from the frame loop.
+        # The loop builds a snapshot (cheap, local) and drops it in a single
+        # coalescing slot; this background task drains the slot and does the
+        # ~330ms POST round-trip OFF the hot path. Without it the loop awaited
+        # every upload inline, so frame consumption (and thus observation
+        # sampling) was pinned to network-round-trip rate (~3 FPS) even with
+        # an idle GPU and a 30 FPS source. "Coalescing" = only the freshest
+        # snapshot is ever sent; intermediate ones are dropped if a POST is in
+        # flight, so the overlay always shows the latest frame, never a
+        # backlog. ``fatal`` relays an ``ApiSessionGoneError`` back to the loop
+        # so a vanished session still ends the worker (as the old inline path
+        # did). The slot/events are created here (enclosing scope) so the
+        # teardown ``finally`` below can flush the sender before the terminal
+        # status post reads the final perception counters.
+        perception_slot: dict[str, Any] = {"pending": None, "fatal": None}
+        perception_wakeup = asyncio.Event()
+        perception_stop = asyncio.Event()
+
+        async def _perception_sender() -> None:
+            while True:
+                await perception_wakeup.wait()
+                perception_wakeup.clear()
+                payload = perception_slot["pending"]
+                perception_slot["pending"] = None
+                if payload is not None:
+                    try:
+                        await self._post_perception_payload(payload, counters)
+                    except ApiSessionGoneError as exc:
+                        perception_slot["fatal"] = exc
+                        return
+                # Drain-then-exit: when asked to stop, send the final pending
+                # snapshot (above) before returning so it is not lost.
+                if perception_stop.is_set() and perception_slot["pending"] is None:
+                    return
+
         async def _reader() -> None:
             assert self._pm is not None
             try:
@@ -1122,6 +1164,10 @@ class DeepStreamWorker(Runtime):
             attached = False
             processing = False
             async for frame in source:
+                # Relay a session-gone raised by the background perception
+                # sender so the worker ends quietly (old inline behavior).
+                if perception_slot["fatal"] is not None:
+                    raise perception_slot["fatal"]
                 counters.absorb(frame)
                 if line_state is not None:
                     await self._emit_line_crossings(
@@ -1170,11 +1216,18 @@ class DeepStreamWorker(Runtime):
                         >= self._settings.perception_snapshot_interval_seconds
                     ):
                         last_perception_post = now_mono
-                        await self._emit_perception_snapshot(
+                        payload = self._build_perception_payload(
                             frame=frame,
                             geometry=perception_geometry,
                             counters=counters,
                         )
+                        if payload is not None:
+                            # Hand off to the background sender (non-blocking):
+                            # the frame loop never waits on the upload. The
+                            # slot coalesces — a snapshot already waiting is
+                            # overwritten by this fresher one.
+                            perception_slot["pending"] = payload
+                            perception_wakeup.set()
                 if not attached:
                     attached = True
                     self._state = WorkerState.ATTACHED
@@ -1213,6 +1266,11 @@ class DeepStreamWorker(Runtime):
         # ``finally`` so docker stop + workdir cleanup + the terminal
         # status post happen even if the worker task is cancelled (e.g.,
         # supervisor force-stop after the per-worker budget expires).
+        # The background perception sender runs alongside (not inside the
+        # gather: it idles until the consumer ends, then is drained below).
+        sender_task = (
+            asyncio.create_task(_perception_sender()) if perception_enabled else None
+        )
         try:
             results = await asyncio.gather(_reader(), _consumer(), return_exceptions=True)
             for r in results:
@@ -1220,6 +1278,20 @@ class DeepStreamWorker(Runtime):
                     # Surface unexpected failure but keep cleanup going.
                     _log.exception("metadata-probe task crashed", exc_info=r)
         finally:
+            # Flush the perception sender BEFORE finalize: signal stop + wake
+            # it so it drains the final pending snapshot, then await (bounded)
+            # so the terminal status post reflects the final perception
+            # counters. A stuck upload is abandoned after the timeout so
+            # teardown can never wedge.
+            if sender_task is not None:
+                perception_stop.set()
+                perception_wakeup.set()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(sender_task), timeout=_PERCEPTION_FLUSH_TIMEOUT
+                    )
+                except TimeoutError:
+                    sender_task.cancel()
             try:
                 await asyncio.shield(
                     self._finalize_metadata_probe(
@@ -1233,21 +1305,21 @@ class DeepStreamWorker(Runtime):
 
     # --- P5-C: low-rate latest perception snapshot -----------------------
 
-    async def _emit_perception_snapshot(
+    def _build_perception_payload(
         self,
         *,
         frame: NeutralFrameMetadata,
         geometry: dict[str, Any],
         counters: _MetadataCounters,
-    ) -> None:
-        """Build + POST one latest perception snapshot.
+    ) -> PerceptionSnapshotPayload | None:
+        """Build one latest-perception-snapshot payload — NO network.
 
-        Best-effort, and deliberately broader than the observation emits: a
-        perception failure must NEVER crash the consumer loop or disturb the
-        observation path. ``ApiSessionGoneError`` still propagates (the
-        session is gone — end the worker quietly via the outer handler);
-        every other error (transient API, contract drift, or a defensive
-        builder edge case) is counted and swallowed.
+        Cheap + local so it runs inline in the frame loop; the ~330ms upload
+        round-trip is handed to the background sender
+        (``_post_perception_payload``) so it never throttles frame
+        consumption. A build failure (defensive builder edge case) is counted
+        + swallowed (best-effort) and returns ``None``; it must NEVER crash
+        the consumer loop or disturb the observation path.
 
         Unlike the observation emits this does NOT go through
         ``ObservationWriter`` — a perception snapshot is not an observation;
@@ -1269,17 +1341,39 @@ class DeepStreamWorker(Runtime):
                 observed_at=observed_at,
                 max_objects=self._settings.perception_snapshot_max_objects,
             )
-            await self._api.post_perception_snapshot(
-                PerceptionSnapshotPayload(
-                    stream_session_id=self._session.session_id,
-                    processor_id=self._settings.processor_id,
-                    package_id=self._package.package_id,
-                    observed_at=observed_at,
-                    snapshot=snapshot,
-                )
+        except Exception as exc:
+            counters.perception_snapshot_write_errors += 1
+            _log.warning(
+                "perception snapshot build failed for %s: %s",
+                self.session_id,
+                exc,
             )
+            return None
+        return PerceptionSnapshotPayload(
+            stream_session_id=self._session.session_id,
+            processor_id=self._settings.processor_id,
+            package_id=self._package.package_id,
+            observed_at=observed_at,
+            snapshot=snapshot,
+        )
+
+    async def _post_perception_payload(
+        self,
+        payload: PerceptionSnapshotPayload,
+        counters: _MetadataCounters,
+    ) -> None:
+        """POST one perception snapshot — the network round-trip.
+
+        Runs in the background sender task, NOT the frame loop, so the
+        ~330ms round-trip never blocks frame consumption. Best-effort:
+        ``ApiSessionGoneError`` propagates (the session is gone — the sender
+        relays it to the loop to end the worker quietly); every other error
+        (transient API, contract drift) is counted + swallowed so it can never
+        disturb the observation path.
+        """
+        try:
+            await self._api.post_perception_snapshot(payload)
         except ApiSessionGoneError:
-            # Session gone — propagate so the outer run() handler ends quietly.
             raise
         except Exception as exc:
             counters.perception_snapshot_write_errors += 1
@@ -1290,7 +1384,7 @@ class DeepStreamWorker(Runtime):
             )
             return
         counters.perception_snapshots_posted += 1
-        counters.last_perception_snapshot_at = observed_at
+        counters.last_perception_snapshot_at = payload.observed_at
 
     # --- P4-B: per-frame line-crossing emission --------------------------
 

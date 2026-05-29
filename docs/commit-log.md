@@ -4,6 +4,60 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-05-28 - Decouple perception upload from the frame loop + configurable GPU device
+
+### Summary
+Two changes driven by a live FPS investigation. An operator running a 30 FPS
+camera on an idle-GPU box saw detections cap at a dead-regular ~3 FPS on the
+dashboard. Root cause: the latest-perception-snapshot POST was `await`ed
+**inline in the per-frame consumer loop**. The POST is a ~330ms round-trip to
+the cloud API, and the configured emit interval (0.1s) was *shorter* than that
+round-trip — so the loop posted back-to-back and became entirely
+network-round-trip-bound at ~3 FPS. Critically this throttled not just the
+overlay but the whole loop, so observation sampling (line crossings, ROIs,
+zones, dwell) was also pinned to 3 FPS. Neither the GPU (idle) nor the source
+(30 FPS) nor inference (`interval=0`, every frame) was the limit.
+
+### 1. Decouple the perception upload (the FPS fix)
+The frame loop now *builds* a snapshot (cheap, local) and drops it in a single
+coalescing slot; a background sender task drains the slot and does the POST
+**off the hot path**. Effects:
+
+- The consumer loop runs at the full source rate again → observations sample
+  at 30 FPS instead of 3.
+- "Coalescing" = only the freshest snapshot is ever sent; if a POST is in
+  flight, intermediate snapshots are dropped, so the overlay always shows the
+  latest frame and never a growing backlog.
+- The single sequential sender still uploads at ~round-trip rate (~3 FPS), but
+  non-blocking — pushing the *overlay* past that needs bounded concurrency or
+  lower API latency, deliberately deferred.
+
+Behavior preserved: `ApiSessionGoneError` from the upload is relayed via the
+slot's `fatal` field and re-raised by the loop so a vanished session still
+ends the worker quietly; every other error is counted
+(`perception_snapshot_write_errors`) and swallowed so a perception failure
+never disturbs observations. The sender is **flushed** (not cancelled) at
+consumer teardown — stop is signalled, it drains the final pending snapshot,
+and the flush is awaited (bounded by `_PERCEPTION_FLUSH_TIMEOUT=5s`) *before*
+the terminal status post so the final perception counters are accurate.
+`_emit_perception_snapshot` is split into `_build_perception_payload` (loop,
+no network) and `_post_perception_payload` (sender, the round-trip). New test
+`test_slow_perception_post_does_not_block_frame_loop` holds the upload open and
+asserts a later frame's line crossing still emits — with the old inline design
+it would deadlock.
+
+### 2. Configurable GPU device (`UPSTREAM_DEEPSTREAM_GPUS`)
+`docker run --gpus all` was hard-coded in all four DeepStream command builders
+(decode, inference, metadata/analytics). Added a `deepstream_gpus` setting
+(default `"all"`) threaded through `worker.py` into every builder so a worker
+can be pinned to a specific card, e.g. `UPSTREAM_DEEPSTREAM_GPUS="device=1"`
+exposes only physical GPU 1 (all DeepStream elements at gpu-id=0 then map onto
+it). Note the docker semantics: a bare integer is a *count* of GPUs, not an
+index — use `device=N`. Does not affect FPS (GPUs were idle); it isolates the
+processor onto a chosen card. Each builder gets a device-pinning test.
+
+---
+
 ## 2026-05-27 - P6-D: End-to-end geometry lineage verification
 
 ### Summary

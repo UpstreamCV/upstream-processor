@@ -171,6 +171,72 @@ async def test_post_failure_does_not_crash_worker(fast_settings: Any) -> None:
     assert _last_metadata_payload(api)["perception_snapshot_write_errors_count"] > 0
 
 
+async def test_slow_perception_post_does_not_block_frame_loop(
+    fast_settings: Any,
+) -> None:
+    """The upload runs OFF the frame loop (background sender). A slow/blocked
+    perception POST must not stall observation processing for later frames.
+
+    Regression for the ~3 FPS cap: the perception POST used to be awaited
+    inline in the consumer loop, so its round-trip throttled frame consumption
+    (and thus observation sampling). With the inline design this test would
+    deadlock — the loop would block on frame 0's POST and never process the
+    frame 1 line crossing.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowApi(FakeApi):
+        async def post_perception_snapshot(self, payload: Any) -> Any:
+            started.set()
+            await release.wait()  # hold the upload open
+            return await super().post_perception_snapshot(payload)
+
+    api = SlowApi()
+    # interval=100s so only frame 0 triggers a perception post (which blocks);
+    # frame 1 carries the line crossing that must still emit meanwhile.
+    settings = fast_settings.model_copy(
+        update={"perception_snapshot_interval_seconds": 100.0}
+    )
+    pm = FakeMetadataPM(
+        [
+            _frame_line(
+                frame_num=0,
+                objects=[_person()],
+                line_crossing_cumulative={"entry-line": 0},
+            ),
+            _frame_line(
+                frame_num=1,
+                objects=[_person()],
+                line_crossing_cumulative={"entry-line": 1},
+            ),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    run_task = asyncio.create_task(w.run())
+    try:
+        # Wait until the perception upload is in flight (blocked).
+        await asyncio.wait_for(started.wait(), timeout=2)
+        # The frame-1 line crossing must land WHILE the upload is still
+        # blocked. If the loop blocked on the upload this never appears.
+        for _ in range(200):
+            if any(o.type == "processor.line_crossing" for o in api.observations):
+                break
+            await asyncio.sleep(0.01)
+        assert any(o.type == "processor.line_crossing" for o in api.observations), (
+            "line crossing did not emit while the perception POST was blocked "
+            "— the frame loop wedged on the upload"
+        )
+        assert not release.is_set()
+    finally:
+        release.set()  # let the upload + teardown flush complete
+    await asyncio.wait_for(run_task, timeout=3)
+    assert w.state is WorkerState.STOPPED
+    # The held snapshot is flushed at teardown, not lost.
+    assert len(api.perception_snapshots) == 1
+
+
 async def test_observations_still_emit_with_perception_enabled(
     fast_settings: Any,
 ) -> None:

@@ -58,6 +58,7 @@ def build_metadata_docker_command(
     tracker_width: int = 960,
     tracker_height: int = 544,
     analytics_enabled: bool = False,
+    gpus: str = "all",
 ) -> list[str]:
     """Docker argv for one bounded metadata- / tracker- / analytics-probe
     run. Pure / side-effect free so it is unit-testable without Docker.
@@ -103,7 +104,7 @@ def build_metadata_docker_command(
     )
     argv: list[str] = [
         "docker", "run", "--rm", "--name", container_name,
-        "--gpus", "all", "--network", network,
+        "--gpus", gpus, "--network", network,
         "-v", f"{work_dir}:{work_dir}",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
         "-e", f"RTSP_URL={rtsp_url}",
@@ -153,6 +154,7 @@ class DeepStreamMetadataProcessManager:
         # geometry is rendered into the nvdsanalytics INI instead of the
         # probe-default. ``analytics_roi_margin_pct`` is ignored in this case.
         analytics_geometry: AnalyticsGeometry | None = None,
+        gpus: str = "all",
     ) -> None:
         if analytics_enabled and not tracker_enabled:
             raise ValueError(
@@ -181,6 +183,7 @@ class DeepStreamMetadataProcessManager:
         self._analytics_roi_margin_pct = analytics_roi_margin_pct
         self._analytics_class_ids = analytics_class_ids
         self._analytics_geometry = analytics_geometry
+        self._gpus = gpus
         # Container name prefix encodes the mode for easy `docker ps`
         # grouping: -dsm (metadata), -dst (tracker), -dsa (analytics).
         if analytics_enabled:
@@ -282,6 +285,7 @@ class DeepStreamMetadataProcessManager:
             tracker_width=self._tracker_width,
             tracker_height=self._tracker_height,
             analytics_enabled=self._analytics_enabled,
+            gpus=self._gpus,
         )
 
     async def start(self) -> None:
