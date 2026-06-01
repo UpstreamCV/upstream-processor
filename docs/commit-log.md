@@ -4,6 +4,75 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-01 - M7B: Processor stamps applied_processing_config (STAMP ONLY)
+
+### Summary
+The DeepStream worker now consumes the eligible-session `processing_config`
+envelope at startup and stamps a requested-vs-applied
+`applied_processing_config` lineage block onto every status payload. This is
+**STAMP ONLY** — no runtime behavior changes. Nothing from the config is
+applied: the model, tracker, confidence threshold, processing FPS, and class
+filter all stay at the worker's current defaults. The block records what the
+operator *requested* alongside what the runtime *actually applies* so the
+dashboard can show the gap before a later milestone wires real application.
+
+- the eligible-session envelope gains a nullable `processing_config`
+  `{ "revision": int, "config": {...} }` field (mirrors `geometry_config`),
+  `null` when the camera has no `camera_processing_configs` row,
+- the processor re-validates the envelope locally (`extra="forbid"` drift
+  policy, mirroring `session_geometry.py`) against a clone of the api-server's
+  `CameraProcessingConfig`,
+- the resolver compares each requested field against the static applied
+  defaults (`trafficcamnet_v1` / `[]` all classes / `iou` / no threshold / no
+  fps override) and records per-field `*_requested_not_applied` warnings,
+- every processor status post carries `payload.applied_processing_config`
+  with `source` / `revision` / `status` / `reason` / `requested` / `applied`
+  / `warnings`.
+
+### Resolution policy (mirrors geometry, STAMP ONLY)
+- **No saved config** (`null`) → `source="default"`,
+  `status="applied_defaults"`, all-null `requested`, `applied`=defaults.
+- **Saved config, valid** → `source="operator_saved"`; `requested` echoes the
+  saved values; `applied` stays at defaults (never echoes a requested value);
+  `status="requested_not_applied"` when any field diverges, else
+  `applied_defaults`.
+- **Saved config, invalid** (malformed envelope) →
+  `source="fallback_default_on_error"`,
+  `status="fallback_default_on_error"`, short safe `reason`. Unlike geometry's
+  `geometry_invalid`, this does **NOT** set `error_code` — M7B applies
+  nothing, so a bad processing config must not flag a worker error; it lives
+  only in the lineage block.
+- `status="partially_applied"` is reserved for a later milestone and is NEVER
+  emitted in M7B.
+
+### Files touched
+- `app/observations/schemas.py` — `EligibleSession.processing_config:
+  dict | None` (additive, `extra="ignore"`).
+- `app/processing/__init__.py` — new package marker (empty).
+- `app/processing/session_processing.py` — `SessionProcessingConfig` /
+  `SessionProcessingConfigEnvelope` re-validation mirror of the api-server's
+  `CameraProcessingConfig`.
+- `app/processing/resolver.py` — `RequestedProcessingConfig` /
+  `AppliedProcessingConfig` / `ResolvedProcessingConfig`,
+  `resolve_session_processing_config` (pure, never raises), `DEFAULT_APPLIED`,
+  `MODEL_KEY_RUNTIME` (lineage-only static map).
+- `app/runtimes/deepstream_runtime/worker.py` — resolve in `__init__`
+  (defensive, never raises, no `error_code`) + stamp
+  `payload.applied_processing_config` in `_build()` alongside
+  `applied_geometry`.
+- `docs/architecture.md`, `docs/commit-log.md` — this note.
+
+### What this milestone did NOT change
+- `inference.py` / `metadata_probe.py` / pgie / tracker / nvinfer interval /
+  nvdsanalytics class-id / analytics class normalization — untouched.
+- No multi-class ever passed to the runtime filter; no observation/snapshot
+  count changes; account-level `processing_enabled`, `package_id` resolution,
+  and the dashboard are untouched.
+- The only observable changes: a new nullable envelope field + an additive
+  status-payload key.
+
+---
+
 ## 2026-05-28 - Decouple perception upload from the frame loop + configurable GPU device
 
 ### Summary
