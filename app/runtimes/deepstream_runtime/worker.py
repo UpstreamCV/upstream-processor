@@ -59,6 +59,10 @@ from app.observations.writer import ObservationWriter
 from app.packages.resolver import PackageSpec
 from app.perception.builder import build_perception_snapshot
 from app.perception.schemas import PerceptionSnapshotPayload
+from app.processing.resolver import (
+    ResolvedProcessingConfig,
+    resolve_session_processing_config,
+)
 from app.redact import redact_rtsp, scrub_rtsp_in_text
 from app.runtimes.base import Runtime, WorkerState
 from app.runtimes.deepstream_runtime.inference import (
@@ -413,6 +417,32 @@ class DeepStreamWorker(Runtime):
                     else ""
                 ),
             )
+        # M7B: resolve the operator-saved processing config once, STAMP ONLY.
+        # Done defensively right next to the geometry resolve — the resolver
+        # never raises and applies NOTHING (model/tracker/threshold/fps stay
+        # at the worker's current defaults). It only produces the
+        # requested-vs-applied lineage block stamped onto status. Resolved
+        # unconditionally (not gated on mode) so every DeepStream worker
+        # carries the lineage; a bad/diverging config must NOT flag a worker
+        # error — it lives only in the lineage block.
+        self._resolved_processing_config: ResolvedProcessingConfig = (
+            resolve_session_processing_config(session.processing_config)
+        )
+        _log.info(
+            "processing config resolved: camera_id=%s stream_session_id=%s source=%s "
+            "revision=%s status=%s warnings=%s%s",
+            session.camera_id,
+            session.session_id,
+            self._resolved_processing_config.source,
+            self._resolved_processing_config.revision,
+            self._resolved_processing_config.status,
+            list(self._resolved_processing_config.warnings),
+            (
+                f" error_reason={self._resolved_processing_config.error_reason!r}"
+                if self._resolved_processing_config.error_reason
+                else ""
+            ),
+        )
 
     # --- Runtime interface ------------------------------------------------
 
@@ -1756,11 +1786,25 @@ class DeepStreamWorker(Runtime):
         # ``error_code="geometry_invalid"`` — but only when the caller didn't
         # set a more-specific error (container crash, model load failure,
         # etc.), so runtime errors keep their own taxonomy.
-        if self._resolved_geometry is not None:
+        #
+        # M7B: every status post also carries the processing-config lineage
+        # block in ``payload.applied_processing_config`` (requested-vs-applied,
+        # STAMP ONLY). Unlike geometry, a bad/diverging processing config does
+        # NOT set ``error_code`` — M7B applies nothing, so it must not flag a
+        # worker error; it lives only in the lineage block.
+        if self._resolved_geometry is not None or self._resolved_processing_config is not None:
             payload = dict(fields.pop("payload", None) or {})
-            payload.setdefault("applied_geometry", self._resolved_geometry.status_payload())
+            if self._resolved_geometry is not None:
+                payload.setdefault("applied_geometry", self._resolved_geometry.status_payload())
+            payload.setdefault(
+                "applied_processing_config",
+                self._resolved_processing_config.status_payload(),
+            )
             fields["payload"] = payload
-            if self._resolved_geometry.source == "fallback_default_on_error":
+            if (
+                self._resolved_geometry is not None
+                and self._resolved_geometry.source == "fallback_default_on_error"
+            ):
                 fields.setdefault("error_code", "geometry_invalid")
                 if self._resolved_geometry.error_reason:
                     fields.setdefault("error_message", self._resolved_geometry.error_reason)

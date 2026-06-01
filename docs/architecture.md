@@ -126,6 +126,36 @@ MetadataSource, metadata adapter, observations, tracking, nvtracker,
 nvdsanalytics, line crossing, zones, Triton, dashboard, package catalog,
 billing. API contracts unchanged.
 
+## M7B — processing-config lineage stamp (STAMP ONLY)
+
+The eligible-session envelope gains a nullable `processing_config`
+`{ "revision": int, "config": {...} }` field (mirrors `geometry_config`,
+`null` when the camera has no `camera_processing_configs` row). `app/processing/`
+re-validates it locally — `session_processing.py` clones the api-server's
+`CameraProcessingConfig` with the same `extra="forbid"` drift policy as
+`session_geometry.py` — and `resolver.py` produces a `ResolvedProcessingConfig`
+lineage wrapper.
+
+At worker startup the DeepStream worker calls
+`resolve_session_processing_config(session.processing_config)` (defensive —
+the resolver never raises) and stamps the result onto every status post as
+`payload.applied_processing_config` (next to `applied_geometry`). The block
+carries `source` / `revision` / `status` / `reason` / `requested` / `applied`
+/ `warnings`.
+
+**STAMP ONLY: nothing is applied.** `applied` is ALWAYS the worker's current
+runtime defaults (`trafficcamnet_v1` / `[]` = all classes / `iou` / no
+threshold / no fps override) and never echoes a requested value. The resolver
+flags per-field divergence as `*_requested_not_applied` warnings and sets
+`status="requested_not_applied"`; a malformed envelope yields
+`status="fallback_default_on_error"` with a short safe `reason`. Unlike
+geometry's `geometry_invalid`, a bad/diverging processing config does **NOT**
+set `error_code` — M7B applies nothing, so it must not flag a worker error.
+`partially_applied` is reserved for a later milestone and is never emitted.
+The only observable changes are the new envelope field and the additive
+status-payload key; runtime behavior (pgie/tracker/nvinfer/nvdsanalytics) is
+untouched.
+
 ## P2 — manual pyds metadata probe (out-of-tree)
 
 A *manual* probe that proves the DeepStream metadata seam (no runtime worker

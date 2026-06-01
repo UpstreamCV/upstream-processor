@@ -105,6 +105,15 @@ class EligibleSession(BaseModel):
     # and NOT consumed yet — the DeepStream worker begins applying it in
     # P6-C; P6-A is the lock-step wire rename only (was ``zones_lines``).
     geometry_config: dict[str, Any] | None = None
+    # M7B: the camera's dashboard-authored model/processing selection, or
+    # null when the camera has no ``camera_processing_configs`` row. The
+    # api-server carries it as a ``{"revision": int, "config": {...}}``
+    # envelope (mirrors ``geometry_config``). Kept loosely typed here and
+    # consumed STAMP-ONLY by the DeepStream worker: M7B re-validates it and
+    # stamps a requested-vs-applied ``applied_processing_config`` lineage
+    # block onto status — nothing from the config changes runtime behavior
+    # (model/tracker/threshold/fps applying is a later milestone).
+    processing_config: dict[str, Any] | None = None
     started_at: datetime | None = None
     processor_eligible: bool = True
 
