@@ -245,6 +245,42 @@ source of truth (`self._selected_classes`); no global/module state.
 When `selected_classes` is `[]` (or no config), the filter returns the objects
 unchanged and behavior is byte/behavior-identical to before M7D.
 
+## M8 — stamp applied_processing_config lineage onto snapshots + observations
+
+M8 is **ADDITIVE METADATA ONLY** — no runtime behavior changes. It stamps the
+requested-vs-applied processing-config lineage onto two more surfaces beyond
+processor status: the **perception snapshot** `source` block and **every
+observation** `source` block. The lineage is the **single source of truth** —
+`ResolvedProcessingConfig.status_payload()`, the SAME dict already stamped on
+processor status by M7B/C/D. It is never recomputed per output path, so status,
+snapshot, and observations cannot drift. `status_payload()` is pure /
+read-only — calling it on these paths changes nothing.
+
+- `build_perception_snapshot(...)` (`app/perception/builder.py`) takes
+  `applied_processing_config: dict[str, Any] | None = None` and places it inside
+  the `source` block when not `None` (omitted when `None`). Objects / geometry /
+  debug are untouched.
+- `deepstream_source_block(...)` (`app/observations/observation_adapter.py`)
+  takes the same param and sets `src["applied_processing_config"]` when not
+  `None`, mirroring the omit-when-None pattern of `tracker_algorithm` /
+  `geometry_source` / `geometry_revision`.
+- The worker (`app/runtimes/deepstream_runtime/worker.py`) passes
+  `self._resolved_processing_config.status_payload()` at BOTH the
+  `_build_perception_payload` snapshot build and the single
+  `deepstream_source_block(...)` construction. That one source_block is already
+  threaded into all emits (line / ROI / zone / dwell), so every observation
+  gains the stamp uniformly.
+
+The nvdsanalytics aggregate line/ROI counts stay all-class — M8 changes no
+count. When `selected_classes` is applied, the honest
+`selected_classes_analytics_counts_not_filtered` caveat is already inside
+`status_payload().warnings`, so it rides along inside the stamped block and is
+NOT stripped. Model / tracker / FPS remain stamp-only.
+
+No api-server change: the snapshot/observation payloads are opaque `dict[str, Any]`
+JSONB (no `extra=forbid`), so additive keys are accepted as-is. No DB migration,
+no dashboard, no styling/overlay fields.
+
 ## P2 — manual pyds metadata probe (out-of-tree)
 
 A *manual* probe that proves the DeepStream metadata seam (no runtime worker

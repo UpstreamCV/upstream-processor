@@ -827,6 +827,94 @@ def test_deepstream_source_block_default_source_carries_no_revision() -> None:
     assert "geometry_revision" not in src
 
 
+# --- M8: additive applied_processing_config on the source block --------
+
+# Representative resolver ``status_payload()`` (selected_classes applied →
+# partially_applied with the honest analytics-counts caveat). The helper is
+# opaque to the contents — it stores the dict verbatim under
+# ``src["applied_processing_config"]``.
+_APPLIED_PC: dict[str, object] = {
+    "source": "operator_saved",
+    "revision": 7,
+    "status": "partially_applied",
+    "reason": None,
+    "requested": {
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["person"],
+        "tracker": None,
+        "confidence_threshold": None,
+        "processing_fps": None,
+    },
+    "applied": {
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["person"],
+        "tracker": "iou",
+        "confidence_threshold": None,
+        "processing_fps": None,
+    },
+    "warnings": ["selected_classes_analytics_counts_not_filtered"],
+}
+
+
+def test_deepstream_source_block_omits_applied_processing_config_when_unset() -> None:
+    """Back-compat: omitting the param (default None) leaves the source block
+    byte-identical to the pre-M8 shape — no ``applied_processing_config`` key.
+    Mirrors the geometry omit-when-None pattern above."""
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0", tracker_algorithm="iou"
+    )
+    assert "applied_processing_config" not in src
+    assert src == {
+        "runtime": "deepstream",
+        "package_id": "deepstream.analytics_probe.v0",
+        "metadata_source": "pyds_pad_probe",
+        "analytics_plugin": "nvdsanalytics",
+        "tracker_algorithm": "iou",
+    }
+
+
+def test_deepstream_source_block_carries_applied_processing_config() -> None:
+    """M8: when supplied, the resolver lineage dict is stamped verbatim under
+    ``applied_processing_config`` while every existing source-block field
+    (runtime / package_id / metadata_source / analytics_plugin /
+    tracker_algorithm / geometry_source / geometry_revision) is unchanged."""
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0",
+        tracker_algorithm="iou",
+        geometry_source="operator_saved",
+        geometry_revision=5,
+        applied_processing_config=_APPLIED_PC,
+    )
+    assert src["applied_processing_config"] == _APPLIED_PC
+    # The honest caveat warning rides inside the stamped block (not stripped).
+    assert (
+        "selected_classes_analytics_counts_not_filtered"
+        in src["applied_processing_config"]["warnings"]
+    )
+    # Every pre-M8 field is byte-identical alongside the additive one.
+    assert src["runtime"] == "deepstream"
+    assert src["package_id"] == "deepstream.analytics_probe.v0"
+    assert src["metadata_source"] == "pyds_pad_probe"
+    assert src["analytics_plugin"] == "nvdsanalytics"
+    assert src["tracker_algorithm"] == "iou"
+    assert src["geometry_source"] == "operator_saved"
+    assert src["geometry_revision"] == 5
+
+
+def test_deepstream_source_block_applied_processing_config_independent_of_geometry() -> None:
+    """The two additive lineage blocks (geometry + processing) are independent:
+    a source block can carry ``applied_processing_config`` without any geometry
+    kwargs (and the geometry keys stay omitted)."""
+    src = deepstream_source_block(
+        package_id="deepstream.analytics_probe.v0",
+        tracker_algorithm="iou",
+        applied_processing_config=_APPLIED_PC,
+    )
+    assert src["applied_processing_config"] == _APPLIED_PC
+    assert "geometry_source" not in src
+    assert "geometry_revision" not in src
+
+
 # --- malformed inputs are skipped, not crashing ------------------------
 
 

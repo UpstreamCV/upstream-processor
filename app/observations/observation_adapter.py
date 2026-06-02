@@ -1127,6 +1127,7 @@ def deepstream_source_block(
     tracker_algorithm: str | None = None,
     geometry_source: str | None = None,
     geometry_revision: int | None = None,
+    applied_processing_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Stable provenance block for the ``source`` field on events from
     the DeepStream analytics path. Pulled out so worker code does NOT
@@ -1136,6 +1137,14 @@ def deepstream_source_block(
     with the existing ``runtime`` / ``analytics_plugin`` / etc keys) so
     downstream consumers can index on the lineage without parsing nested
     objects. Omitted when None — keeps probe-only test fixtures unchanged.
+
+    M8: ``applied_processing_config`` (the resolver's ``status_payload()`` —
+    the SAME requested-vs-applied lineage stamped on processor status by
+    M7B/C/D) is ADDITIVE metadata; it changes no count. The honest
+    ``selected_classes_analytics_counts_not_filtered`` caveat already rides
+    inside that block's ``warnings`` when selected_classes is applied — it is
+    NOT stripped here. Omitted when None (mirrors the fields above) so
+    existing fixtures stay byte-identical.
     """
     src: dict[str, Any] = {
         "runtime": "deepstream",
@@ -1149,6 +1158,8 @@ def deepstream_source_block(
         src["geometry_source"] = geometry_source
     if geometry_revision is not None:
         src["geometry_revision"] = geometry_revision
+    if applied_processing_config is not None:
+        src["applied_processing_config"] = applied_processing_config
     return src
 
 
