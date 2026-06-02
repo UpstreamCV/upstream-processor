@@ -1120,6 +1120,13 @@ class DeepStreamWorker(Runtime):
                     if self._resolved_geometry is not None
                     else None
                 ),
+                # M8: this single source_block is threaded into ALL emits
+                # (line / ROI / zone / dwell), so stamping the SAME status
+                # lineage here makes every observation carry it uniformly. The
+                # line/ROI aggregate counts stay all-class — the honest
+                # selected_classes_analytics_counts_not_filtered caveat rides
+                # inside this block's warnings. Additive only; no count change.
+                applied_processing_config=self._resolved_processing_config.status_payload(),
             )
             if observations_enabled
             else {}
@@ -1416,6 +1423,11 @@ class DeepStreamWorker(Runtime):
                 tracker_algorithm=self._settings.deepstream_tracker_algorithm,
                 observed_at=observed_at,
                 max_objects=self._settings.perception_snapshot_max_objects,
+                # M8: stamp the SAME requested-vs-applied lineage carried on
+                # processor status (single source of truth) into the snapshot
+                # source block. Additive metadata only — status_payload() is
+                # pure/read-only, so no objects/geometry/count behavior changes.
+                applied_processing_config=self._resolved_processing_config.status_payload(),
             )
         except Exception as exc:
             counters.perception_snapshot_write_errors += 1

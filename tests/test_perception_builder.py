@@ -170,3 +170,130 @@ def test_output_is_json_serializable() -> None:
     snap = _build(_frame(objects=[obj]))
     # Must not raise — no datetime / UUID / set left in the dict.
     json.dumps(snap)
+
+
+# --- M8: additive applied_processing_config stamping -------------------
+
+# A representative resolver ``status_payload()`` block (selected_classes +
+# confidence applied → partially_applied, carrying the honest analytics-counts
+# caveat warning). The builder is opaque to the contents — it must store the
+# dict verbatim under ``source`` — so a realistic shape is used to prove that.
+_APPLIED_PC: dict[str, Any] = {
+    "source": "operator_saved",
+    "revision": 7,
+    "status": "partially_applied",
+    "reason": None,
+    "requested": {
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["person"],
+        "tracker": None,
+        "confidence_threshold": 0.55,
+        "processing_fps": None,
+    },
+    "applied": {
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["person"],
+        "tracker": "iou",
+        "confidence_threshold": 0.55,
+        "processing_fps": None,
+    },
+    "warnings": ["selected_classes_analytics_counts_not_filtered"],
+}
+
+
+def test_applied_processing_config_omitted_by_default() -> None:
+    """Back-compat: with the param omitted (default None) the ``source`` block
+    carries NO ``applied_processing_config`` key — pre-M8 builder output is
+    byte-identical (this is the existing ``test_source_block_fields`` shape)."""
+    src = _build(_frame())["source"]
+    assert "applied_processing_config" not in src
+    assert src == {
+        "runtime": "deepstream",
+        "metadata_source": "pyds_pad_probe",
+        "analytics_plugin": "nvdsanalytics",
+        "tracker_algorithm": "iou",
+    }
+
+
+def test_applied_processing_config_stamped_into_source_block_verbatim() -> None:
+    """When supplied, the dict is placed verbatim under ``source`` as a sibling
+    of the existing provenance keys — the builder does not reshape or recompute
+    it (single source of truth = the resolver's status_payload())."""
+    snap = build_perception_snapshot(
+        metadata=_frame(),
+        geometry=_GEOM,
+        camera_id=uuid4(),
+        stream_session_id=uuid4(),
+        processor_id="proc-1",
+        package_id="deepstream.analytics_probe.v0",
+        runtime="deepstream",
+        metadata_source="pyds_pad_probe",
+        analytics_plugin="nvdsanalytics",
+        tracker_algorithm="iou",
+        observed_at=_OBSERVED,
+        applied_processing_config=_APPLIED_PC,
+    )
+    src = snap["source"]
+    assert src["applied_processing_config"] == _APPLIED_PC
+    # Existing provenance keys are untouched alongside the additive one.
+    assert src["runtime"] == "deepstream"
+    assert src["metadata_source"] == "pyds_pad_probe"
+    assert src["analytics_plugin"] == "nvdsanalytics"
+    assert src["tracker_algorithm"] == "iou"
+    # The caveat warning rides along inside the stamped block, not stripped.
+    assert (
+        "selected_classes_analytics_counts_not_filtered"
+        in src["applied_processing_config"]["warnings"]
+    )
+
+
+def test_applied_processing_config_does_not_touch_objects_or_geometry() -> None:
+    """The additive stamp is metadata only: objects / geometry / debug are
+    identical whether or not the block is supplied."""
+    obj = NeutralObjectMetadata(
+        class_id=2,
+        label="person",
+        tracker_id="0",
+        bbox_pixels=BoundingBoxPixels(left=1, top=2, width=3, height=4),
+        debug={"analytics": {"roi_labels": ["entry-roi"]}},
+    )
+    without = _build(_frame(objects=[obj]))
+    with_pc = build_perception_snapshot(
+        metadata=_frame(objects=[obj]),
+        geometry=_GEOM,
+        camera_id=uuid4(),
+        stream_session_id=uuid4(),
+        processor_id="proc-1",
+        package_id="deepstream.analytics_probe.v0",
+        runtime="deepstream",
+        metadata_source="pyds_pad_probe",
+        analytics_plugin="nvdsanalytics",
+        tracker_algorithm="iou",
+        observed_at=_OBSERVED,
+        applied_processing_config=_APPLIED_PC,
+    )
+    assert with_pc["objects"] == without["objects"]
+    assert with_pc["geometry"] == without["geometry"]
+    assert with_pc["debug"] == without["debug"]
+    # The ONLY difference is the additive source key.
+    assert set(with_pc["source"]) - set(without["source"]) == {"applied_processing_config"}
+
+
+def test_applied_processing_config_output_is_json_serializable() -> None:
+    """The stamped block must not break the snapshot's JSON-serializability
+    contract."""
+    snap = build_perception_snapshot(
+        metadata=_frame(),
+        geometry=_GEOM,
+        camera_id=uuid4(),
+        stream_session_id=uuid4(),
+        processor_id="proc-1",
+        package_id="deepstream.analytics_probe.v0",
+        runtime="deepstream",
+        metadata_source="pyds_pad_probe",
+        analytics_plugin="nvdsanalytics",
+        tracker_algorithm="iou",
+        observed_at=_OBSERVED,
+        applied_processing_config=_APPLIED_PC,
+    )
+    json.dumps(snap)

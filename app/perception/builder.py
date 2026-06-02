@@ -73,6 +73,7 @@ def build_perception_snapshot(
     tracker_algorithm: str,
     observed_at: datetime,
     max_objects: int = 50,
+    applied_processing_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the latest-perception-snapshot payload dict.
 
@@ -80,6 +81,12 @@ def build_perception_snapshot(
     output (``{"rois": [...], "lines": [...]}``) — passed pre-serialized so
     this builder stays free of any runtime-specific import. ``max_objects``
     bounds the ``objects`` list; ``debug.objects_seen`` keeps the true count.
+
+    M8: ``applied_processing_config`` (the resolver's ``status_payload()`` —
+    the SAME requested-vs-applied lineage stamped on processor status by
+    M7B/C/D) is ADDITIVE metadata placed inside the ``source`` block when not
+    ``None``; it never affects objects/geometry/debug or any count. Omitted
+    when ``None`` so pure-unit builder tests stay byte-identical.
     """
     all_objects = metadata.objects
     capped = all_objects[: max(max_objects, 0)]
@@ -103,6 +110,11 @@ def build_perception_snapshot(
             "metadata_source": metadata_source,
             "analytics_plugin": analytics_plugin,
             "tracker_algorithm": tracker_algorithm,
+            **(
+                {"applied_processing_config": applied_processing_config}
+                if applied_processing_config is not None
+                else {}
+            ),
         },
         "debug": {
             "objects_seen": len(all_objects),

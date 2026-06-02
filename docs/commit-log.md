@@ -4,6 +4,60 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-02 - M8: Stamp applied_processing_config lineage onto perception snapshots + observation source blocks
+
+### Summary
+The processor now **stamps** the requested-vs-applied processing-config lineage
+onto two more output surfaces — the **perception snapshot** (`source` block) and
+**every observation** (`source` block) — in addition to processor status. This
+is **ADDITIVE METADATA ONLY**: no runtime behavior changes anywhere. The lineage
+reuses the **single source of truth** — `ResolvedProcessingConfig.status_payload()`,
+the SAME block already stamped on processor status by M7B/C/D — so status,
+snapshot, and observations can never drift. `status_payload()` is pure /
+read-only, so calling it on these paths changes nothing.
+
+- `app/perception/builder.py` — `build_perception_snapshot(...)` gains
+  `applied_processing_config: dict[str, Any] | None = None`, placed INSIDE the
+  returned `source` block (beside `tracker_algorithm`) when not `None`; omitted
+  when `None` so existing pure-unit builder tests stay byte-identical. Objects /
+  geometry / debug untouched.
+- `app/observations/observation_adapter.py` — `deepstream_source_block(...)`
+  gains `applied_processing_config: dict[str, Any] | None = None`; set as
+  `src["applied_processing_config"]` when not `None`, mirroring the
+  omit-when-None pattern of `tracker_algorithm` / `geometry_source` /
+  `geometry_revision`. Omitted when `None` so existing fixtures stay unchanged.
+- `app/runtimes/deepstream_runtime/worker.py` — passes
+  `applied_processing_config=self._resolved_processing_config.status_payload()`
+  at BOTH the `_build_perception_payload` snapshot build site and the single
+  `deepstream_source_block(...)` construction (~line 1108). That one source_block
+  is already threaded into ALL emits (line / ROI / zone / dwell), so every
+  observation gains the stamp uniformly.
+
+### Single source of truth — no drift
+Both new stamp points and the existing status stamp call the identical
+`status_payload()` accessor. No lineage is recomputed per output path.
+
+### Line/ROI aggregate counts still all-class (caveat rides along)
+The nvdsanalytics aggregate line-crossing / ROI-occupancy counts remain across
+ALL classes — M8 changes no count. When `selected_classes` is applied, the honest
+`selected_classes_analytics_counts_not_filtered` warning is already inside
+`status_payload().warnings`, so it rides along inside the stamped block
+automatically and is NOT stripped.
+
+### api-server: NO change needed
+`PerceptionSnapshotIngestRequest.snapshot` and `ProcessorObservationRequest.payload`
+are `dict[str, Any]` opaque JSONB (no `extra=forbid`); the service `json.dumps(...)`
+them straight into JSONB columns. Additive keys are accepted as-is. No DB
+migration, no dashboard, no styling/overlay fields.
+
+### Not in scope (unchanged)
+Model / tracker / FPS remain stamp-only. No change to object counts, M7D
+`selected_classes` filtering, M7C `confidence_threshold` apply, geometry, PGIE
+config, nvdsanalytics class-id, line/ROI aggregate counts, reliability, account
+`processing_enabled`, or `package_id`.
+
+---
+
 ## 2026-06-02 - M7D: Apply selected_classes by post-inference per-object filtering
 
 ### Summary
