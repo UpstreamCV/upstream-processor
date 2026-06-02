@@ -20,6 +20,9 @@ from __future__ import annotations
 from app.observations.schemas import EligibleSession
 from app.packages.resolver import resolve
 from app.processing.resolver import DEFAULT_APPLIED
+from app.runtimes.deepstream_runtime.metadata_probe import (
+    DeepStreamMetadataProcessManager,
+)
 from app.runtimes.deepstream_runtime.worker import DeepStreamWorker
 
 from tests._fakes import FakeApi
@@ -59,6 +62,15 @@ def _analytics_worker(session: EligibleSession, settings) -> DeepStreamWorker:  
         settings=settings,
         api=FakeApi(),
         package=resolve("deepstream.analytics_probe.v0"),
+    )
+
+
+def _worker(session: EligibleSession, settings, package_id: str) -> DeepStreamWorker:  # type: ignore[no-untyped-def]
+    return DeepStreamWorker(
+        session=session,
+        settings=settings,
+        api=FakeApi(),
+        package=resolve(package_id),
     )
 
 
@@ -113,15 +125,17 @@ def test_null_processing_config_resolves_to_default(fast_settings) -> None:  # t
 
 
 def test_diverging_config_resolves_to_requested_not_applied(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    env = _envelope(
-        revision=7, selected_classes=["person"], confidence_threshold=0.55, processing_fps=5
-    )
+    # M7C: confidence_threshold is now genuinely applied in analytics mode, so
+    # this stamp-only divergence case uses only the fields that remain
+    # stamp-only (selected_classes / processing_fps). The
+    # confidence-applied/partially_applied paths are covered explicitly below.
+    env = _envelope(revision=7, selected_classes=["person"], processing_fps=5)
     w = _analytics_worker(_session(env), fast_settings)
     rc = w._resolved_processing_config
     assert rc.source == "operator_saved"
     assert rc.status == "requested_not_applied"
     assert rc.revision == 7
-    # Nothing applied.
+    # Nothing applied (none of the requested fields is applicable in M7C).
     assert rc.applied == DEFAULT_APPLIED
 
 
@@ -209,3 +223,82 @@ def test_caller_payload_merges_with_applied_processing_config(fast_settings) -> 
     assert "applied_processing_config" in status.payload
     # Geometry lineage still flows alongside it on an analytics worker.
     assert "applied_geometry" in status.payload
+
+
+# ===========================================================================
+# M7C — confidence_threshold flows into the PGIE-rendering process manager
+# ===========================================================================
+
+
+def test_analytics_worker_applies_confidence_in_resolution(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """An analytics worker computes confidence_apply_supported=True, so a
+    saved confidence is genuinely applied: resolved status flips to
+    partially_applied (other requested fields still warn) and
+    applied.confidence_threshold echoes the operator value."""
+    env = _envelope(revision=8, confidence_threshold=0.55, selected_classes=["person"])
+    w = _analytics_worker(_session(env), fast_settings)
+    rc = w._resolved_processing_config
+    assert rc.source == "operator_saved"
+    assert rc.status == "partially_applied"
+    assert rc.applied.confidence_threshold == 0.55
+    assert "confidence_threshold_requested_not_applied" not in rc.warnings
+    assert "selected_classes_requested_not_applied" in rc.warnings
+
+
+def test_metadata_worker_applies_confidence_clean_status_applied(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Metadata mode also supports applying confidence. With only confidence
+    requested, status is the clean ``applied`` (no warnings)."""
+    env = _envelope(revision=3, confidence_threshold=0.55)
+    w = _worker(_session(env), fast_settings, "deepstream.metadata_probe.v0")
+    rc = w._resolved_processing_config
+    assert rc.status == "applied"
+    assert rc.applied.confidence_threshold == 0.55
+    assert rc.warnings == ()
+
+
+def test_decode_worker_does_not_apply_confidence(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Decode mode renders no PGIE config, so confidence_apply_supported is
+    False there: the same saved confidence is recorded as
+    requested_not_applied and applied stays at the defaults (None)."""
+    env = _envelope(revision=3, confidence_threshold=0.55)
+    w = _worker(_session(env), fast_settings, "deepstream.decode_probe.v0")
+    rc = w._resolved_processing_config
+    assert rc.status == "requested_not_applied"
+    assert rc.applied.confidence_threshold is None
+    assert rc.applied == DEFAULT_APPLIED
+    assert "confidence_threshold_requested_not_applied" in rc.warnings
+
+
+def test_default_pm_factory_forwards_confidence_threshold(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """``_default_pm_factory()`` on an analytics worker must hand the
+    DeepStreamMetadataProcessManager the resolved APPLIED confidence (the
+    single source of truth the live PGIE config and the stamped lineage
+    share), mirroring how the geometry test inspects the forwarded value."""
+    env = _envelope(revision=2, confidence_threshold=0.55)
+    w = _analytics_worker(_session(env), fast_settings)
+    # The applied value is what gets forwarded.
+    assert w._resolved_processing_config.applied.confidence_threshold == 0.55
+    pm = w._default_pm_factory()
+    assert isinstance(pm, DeepStreamMetadataProcessManager)
+    assert pm._confidence_threshold == 0.55
+
+
+def test_default_pm_factory_forwards_none_when_no_override(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """No operator confidence → the PM receives None, preserving the built-in
+    pre-cluster-threshold defaults (M7B/byte-identical behavior)."""
+    w = _analytics_worker(_session(None), fast_settings)
+    pm = w._default_pm_factory()
+    assert isinstance(pm, DeepStreamMetadataProcessManager)
+    assert pm._confidence_threshold is None
+
+
+def test_default_pm_factory_forwards_none_when_mode_cannot_apply(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """A tracker-mode worker DOES render a PGIE config and DOES support
+    applying confidence, so it forwards the resolved value. (Sanity that the
+    PM-facing path matches the resolver gate.)"""
+    env = _envelope(revision=4, confidence_threshold=0.4)
+    w = _worker(_session(env), fast_settings, "deepstream.tracker_probe.v0")
+    assert w._resolved_processing_config.applied.confidence_threshold == 0.4
+    pm = w._default_pm_factory()
+    assert isinstance(pm, DeepStreamMetadataProcessManager)
+    assert pm._confidence_threshold == 0.4

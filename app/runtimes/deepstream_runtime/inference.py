@@ -56,10 +56,20 @@ def resolve_model_dir(model: str) -> str:
     return _MODEL_DIR
 
 
-def build_pgie_config(*, model_dir: str, engine_path: str) -> str:
+def build_pgie_config(
+    *, model_dir: str, engine_path: str, confidence_threshold: float | None = None
+) -> str:
     """PGIE config: bundled TrafficCamNet ONNX, INT8, batch 1. The
     ``model-engine-file`` points at a not-yet-existing path so nvinfer must
-    BUILD the TensorRT engine (the SM-arch test). Mirrors M8.2C1-A."""
+    BUILD the TensorRT engine (the SM-arch test). Mirrors M8.2C1-A.
+
+    M7C: when ``confidence_threshold`` is supplied (the resolved per-camera
+    operator value), it overrides BOTH ``pre-cluster-threshold`` entries
+    (``class-attrs-all`` and ``class-attrs-0``) so detection filtering is
+    uniform across classes. When ``None`` (no operator override) the output
+    is byte-identical to the previous hard-coded 0.2 / 0.4 defaults."""
+    all_thr = "0.2" if confidence_threshold is None else f"{confidence_threshold}"
+    cls0_thr = "0.4" if confidence_threshold is None else f"{confidence_threshold}"
     return (
         "[property]\n"
         "gpu-id=0\n"
@@ -79,11 +89,11 @@ def build_pgie_config(*, model_dir: str, engine_path: str) -> str:
         "[class-attrs-all]\n"
         "topk=20\n"
         "nms-iou-threshold=0.5\n"
-        "pre-cluster-threshold=0.2\n"
+        f"pre-cluster-threshold={all_thr}\n"
         "[class-attrs-0]\n"
         "topk=20\n"
         "nms-iou-threshold=0.5\n"
-        "pre-cluster-threshold=0.4\n"
+        f"pre-cluster-threshold={cls0_thr}\n"
     )
 
 

@@ -330,6 +330,111 @@ def test_status_payload_includes_reason_when_degraded() -> None:
     assert payload["applied"]["model_key"] == "trafficcamnet_v1"
 
 
+# ===========================================================================
+# M7C — confidence_threshold is genuinely applied when the mode supports it
+# ===========================================================================
+#
+# These exercise the new ``confidence_apply_supported`` seam. The existing M7B
+# tests above intentionally OMIT the kwarg (defaults to False) and must stay
+# green — proving M7C is a pure superset: when apply isn't supported the
+# resolver behaves exactly as it did in M7B (stamp-only, applied==defaults).
+
+
+def test_confidence_applied_when_supported_status_applied() -> None:
+    """confidence_apply_supported=True + a confidence request and otherwise
+    default config → confidence is echoed into applied, NO confidence warning,
+    status == applied (a value was applied, nothing diverged)."""
+    r = resolve_session_processing_config(
+        _envelope(confidence_threshold=0.55), confidence_apply_supported=True
+    )
+    assert r.source == "operator_saved"
+    assert r.status == "applied"
+    assert r.applied.confidence_threshold == 0.55
+    assert "confidence_threshold_requested_not_applied" not in r.warnings
+    assert r.warnings == ()
+    # Only confidence is applied; every other applied field stays at defaults.
+    assert r.applied.model_key == DEFAULT_APPLIED.model_key
+    assert r.applied.selected_classes == []
+    assert r.applied.tracker == DEFAULT_APPLIED.tracker
+    assert r.applied.processing_fps is None
+    # The frozen module default must NOT have been mutated by replace().
+    assert DEFAULT_APPLIED.confidence_threshold is None
+
+
+def test_confidence_applied_plus_unapplied_fields_is_partially_applied() -> None:
+    """confidence_apply_supported=True + confidence 0.55 + selected_classes
+    + processing_fps → confidence applied (no confidence warning) while the
+    stamp-only fields warn. status == partially_applied; the stamp-only fields
+    stay at defaults ([] / None)."""
+    r = resolve_session_processing_config(
+        _envelope(
+            confidence_threshold=0.55,
+            selected_classes=["person"],
+            processing_fps=5,
+        ),
+        confidence_apply_supported=True,
+    )
+    assert r.status == "partially_applied"
+    assert r.applied.confidence_threshold == 0.55
+    assert "confidence_threshold_requested_not_applied" not in r.warnings
+    assert "selected_classes_requested_not_applied" in r.warnings
+    assert "processing_fps_requested_not_applied" in r.warnings
+    # The unapplied fields keep the runtime defaults (not echoes of requested).
+    assert r.applied.selected_classes == []
+    assert r.applied.processing_fps is None
+    # ...but requested still mirrors what the operator saved.
+    assert r.requested.selected_classes == ["person"]
+    assert r.requested.processing_fps == 5
+
+
+def test_confidence_not_applied_when_unsupported_preserves_m7b() -> None:
+    """confidence_apply_supported=False (the M7B default) + a confidence
+    request → NOT applied, warning emitted, status == requested_not_applied,
+    applied stays the static defaults. This proves the pre-M7C behavior is
+    preserved exactly when the mode can't apply the threshold."""
+    r = resolve_session_processing_config(
+        _envelope(confidence_threshold=0.55), confidence_apply_supported=False
+    )
+    assert r.status == "requested_not_applied"
+    assert r.applied.confidence_threshold is None
+    assert r.applied == DEFAULT_APPLIED
+    assert "confidence_threshold_requested_not_applied" in r.warnings
+    assert r.requested.confidence_threshold == 0.55
+    # Default kwarg must behave identically to passing False explicitly.
+    r_default = resolve_session_processing_config(_envelope(confidence_threshold=0.55))
+    assert r_default.status == "requested_not_applied"
+    assert r_default.applied == DEFAULT_APPLIED
+
+
+def test_no_confidence_request_is_applied_defaults_even_when_supported() -> None:
+    """confidence_apply_supported=True but the operator requested no
+    confidence (None) and nothing else diverges → no confidence warning,
+    applied.confidence_threshold stays None, status == applied_defaults."""
+    r = resolve_session_processing_config(
+        _envelope(confidence_threshold=None), confidence_apply_supported=True
+    )
+    assert r.status == "applied_defaults"
+    assert r.applied.confidence_threshold is None
+    assert r.applied == DEFAULT_APPLIED
+    assert r.warnings == ()
+    assert "confidence_threshold_requested_not_applied" not in r.warnings
+
+
+def test_out_of_range_confidence_falls_back_even_when_apply_supported() -> None:
+    """Defensive: an out-of-[0,1] confidence (e.g. 1.5) fails the
+    session_processing bounds validation, so even with apply support the
+    resolver degrades to the error fallback WITHOUT raising — applied stays
+    the static defaults (confidence None)."""
+    r = resolve_session_processing_config(
+        _envelope(confidence_threshold=1.5), confidence_apply_supported=True
+    )
+    assert r.source == "fallback_default_on_error"
+    assert r.status == "fallback_default_on_error"
+    assert r.error_reason is not None
+    assert r.applied.confidence_threshold is None
+    assert r.applied == DEFAULT_APPLIED
+
+
 def test_status_payload_applied_is_always_default_across_all_outcomes() -> None:
     """Pin the core M7B invariant in one place: regardless of source/status,
     the applied block equals DEFAULT_APPLIED rendered to dict — nothing from

@@ -417,16 +417,29 @@ class DeepStreamWorker(Runtime):
                     else ""
                 ),
             )
-        # M7B: resolve the operator-saved processing config once, STAMP ONLY.
-        # Done defensively right next to the geometry resolve — the resolver
-        # never raises and applies NOTHING (model/tracker/threshold/fps stay
-        # at the worker's current defaults). It only produces the
-        # requested-vs-applied lineage block stamped onto status. Resolved
-        # unconditionally (not gated on mode) so every DeepStream worker
-        # carries the lineage; a bad/diverging config must NOT flag a worker
-        # error — it lives only in the lineage block.
+        # M7B/M7C: resolve the operator-saved processing config once. Done
+        # defensively right next to the geometry resolve — the resolver never
+        # raises. model/tracker/selected_classes/fps stay at the worker's
+        # current defaults (stamp-only). M7C: confidence_threshold is genuinely
+        # applied, but ONLY in the modes that actually render it into a PGIE
+        # config — the metadata/tracker/analytics modes that construct a
+        # DeepStreamMetadataProcessManager in ``_default_pm_factory``. The
+        # boolean below is the gate; the resolved APPLIED value is then the
+        # single source of truth forwarded to that process manager so the
+        # stamped lineage and the live PGIE config can never disagree. Resolved
+        # unconditionally (not gated on mode) so every DeepStream worker carries
+        # the lineage; a bad/diverging config must NOT flag a worker error — it
+        # lives only in the lineage block.
+        confidence_apply_supported = self._mode in (
+            _METADATA_MODE,
+            _TRACKER_MODE,
+            _ANALYTICS_MODE,
+        )
         self._resolved_processing_config: ResolvedProcessingConfig = (
-            resolve_session_processing_config(session.processing_config)
+            resolve_session_processing_config(
+                session.processing_config,
+                confidence_apply_supported=confidence_apply_supported,
+            )
         )
         _log.info(
             "processing config resolved: camera_id=%s stream_session_id=%s source=%s "
@@ -519,6 +532,10 @@ class DeepStreamWorker(Runtime):
                 analytics_class_ids=self._settings.deepstream_analytics_class_ids,
                 analytics_geometry=analytics_geometry,
                 gpus=self._settings.deepstream_gpus,
+                # M7C: the resolved APPLIED confidence threshold (a float when
+                # applied for this mode, None otherwise) — the single source of
+                # truth shared with the stamped lineage so they can't diverge.
+                confidence_threshold=self._resolved_processing_config.applied.confidence_threshold,
             )
         if self._mode == _INFERENCE_MODE:
             return DeepStreamInferenceProcessManager(

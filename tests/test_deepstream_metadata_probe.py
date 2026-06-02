@@ -460,8 +460,48 @@ async def test_metadata_pm_writes_app_and_pgie_then_cleans(tmp_path, monkeypatch
     assert "cal_trt.bin" in pgie_text
     cmd = pm.command()
     assert "--gpus" in cmd and "-v" in cmd
+    # M7C: with no operator override the written pgie keeps the built-in
+    # pre-cluster-threshold defaults (byte-identical to pre-M7C).
+    assert "pre-cluster-threshold=0.2\n" in pgie_text
+    assert "pre-cluster-threshold=0.4\n" in pgie_text
     await pm.stop()
     assert not wd.exists()  # cleaned up by default
+
+
+async def test_metadata_pm_writes_confidence_threshold_into_pgie(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """M7C: a confidence_threshold passed to the PM is rendered into the
+    written pgie.txt — BOTH pre-cluster-threshold lines become the override,
+    and neither built-in default (0.2 / 0.4) remains."""
+
+    async def _fake_exec(*_a: object, **_k: object):  # type: ignore[no-untyped-def]
+        return _FakeProc()
+
+    monkeypatch.setattr(meta_mod.asyncio, "create_subprocess_exec", _fake_exec)
+    pm = DeepStreamMetadataProcessManager(
+        rtsp_url=_URL,
+        image="upstream-deepstream:8.0-pyds-v1.2.2",
+        network="host",
+        rtsp_transport="tcp",
+        probe_timeout_seconds=5,
+        stop_timeout_seconds=0.01,
+        model="trafficcamnet",
+        output_base_dir=str(tmp_path),
+        keep_temp_files=False,
+        sample_limit=3,
+        stream_session_id="abc-123",
+        width=1280,
+        height=720,
+        confidence_threshold=0.55,
+    )
+    assert pm._confidence_threshold == 0.55
+    await pm.start()
+    wd = pm._work_dir
+    assert wd is not None
+    pgie_text = (wd / "pgie.txt").read_text(encoding="utf-8")
+    assert pgie_text.count("pre-cluster-threshold=0.55\n") == 2
+    assert "pre-cluster-threshold=0.2\n" not in pgie_text
+    assert "pre-cluster-threshold=0.4\n" not in pgie_text
+    await pm.stop()
 
 
 def test_metadata_pm_unknown_model_raises(tmp_path) -> None:  # type: ignore[no-untyped-def]

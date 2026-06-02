@@ -1,30 +1,41 @@
 """Resolve the eligible-session ``processing_config`` envelope into a
-requested-vs-applied lineage block. STAMP ONLY (M7B).
+requested-vs-applied lineage block.
 
 Three resolution outcomes (mirrors ``geometry/resolver.py``):
 
 - ``operator_saved`` — envelope parsed. The requested values are recorded
   and compared field-by-field against what the runtime *actually* applies
-  (the static defaults below). Any divergence is recorded in ``warnings``
-  and flips ``status`` to ``requested_not_applied``; nothing is applied.
+  (the static defaults below). Any divergence that is NOT applied is recorded
+  in ``warnings``.
 - ``default`` — envelope is ``None`` (camera has no ``camera_processing_configs``
   row). ``status`` is ``applied_defaults`` with all-null requested.
 - ``fallback_default_on_error`` — envelope is present but doesn't parse.
   ``error_reason`` carries a short, secret-free hint.
 
-M7B applies NOTHING from the config — ``applied`` is ALWAYS the worker's
-current runtime defaults and never echoes a requested value. Unlike the
-geometry resolver, a bad/diverging processing config does NOT flag a worker
-``error_code``: it lives only in this lineage block (the caller wires it as
-``payload.applied_processing_config`` and sets no error). ``partially_applied``
-is reserved for a later milestone and is NEVER emitted here.
+M7C: ``confidence_threshold`` is now genuinely applied — but ONLY when the
+caller passes ``confidence_apply_supported=True`` (the DeepStream
+metadata/tracker/analytics modes, which actually render the value into the
+PGIE ``pre-cluster-threshold``). When applied, it is echoed into ``applied``
+and produces NO warning; when the mode cannot apply it, it stays in the
+defaults and emits ``confidence_threshold_requested_not_applied``. Because
+both ``partially_applied`` (some applied, some not) and ``applied`` (request
+matches/applies cleanly) can now occur, both statuses are emitted here.
+
+Everything ELSE remains STAMP ONLY: ``model_key`` / ``selected_classes`` /
+``processing_fps`` / ``tracker`` are never applied — any meaningful request
+for them is recorded as a ``*_requested_not_applied`` warning and ``applied``
+keeps the worker's current runtime defaults.
+
+Unlike the geometry resolver, a bad/diverging processing config does NOT flag
+a worker ``error_code``: it lives only in this lineage block (the caller wires
+it as ``payload.applied_processing_config`` and sets no error).
 
 Pure / side-effect free: no I/O, no logging. Logging is the caller's job.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from pydantic import ValidationError
@@ -47,8 +58,9 @@ class RequestedProcessingConfig:
 
 @dataclass(frozen=True)
 class AppliedProcessingConfig:
-    """What the runtime actually applies. In M7B this is always the static
-    DeepStream defaults — the config is never applied."""
+    """What the runtime actually applies. Starts from the static DeepStream
+    defaults; M7C may override ``confidence_threshold`` with the operator
+    value when the mode can apply it. All other fields stay at defaults."""
 
     model_key: str
     selected_classes: list[str]
@@ -57,10 +69,11 @@ class AppliedProcessingConfig:
     processing_fps: int | None
 
 
-# The deepstream worker's REAL current behavior: trafficcamnet, all classes
-# (empty list == no class filter), iou tracker, no operator threshold/fps
-# override. M7B applies nothing, so this is what every ``applied`` block
-# reports regardless of what was requested.
+# The deepstream worker's REAL current default behavior: trafficcamnet, all
+# classes (empty list == no class filter), iou tracker, no operator
+# threshold/fps override. M7C may replace ``confidence_threshold`` here with
+# the operator value when the mode can apply it; everything else is reported
+# as-is regardless of what was requested.
 DEFAULT_APPLIED = AppliedProcessingConfig(
     model_key="trafficcamnet_v1",
     selected_classes=[],
@@ -130,8 +143,17 @@ def resolve_session_processing_config(
     envelope: dict[str, Any] | None,
     *,
     defaults: AppliedProcessingConfig = DEFAULT_APPLIED,
+    confidence_apply_supported: bool = False,
 ) -> ResolvedProcessingConfig:
     """Resolve the wire envelope into a ``ResolvedProcessingConfig``.
+
+    ``confidence_apply_supported`` (default ``False``, which preserves the
+    pre-M7C stamp-only behavior for callers/tests that don't pass it) tells
+    the resolver the running mode can actually write the operator
+    ``confidence_threshold`` into the PGIE config. When ``True`` and a
+    threshold is requested, it is applied (echoed into ``applied`` with no
+    warning); otherwise it is recorded as
+    ``confidence_threshold_requested_not_applied``.
 
     See module docstring. NEVER raises.
     """
@@ -181,12 +203,12 @@ def resolve_session_processing_config(
     )
 
     # Per-field divergence vs what the runtime actually applies (defaults).
-    # M7B applies nothing, so any meaningful request is "requested_not_applied".
+    # Everything except confidence_threshold is still stamp-only: a meaningful
+    # request is recorded as "*_requested_not_applied" and never applied.
     warnings: list[str] = []
+    applied_count = 0
     if config.selected_classes and config.selected_classes != []:
         warnings.append("selected_classes_requested_not_applied")
-    if config.confidence_threshold is not None:
-        warnings.append("confidence_threshold_requested_not_applied")
     if config.processing_fps is not None:
         warnings.append("processing_fps_requested_not_applied")
     if config.model_key != defaults.model_key:
@@ -196,14 +218,30 @@ def resolve_session_processing_config(
     if config.tracker not in (None, defaults.tracker):
         warnings.append("tracker_requested_not_applied")
 
-    # NEVER "partially_applied" in M7B — only requested_not_applied (something
-    # diverges) or applied_defaults (request matches the defaults exactly).
-    status = "requested_not_applied" if warnings else "applied_defaults"
+    # M7C: confidence_threshold is genuinely applied when the mode supports it.
+    applied_confidence = defaults.confidence_threshold
+    if config.confidence_threshold is not None:
+        if confidence_apply_supported:
+            applied_confidence = config.confidence_threshold
+            applied_count += 1
+        else:
+            warnings.append("confidence_threshold_requested_not_applied")
+
+    applied = replace(defaults, confidence_threshold=applied_confidence)
+
+    if warnings and applied_count > 0:
+        status = "partially_applied"
+    elif warnings:
+        status = "requested_not_applied"
+    elif applied_count > 0:
+        status = "applied"
+    else:
+        status = "applied_defaults"
     return ResolvedProcessingConfig(
         source="operator_saved",
         revision=parsed.revision,
         requested=requested,
-        applied=defaults,
+        applied=applied,
         status=status,
         warnings=tuple(warnings),
     )

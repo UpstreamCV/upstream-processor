@@ -4,6 +4,59 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-02 - M7C: Apply confidence_threshold to the live PGIE config
+
+### Summary
+The DeepStream worker now **applies** the operator-saved per-camera
+`confidence_threshold` to the live nvinfer PGIE config — the first piece of the
+processing config that is genuinely applied rather than only stamped. Scope is
+`confidence_threshold` ONLY: model switching, `selected_classes` / class
+filtering, `processing_fps`, and dynamic tracker switching remain stamp-only.
+
+- `build_pgie_config` (`inference.py`) gains an optional
+  `confidence_threshold: float | None = None`. A float overrides BOTH
+  `pre-cluster-threshold` entries (`[class-attrs-all]` and `[class-attrs-0]`);
+  `None` leaves the output byte-identical to the prior hard-coded 0.2 / 0.4
+  defaults. No other PGIE field (topk / nms / interval / num-classes / paths)
+  changes.
+- `DeepStreamMetadataProcessManager.__init__` gains
+  `confidence_threshold: float | None = None` (stored as
+  `self._confidence_threshold`), forwarded to `build_pgie_config` in
+  `_prepare_work_dir`. Default keeps existing callers/tests unaffected.
+- `resolve_session_processing_config` (`resolver.py`) gains
+  `confidence_apply_supported: bool = False`. When `True` and a threshold is
+  saved, it is applied (echoed into `applied.confidence_threshold`, no warning,
+  `applied_count += 1`); otherwise it stays
+  `confidence_threshold_requested_not_applied`. `applied` is now
+  `replace(defaults, confidence_threshold=applied_confidence)`. Status:
+  `partially_applied` (warnings + something applied), `requested_not_applied`
+  (warnings only), `applied` (something applied, no warnings), else
+  `applied_defaults`. `partially_applied` / `applied` are now emitted.
+- The worker passes `confidence_apply_supported = self._mode in
+  (_METADATA_MODE, _TRACKER_MODE, _ANALYTICS_MODE)` to the resolver, and
+  forwards the resolved APPLIED value
+  (`self._resolved_processing_config.applied.confidence_threshold`) into the
+  `DeepStreamMetadataProcessManager` — the single source of truth, so the
+  stamped lineage and the live PGIE config can never disagree.
+
+### Applied only where it can take effect
+Confidence is applied only in the DeepStream metadata / tracker / analytics
+modes (the ones that build a PGIE config). Inference / decode / probe modes and
+the `inference.py:586` `inference_probe` call site keep calling
+`build_pgie_config` with no confidence arg (defaults to `None`) — unchanged.
+
+### Per-camera safety
+The value flows per-worker (per session) through the process-manager instance —
+never via global `Settings` or a module global. No cross-camera leakage.
+
+### Not in scope
+No model switching, no `selected_classes` application, no `processing_fps`
+throttle, no dynamic tracker switching. No DB migration, no dashboard change, no
+api-server change. Tracker config, analytics class-id / geometry, `package_id`,
+account `processing_enabled`, reliability all untouched.
+
+---
+
 ## 2026-06-01 - M7B: Processor stamps applied_processing_config (STAMP ONLY)
 
 ### Summary
