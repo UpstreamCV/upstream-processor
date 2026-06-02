@@ -112,3 +112,42 @@ def test_filter_does_not_mutate_label_casing() -> None:
 def test_filter_empty_result_when_nothing_matches() -> None:
     objs = [_obj(0, "car"), _obj(1, "bicycle")]
     assert filter_objects_by_class(objs, ["person"]) == []
+
+
+# --- label-vocabulary drift: model "road_sign" vs registry "roadsign" --
+
+
+def test_canonical_class_strips_separators() -> None:
+    # The DeepStream model emits "road_sign"; the registry says "roadsign".
+    # Both must canonicalize identically (case-folded, separators removed).
+    assert canonical_class("road_sign", 3) == "roadsign"
+    assert canonical_class("Road Sign", 3) == "roadsign"
+    assert canonical_class("road-sign", None) == "roadsign"
+    assert canonical_class("ROAD_SIGN", None) == "roadsign"
+
+
+def test_filter_matches_across_separator_drift() -> None:
+    # Selecting the registry label "roadsign" keeps the model's "road_sign"
+    # objects (and the other separator/case variants) — the underscore fix.
+    objs = [
+        _obj(3, "road_sign"),
+        _obj(3, "Road Sign"),
+        _obj(3, "road-sign"),
+        _obj(2, "person"),
+    ]
+    out = filter_objects_by_class(objs, ["roadsign"])
+    assert out == [objs[0], objs[1], objs[2]]
+
+
+def test_filter_separator_insensitive_on_both_sides() -> None:
+    # A selected entry with a separator also canonicalizes — symmetry.
+    objs = [_obj(3, "road_sign"), _obj(2, "person")]
+    assert filter_objects_by_class(objs, ["road sign"]) == [objs[0]]
+    assert filter_objects_by_class(objs, ["road_sign"]) == [objs[0]]
+
+
+def test_clean_classes_unaffected_by_canonicalization() -> None:
+    # Regression: the already-correct labels are unchanged by _canon.
+    objs = [_obj(0, "car"), _obj(2, "person"), _obj(1, "bicycle")]
+    assert filter_objects_by_class(objs, ["car"]) == [objs[0]]
+    assert filter_objects_by_class(objs, ["person", "bicycle"]) == [objs[1], objs[2]]

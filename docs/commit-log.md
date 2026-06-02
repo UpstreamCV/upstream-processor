@@ -4,6 +4,25 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-02 - M7D fix: canonicalize class labels so registry "roadsign" matches model "road_sign"
+
+### Summary
+Follow-up to M7D. The DeepStream model emits `label="road_sign"` (and could
+emit `"Road Sign"` / `"road-sign"`), while the registry / dashboard
+`supported_classes` use `"roadsign"`. M7D matched labels after only
+`lower()`/`strip()`, so selecting `roadsign` would have dropped real road-sign
+detections. The class filter now canonicalizes BOTH sides with a shared
+`_canon` rule (case-fold + strip all non-alphanumerics) in
+`app/processing/class_filter.py`, so `road_sign`/`Road Sign`/`road-sign` all
+match `roadsign`. Matching stays **label-first** (the model's own label travels
+with whatever model is running — more future-proof across the growing registry
+than the TrafficCamNet-specific `class_id` map, which remains the label-less
+fallback). Additive robustness only: the already-correct classes
+(`car`/`person`/`bicycle`) are unchanged; `[]`/no-filter path is untouched.
+Tests: +4 drift cases in `tests/test_class_filter.py`; full suite 600 passed.
+
+---
+
 ## 2026-06-02 - M8: Stamp applied_processing_config lineage onto perception snapshots + observation source blocks
 
 ### Summary
