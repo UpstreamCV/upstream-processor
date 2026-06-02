@@ -4,6 +4,71 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-02 - M7D: Apply selected_classes by post-inference per-object filtering
+
+### Summary
+The DeepStream worker now **applies** the operator-saved per-camera
+`selected_classes` — not by reconfiguring the detector, but by **post-inference
+filtering of the per-object output paths**. Inference still runs across all
+classes (`nvinfer`/PGIE class-id config and `nvdsanalytics` untouched); the
+allow-list drops non-matching objects before they reach the USER-FACING
+per-object surfaces. Scope is `selected_classes` ONLY; model switching,
+`processing_fps`, and tracker switching remain stamp-only, and M7C
+`confidence_threshold` apply is unchanged/unregressed.
+
+- NEW `app/processing/class_filter.py` — pure, unit-tested helper.
+  `CLASS_ID_TO_LABEL = {0:car,1:bicycle,2:person,3:roadsign}` (TrafficCamNet
+  order, fallback when an object has no label). `canonical_class(label,
+  class_id)` prefers `label.strip().lower()` else the id map else `None`.
+  `filter_objects_by_class(objects, selected_classes)` returns the input
+  UNCHANGED when the list is empty/`None`; otherwise keeps only objects whose
+  canonical class is in the normalized allow-list (unresolvable-class objects
+  excluded). Non-mutating, order-preserving, deterministic.
+- `resolve_session_processing_config` (`resolver.py`) gains
+  `selected_classes_apply_supported: bool = False`. When `True` and a non-empty
+  list is saved, it is applied (echoed into `applied.selected_classes`,
+  `applied_count += 1`) and the honest warning
+  `selected_classes_analytics_counts_not_filtered` is added — so a
+  selected-classes-applied config is always at least `partially_applied`. When
+  unsupported, the list stays `selected_classes_requested_not_applied` with
+  `applied.selected_classes == []` (prior behavior). `applied` is now
+  `replace(defaults, confidence_threshold=..., selected_classes=...)`.
+- `worker.py`: computes `selected_classes_apply_supported = self._mode in
+  (_METADATA_MODE, _TRACKER_MODE, _ANALYTICS_MODE)` (the per-object modes),
+  passes it to the resolver, and derives the per-worker filter
+  `self._selected_classes = tuple(resolved.applied.selected_classes)` (single
+  source of truth; no global state).
+
+### What IS filtered (USER-FACING per-object surfaces)
+- The perception snapshot — `_build_perception_payload` filters `frame.objects`
+  and builds the snapshot from a `frame.model_copy(update={"objects": ...})`
+  (the shared frame is never mutated in place).
+- The zone / dwell observation paths — `_emit_zone_transitions` filters the
+  objects fed to `zone_state.absorb_object(...)`; dwell follows zone. Track
+  continuity is preserved (class is stable per track).
+
+### What is NOT filtered (out of scope, disclosed in lineage)
+- nvdsanalytics AGGREGATE counts — line-crossing (`_emit_line_crossings`) and
+  ROI-occupancy (`_emit_roi_occupancies`) come from `frame.source["analytics"]`
+  (per-line / per-ROI totals across ALL classes, computed in-container). Not
+  per-class filterable post-inference; left byte-unchanged. The
+  `selected_classes_analytics_counts_not_filtered` lineage warning is the honest
+  signal.
+- RAW status debug counters (`class_counts` / `objects_seen` via
+  `counters.absorb(frame)`) — kept raw (debug = what the detector produced).
+
+### No-filter path
+When `selected_classes` is `[]` (or no config), `filter_objects_by_class`
+returns the objects unchanged — byte/behavior-identical to before M7D.
+
+### Not in scope
+No model switching, no `processing_fps` throttle, no tracker switching, no
+nvinfer/PGIE class-id config change, no nvdsanalytics class-id config change, no
+geometry/reliability change. No api-server / dashboard / DB / migration. M7C
+confidence apply unchanged.
+
+---
+
 ## 2026-06-02 - M7C: Apply confidence_threshold to the live PGIE config
 
 ### Summary

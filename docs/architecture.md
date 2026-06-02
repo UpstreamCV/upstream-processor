@@ -188,6 +188,63 @@ disagree. The value flows per-worker (per session) through the process-manager
 instance — never via global `Settings` or a module global — so there is no
 cross-camera leakage. Everything else remains stamp-only.
 
+## M7D — apply selected_classes by post-inference per-object filtering
+
+M7D applies the operator-saved per-camera `selected_classes` — but NOT by
+reconfiguring the detector. Inference still runs across all classes
+(`nvinfer`/PGIE class-id config and `nvdsanalytics` are untouched); the
+allow-list is applied by **post-inference filtering of the per-object output
+paths**. Scope is `selected_classes` ONLY; model switching, `processing_fps`,
+and tracker switching all remain stamp-only, and M7C `confidence_threshold`
+apply is unchanged.
+
+The pure helper `app/processing/class_filter.py` does the work.
+`canonical_class(label, class_id)` resolves an object's class (label,
+lower-cased + stripped, preferred; else the TrafficCamNet `CLASS_ID_TO_LABEL`
+fallback `{0:car,1:bicycle,2:person,3:roadsign}`; else `None`).
+`filter_objects_by_class(objects, selected_classes)` returns the input
+**unchanged** when the list is empty/`None` (the byte-identical "no filter"
+path), otherwise keeps only objects whose canonical class is in the normalized
+allow-list (unresolvable-class objects are excluded). It never mutates the
+objects and preserves order.
+
+Apply is gated on the same per-object modes as M7C (`_METADATA_MODE` /
+`_TRACKER_MODE` / `_ANALYTICS_MODE`): the worker computes
+`selected_classes_apply_supported` and passes it to
+`resolve_session_processing_config(...)`. When supported and a non-empty list
+is saved, the resolver echoes it into `applied.selected_classes` and adds the
+honest warning `selected_classes_analytics_counts_not_filtered`; a
+selected-classes-applied config is therefore always at least
+`partially_applied`. When unsupported (or no support), a non-empty list stays
+`selected_classes_requested_not_applied` with `applied.selected_classes == []`,
+exactly as before. The resolved **applied** list is the single per-worker
+source of truth (`self._selected_classes`); no global/module state.
+
+**What IS filtered (USER-FACING per-object surfaces):**
+
+- the **perception snapshot** — `_build_perception_payload` filters
+  `frame.objects` and builds the snapshot from a `model_copy` carrying the
+  filtered objects (the shared frame is never mutated in place);
+- the **zone / dwell** observation paths — `_emit_zone_transitions` filters the
+  objects fed to `zone_state.absorb_object(...)`; dwell follows zone
+  automatically. Track continuity is preserved because an object's class is
+  stable across its track.
+
+**What is NOT filtered (out of scope, disclosed in lineage):**
+
+- the **nvdsanalytics AGGREGATE counts** — line-crossing (`_emit_line_crossings`)
+  and ROI-occupancy (`_emit_roi_occupancies`) come from
+  `frame.source["analytics"]` (per-line / per-ROI totals across ALL classes,
+  computed in-container) and are not per-class filterable post-inference. They
+  stay byte-unchanged; the `selected_classes_analytics_counts_not_filtered`
+  warning is the honest signal.
+- the **RAW status debug counters** (`class_counts` / `objects_seen` via
+  `counters.absorb(frame)`) — kept raw on purpose (debug = what the detector
+  actually produced).
+
+When `selected_classes` is `[]` (or no config), the filter returns the objects
+unchanged and behavior is byte/behavior-identical to before M7D.
+
 ## P2 — manual pyds metadata probe (out-of-tree)
 
 A *manual* probe that proves the DeepStream metadata seam (no runtime worker

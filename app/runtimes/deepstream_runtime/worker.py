@@ -59,6 +59,7 @@ from app.observations.writer import ObservationWriter
 from app.packages.resolver import PackageSpec
 from app.perception.builder import build_perception_snapshot
 from app.perception.schemas import PerceptionSnapshotPayload
+from app.processing.class_filter import filter_objects_by_class
 from app.processing.resolver import (
     ResolvedProcessingConfig,
     resolve_session_processing_config,
@@ -430,16 +431,29 @@ class DeepStreamWorker(Runtime):
         # unconditionally (not gated on mode) so every DeepStream worker carries
         # the lineage; a bad/diverging config must NOT flag a worker error — it
         # lives only in the lineage block.
-        confidence_apply_supported = self._mode in (
+        # M7D: the same per-object modes that can render confidence into the
+        # PGIE config are the ones that produce the per-object output paths
+        # (perception snapshot + zone/dwell), so they can apply selected_classes
+        # by POST-INFERENCE filtering of those paths.
+        per_object_modes = self._mode in (
             _METADATA_MODE,
             _TRACKER_MODE,
             _ANALYTICS_MODE,
         )
+        confidence_apply_supported = per_object_modes
+        selected_classes_apply_supported = per_object_modes
         self._resolved_processing_config: ResolvedProcessingConfig = (
             resolve_session_processing_config(
                 session.processing_config,
                 confidence_apply_supported=confidence_apply_supported,
+                selected_classes_apply_supported=selected_classes_apply_supported,
             )
+        )
+        # M7D: single source of truth for the per-object class filter — the
+        # resolved APPLIED list ([] = no filter; filter_objects_by_class treats
+        # an empty list as "return unchanged"). Per-worker only; no global state.
+        self._selected_classes: tuple[str, ...] = tuple(
+            self._resolved_processing_config.applied.selected_classes
         )
         _log.info(
             "processing config resolved: camera_id=%s stream_session_id=%s source=%s "
@@ -1215,6 +1229,8 @@ class DeepStreamWorker(Runtime):
                 # sender so the worker ends quietly (old inline behavior).
                 if perception_slot["fatal"] is not None:
                     raise perception_slot["fatal"]
+                # M7D: status debug counters stay RAW (what the detector
+                # actually produced) — intentionally NOT class-filtered.
                 counters.absorb(frame)
                 if line_state is not None:
                     await self._emit_line_crossings(
@@ -1373,9 +1389,22 @@ class DeepStreamWorker(Runtime):
         it posts directly to the dedicated perception-snapshot endpoint.
         """
         observed_at = frame.frame.timestamp or now_utc()
+        # M7D: apply the per-camera selected_classes by post-inference filtering
+        # of the per-object snapshot. ``self._selected_classes`` is the resolved
+        # APPLIED list ([] -> filter returns the objects unchanged, so this is
+        # byte-identical to today when no classes are selected). Build the
+        # snapshot from a COPY carrying the filtered objects — never mutate the
+        # shared frame in place, since counters / line-crossing / ROI-occupancy
+        # consume the same frame and must stay raw/aggregate.
+        filtered_objects = filter_objects_by_class(frame.objects, self._selected_classes)
+        snapshot_frame = (
+            frame
+            if filtered_objects is frame.objects
+            else frame.model_copy(update={"objects": list(filtered_objects)})
+        )
         try:
             snapshot = build_perception_snapshot(
-                metadata=frame,
+                metadata=snapshot_frame,
                 geometry=geometry,
                 camera_id=self._session.camera_id,
                 stream_session_id=self._session.session_id,
@@ -1458,6 +1487,11 @@ class DeepStreamWorker(Runtime):
         api-server is unrecoverable in flight; the next worker spawn
         will use a fresh schema)."""
         assert self._writer is not None  # gated by the caller
+        # M7D: intentionally NOT class-filtered. These are nvdsanalytics
+        # AGGREGATE per-line cumulative counts across ALL classes, computed
+        # in-container; they are not per-class filterable post-inference (out of
+        # M7D scope — see the selected_classes_analytics_counts_not_filtered
+        # lineage warning).
         analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
         if not isinstance(analytics, dict):
             return
@@ -1540,6 +1574,11 @@ class DeepStreamWorker(Runtime):
         ``idempotency_key`` on every event makes a future server-side
         UNIQUE constraint safe to add."""
         assert self._writer is not None  # gated by the caller
+        # M7D: intentionally NOT class-filtered. These are nvdsanalytics
+        # AGGREGATE per-ROI occupancy counts across ALL classes, computed
+        # in-container; they are not per-class filterable post-inference (out of
+        # M7D scope — see the selected_classes_analytics_counts_not_filtered
+        # lineage warning).
         analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
         if not isinstance(analytics, dict):
             return
@@ -1632,7 +1671,12 @@ class DeepStreamWorker(Runtime):
             return
         zone_set: set[str] = {str(k) for k in roi_counts}
         occurred_at = frame.frame.timestamp or now_utc()
-        for obj in frame.objects:
+        # M7D: apply the per-camera selected_classes to this PER-OBJECT path
+        # (dwell follows zone automatically). [] -> filter returns frame.objects
+        # unchanged (byte-identical to today). Track continuity is preserved
+        # because an object's class is stable across its track lifetime.
+        objects = filter_objects_by_class(frame.objects, self._selected_classes)
+        for obj in objects:
             if obj.tracker_id is None:
                 continue
             obj_analytics = obj.debug.get("analytics") if isinstance(obj.debug, dict) else None

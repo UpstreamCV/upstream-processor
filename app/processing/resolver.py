@@ -21,10 +21,24 @@ defaults and emits ``confidence_threshold_requested_not_applied``. Because
 both ``partially_applied`` (some applied, some not) and ``applied`` (request
 matches/applies cleanly) can now occur, both statuses are emitted here.
 
-Everything ELSE remains STAMP ONLY: ``model_key`` / ``selected_classes`` /
-``processing_fps`` / ``tracker`` are never applied — any meaningful request
-for them is recorded as a ``*_requested_not_applied`` warning and ``applied``
-keeps the worker's current runtime defaults.
+M7D: ``selected_classes`` is now genuinely applied — but ONLY when the caller
+passes ``selected_classes_apply_supported=True`` (the same per-object modes).
+It is applied by POST-INFERENCE filtering of the PER-OBJECT output paths (the
+perception snapshot + the zone/dwell observation paths); the detector still
+runs across all classes. When applied, the operator list is echoed into
+``applied.selected_classes`` and the honest warning
+``selected_classes_analytics_counts_not_filtered`` is added — because the
+nvdsanalytics AGGREGATE counts (line-crossing / ROI-occupancy) remain across
+ALL classes and are intentionally NOT class-filtered (out of M7D scope). That
+warning means a selected-classes-applied config is always at LEAST
+``partially_applied``. When the mode cannot apply it (or no support), the list
+stays at the defaults (``[]``) and emits ``selected_classes_requested_not_applied``
+exactly as before.
+
+Everything ELSE remains STAMP ONLY: ``model_key`` / ``processing_fps`` /
+``tracker`` are never applied — any meaningful request for them is recorded as
+a ``*_requested_not_applied`` warning and ``applied`` keeps the worker's
+current runtime defaults.
 
 Unlike the geometry resolver, a bad/diverging processing config does NOT flag
 a worker ``error_code``: it lives only in this lineage block (the caller wires
@@ -144,6 +158,7 @@ def resolve_session_processing_config(
     *,
     defaults: AppliedProcessingConfig = DEFAULT_APPLIED,
     confidence_apply_supported: bool = False,
+    selected_classes_apply_supported: bool = False,
 ) -> ResolvedProcessingConfig:
     """Resolve the wire envelope into a ``ResolvedProcessingConfig``.
 
@@ -154,6 +169,17 @@ def resolve_session_processing_config(
     threshold is requested, it is applied (echoed into ``applied`` with no
     warning); otherwise it is recorded as
     ``confidence_threshold_requested_not_applied``.
+
+    ``selected_classes_apply_supported`` (default ``False``, which preserves
+    the M7B/M7C behavior for callers/tests that don't pass it) tells the
+    resolver the running mode can apply the operator ``selected_classes`` by
+    POST-INFERENCE filtering of the per-object output paths. When ``True`` and
+    a non-empty list is requested, it is applied (echoed into
+    ``applied.selected_classes``) and the honest
+    ``selected_classes_analytics_counts_not_filtered`` warning is added
+    (aggregate line/ROI counts stay across all classes — out of scope);
+    otherwise a non-empty request is recorded as
+    ``selected_classes_requested_not_applied``.
 
     See module docstring. NEVER raises.
     """
@@ -203,12 +229,11 @@ def resolve_session_processing_config(
     )
 
     # Per-field divergence vs what the runtime actually applies (defaults).
-    # Everything except confidence_threshold is still stamp-only: a meaningful
-    # request is recorded as "*_requested_not_applied" and never applied.
+    # Everything except confidence_threshold (M7C) and selected_classes (M7D)
+    # is still stamp-only: a meaningful request is recorded as
+    # "*_requested_not_applied" and never applied.
     warnings: list[str] = []
     applied_count = 0
-    if config.selected_classes and config.selected_classes != []:
-        warnings.append("selected_classes_requested_not_applied")
     if config.processing_fps is not None:
         warnings.append("processing_fps_requested_not_applied")
     if config.model_key != defaults.model_key:
@@ -227,7 +252,25 @@ def resolve_session_processing_config(
         else:
             warnings.append("confidence_threshold_requested_not_applied")
 
-    applied = replace(defaults, confidence_threshold=applied_confidence)
+    # M7D: selected_classes is genuinely applied (post-inference per-object
+    # filtering) when the mode supports it. An applied list ALWAYS also adds the
+    # honest analytics-counts warning, because the nvdsanalytics aggregate
+    # line/ROI counts remain across all classes (out of M7D scope) — so a
+    # selected-classes-applied config is always at least partially_applied.
+    applied_selected = list(defaults.selected_classes)
+    if config.selected_classes:
+        if selected_classes_apply_supported:
+            applied_selected = list(config.selected_classes)
+            applied_count += 1
+            warnings.append("selected_classes_analytics_counts_not_filtered")
+        else:
+            warnings.append("selected_classes_requested_not_applied")
+
+    applied = replace(
+        defaults,
+        confidence_threshold=applied_confidence,
+        selected_classes=applied_selected,
+    )
 
     if warnings and applied_count > 0:
         status = "partially_applied"
