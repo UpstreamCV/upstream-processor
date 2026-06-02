@@ -155,6 +155,10 @@ class DeepStreamMetadataProcessManager:
         # probe-default. ``analytics_roi_margin_pct`` is ignored in this case.
         analytics_geometry: AnalyticsGeometry | None = None,
         gpus: str = "all",
+        # M7C: the resolved per-camera operator confidence threshold. None
+        # (the default, so existing callers/tests are unaffected) keeps the
+        # built-in pre-cluster-threshold defaults; a float overrides them.
+        confidence_threshold: float | None = None,
     ) -> None:
         if analytics_enabled and not tracker_enabled:
             raise ValueError(
@@ -184,6 +188,7 @@ class DeepStreamMetadataProcessManager:
         self._analytics_class_ids = analytics_class_ids
         self._analytics_geometry = analytics_geometry
         self._gpus = gpus
+        self._confidence_threshold = confidence_threshold
         # Container name prefix encodes the mode for easy `docker ps`
         # grouping: -dsm (metadata), -dst (tracker), -dsa (analytics).
         if analytics_enabled:
@@ -231,7 +236,11 @@ class DeepStreamMetadataProcessManager:
         pgie_path = work / "pgie.txt"
         engine_path = work / "trafficcamnet_b1_gpu0_int8.engine"
         pgie_path.write_text(
-            build_pgie_config(model_dir=model_dir, engine_path=str(engine_path)),
+            build_pgie_config(
+                model_dir=model_dir,
+                engine_path=str(engine_path),
+                confidence_threshold=self._confidence_threshold,
+            ),
             encoding="utf-8",
         )
         if self._tracker_enabled:

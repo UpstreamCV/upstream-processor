@@ -201,6 +201,66 @@ def test_resolve_model_dir_rejects_unknown() -> None:
         resolve_model_dir("yolo-custom")
 
 
+# --- M7C: confidence_threshold → pre-cluster-threshold --------------------
+
+
+def test_pgie_default_confidence_is_byte_identical_to_pre_m7c() -> None:
+    """confidence_threshold=None (the default, the only way decode/inference/
+    inference_probe invoke build_pgie_config) must keep the pre-M7C output:
+    class-attrs-all at 0.2, class-attrs-0 at 0.4, and no other PGIE field
+    changed. This pins byte-equivalence so the M7C plumbing is a pure no-op
+    when no operator override is present."""
+    # Explicit None and the implicit default must produce identical bytes.
+    pgie_default = build_pgie_config(model_dir="/m/Primary_Detector", engine_path="/tmp/e.engine")
+    pgie_none = build_pgie_config(
+        model_dir="/m/Primary_Detector", engine_path="/tmp/e.engine", confidence_threshold=None
+    )
+    assert pgie_default == pgie_none
+
+    assert "pre-cluster-threshold=0.2\n" in pgie_default  # class-attrs-all
+    assert "pre-cluster-threshold=0.4\n" in pgie_default  # class-attrs-0
+    # The two pre-cluster lines remain DIFFERENT in the None branch.
+    assert pgie_default.count("pre-cluster-threshold=") == 2
+    # Fixed PGIE fields untouched.
+    assert "topk=20" in pgie_default
+    assert "nms-iou-threshold=0.5" in pgie_default
+    assert "num-detected-classes=4" in pgie_default
+    assert "interval=0" in pgie_default
+    assert "network-mode=1" in pgie_default
+    assert "cluster-mode=2" in pgie_default
+
+
+def test_pgie_confidence_override_sets_both_pre_cluster_lines() -> None:
+    """A float confidence (the resolved operator value) overrides BOTH
+    pre-cluster-threshold entries to the same value; class-0 is no longer
+    left at a different threshold. Every other PGIE property is byte-stable
+    vs the default build."""
+    base = build_pgie_config(model_dir="/m/Primary_Detector", engine_path="/tmp/e.engine")
+    pgie = build_pgie_config(
+        model_dir="/m/Primary_Detector",
+        engine_path="/tmp/e.engine",
+        confidence_threshold=0.55,
+    )
+    # Both pre-cluster lines now read 0.55.
+    assert pgie.count("pre-cluster-threshold=0.55\n") == 2
+    # The old per-class defaults no longer appear as pre-cluster lines.
+    assert "pre-cluster-threshold=0.2\n" not in pgie
+    assert "pre-cluster-threshold=0.4\n" not in pgie
+    # Everything except the two pre-cluster lines is unchanged from the default
+    # build — diffing line-by-line proves no other field shifted.
+    changed = [
+        line for line in base.splitlines() if line not in pgie.splitlines()
+    ]
+    assert changed == ["pre-cluster-threshold=0.2", "pre-cluster-threshold=0.4"]
+    # Spot-check the fixed knobs the manifest forbids changing.
+    assert "topk=20" in pgie
+    assert "nms-iou-threshold=0.5" in pgie
+    assert "num-detected-classes=4" in pgie
+    assert "interval=0" in pgie
+    assert "onnx-file=/m/Primary_Detector/resnet18_trafficcamnet_pruned.onnx" in pgie
+    assert "model-engine-file=/tmp/e.engine" in pgie
+
+
 # --- inference lifecycle --------------------------------------------------
 
 

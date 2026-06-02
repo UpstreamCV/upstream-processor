@@ -156,6 +156,38 @@ The only observable changes are the new envelope field and the additive
 status-payload key; runtime behavior (pgie/tracker/nvinfer/nvdsanalytics) is
 untouched.
 
+## M7C — apply confidence_threshold to the live PGIE config
+
+M7C is the first milestone that **applies** a piece of the processing config:
+the operator-saved per-camera `confidence_threshold`. Scope is
+`confidence_threshold` ONLY — model switching, `selected_classes` / class
+filtering, `processing_fps` throttle, and dynamic tracker switching all remain
+stamp-only.
+
+It is applied **only in the DeepStream metadata / tracker / analytics modes** —
+the modes that build a `DeepStreamMetadataProcessManager` and render a PGIE
+config. The worker computes `confidence_apply_supported` from `self._mode`
+against `_METADATA_MODE` / `_TRACKER_MODE` / `_ANALYTICS_MODE` and passes it to
+`resolve_session_processing_config(...)`. When supported and a threshold is
+saved, the resolver echoes it into `applied.confidence_threshold` (no warning)
+and the status becomes `applied` (request applies cleanly) or
+`partially_applied` (applied alongside other still-stamped divergences). When
+the mode can't apply it (inference/decode modes), it stays
+`confidence_threshold_requested_not_applied` exactly as in M7B. The
+inference/decode/probe modes are unchanged.
+
+The resolved **applied** value is the single source of truth: the worker
+forwards `resolved.applied.confidence_threshold` into the
+`DeepStreamMetadataProcessManager` (per-session instance, never a global), which
+passes it to `build_pgie_config(confidence_threshold=...)`. A float overrides
+BOTH `pre-cluster-threshold` entries (`[class-attrs-all]` and `[class-attrs-0]`)
+so filtering is uniform across classes; `None` leaves the config byte-identical
+to the previous hard-coded 0.2 / 0.4 defaults. Because the same resolved value
+feeds both the stamped lineage and the live PGIE config, they can never
+disagree. The value flows per-worker (per session) through the process-manager
+instance — never via global `Settings` or a module global — so there is no
+cross-camera leakage. Everything else remains stamp-only.
+
 ## P2 — manual pyds metadata probe (out-of-tree)
 
 A *manual* probe that proves the DeepStream metadata seam (no runtime worker
