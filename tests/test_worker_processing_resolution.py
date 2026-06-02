@@ -125,17 +125,17 @@ def test_null_processing_config_resolves_to_default(fast_settings) -> None:  # t
 
 
 def test_diverging_config_resolves_to_requested_not_applied(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    # M7C: confidence_threshold is now genuinely applied in analytics mode, so
-    # this stamp-only divergence case uses only the fields that remain
-    # stamp-only (selected_classes / processing_fps). The
-    # confidence-applied/partially_applied paths are covered explicitly below.
-    env = _envelope(revision=7, selected_classes=["person"], processing_fps=5)
+    # M7C applies confidence and M7D applies selected_classes in analytics
+    # mode, so this stamp-only divergence case uses ONLY a field that remains
+    # stamp-only in every milestone (processing_fps). The
+    # confidence/selected-classes applied paths are covered explicitly below.
+    env = _envelope(revision=7, processing_fps=5)
     w = _analytics_worker(_session(env), fast_settings)
     rc = w._resolved_processing_config
     assert rc.source == "operator_saved"
     assert rc.status == "requested_not_applied"
     assert rc.revision == 7
-    # Nothing applied (none of the requested fields is applicable in M7C).
+    # Nothing applied (processing_fps remains stamp-only in all milestones).
     assert rc.applied == DEFAULT_APPLIED
 
 
@@ -154,21 +154,47 @@ def test_malformed_config_resolves_to_fallback_without_raising(fast_settings) ->
 
 
 def test_status_payload_carries_applied_processing_config(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    env = _envelope(revision=11, selected_classes=["person"], processing_fps=5)
+    # Use only stamp-only divergences (model switch + fps) so applied stays the
+    # runtime defaults. (M7D applies selected_classes on an analytics worker —
+    # see test_status_payload_carries_applied_selected_classes for that path.)
+    env = _envelope(
+        revision=11,
+        model_key="some_future_model_v9",
+        processing_fps=5,
+    )
     w = _analytics_worker(_session(env), fast_settings)
     status = w._build("attached")
     block = status.payload["applied_processing_config"]
     assert block["source"] == "operator_saved"
     assert block["revision"] == 11
     assert block["status"] == "requested_not_applied"
-    assert block["requested"]["selected_classes"] == ["person"]
-    # applied is ALWAYS the runtime defaults — never an echo of requested.
+    # applied stays the runtime defaults — these fields are never applied.
     assert block["applied"] == _DEFAULT_APPLIED_DICT
-    assert "selected_classes_requested_not_applied" in block["warnings"]
-    # STAMP ONLY: a diverging config must NOT flag a worker error_code.
+    assert "model_switch_requested_not_applied" in block["warnings"]
+    assert "processing_fps_requested_not_applied" in block["warnings"]
+    # A diverging config must NOT flag a worker error_code.
     assert status.error_code is None
-    # partially_applied is never emitted in M7B.
-    assert block["status"] != "partially_applied"
+
+
+def test_status_payload_carries_applied_selected_classes(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """M7D: on an analytics worker a saved non-empty selected_classes is
+    genuinely applied (post-inference per-object filtering), so the status
+    payload echoes the operator list into applied.selected_classes, flips
+    status to partially_applied, and carries the honest analytics-counts
+    warning rather than ``selected_classes_requested_not_applied``."""
+    env = _envelope(revision=12, selected_classes=["person", "car"])
+    w = _analytics_worker(_session(env), fast_settings)
+    status = w._build("attached")
+    block = status.payload["applied_processing_config"]
+    assert block["source"] == "operator_saved"
+    assert block["status"] == "partially_applied"
+    assert block["requested"]["selected_classes"] == ["person", "car"]
+    assert block["applied"]["selected_classes"] == ["person", "car"]
+    assert "selected_classes_analytics_counts_not_filtered" in block["warnings"]
+    assert "selected_classes_requested_not_applied" not in block["warnings"]
+    assert status.error_code is None
+    # The per-worker filter tuple is derived from the resolved APPLIED list.
+    assert w._selected_classes == ("person", "car")
 
 
 def test_status_payload_carries_default_processing_config(fast_settings) -> None:  # type: ignore[no-untyped-def]
@@ -232,17 +258,50 @@ def test_caller_payload_merges_with_applied_processing_config(fast_settings) -> 
 
 def test_analytics_worker_applies_confidence_in_resolution(fast_settings) -> None:  # type: ignore[no-untyped-def]
     """An analytics worker computes confidence_apply_supported=True, so a
-    saved confidence is genuinely applied: resolved status flips to
-    partially_applied (other requested fields still warn) and
+    saved confidence is genuinely applied. With a stamp-only field also
+    diverging (processing_fps) the resolved status is partially_applied and
     applied.confidence_threshold echoes the operator value."""
-    env = _envelope(revision=8, confidence_threshold=0.55, selected_classes=["person"])
+    env = _envelope(revision=8, confidence_threshold=0.55, processing_fps=5)
     w = _analytics_worker(_session(env), fast_settings)
     rc = w._resolved_processing_config
     assert rc.source == "operator_saved"
     assert rc.status == "partially_applied"
     assert rc.applied.confidence_threshold == 0.55
     assert "confidence_threshold_requested_not_applied" not in rc.warnings
+    assert "processing_fps_requested_not_applied" in rc.warnings
+
+
+def test_analytics_worker_applies_selected_classes_in_resolution(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """M7D: an analytics worker computes selected_classes_apply_supported=True,
+    so a saved non-empty list is genuinely applied (post-inference per-object
+    filtering): applied.selected_classes echoes the list, the per-worker
+    ``_selected_classes`` filter tuple is derived from it, and status is
+    partially_applied (the honest analytics-counts warning always rides along).
+    M7C confidence apply is unregressed when both are present."""
+    env = _envelope(revision=9, confidence_threshold=0.4, selected_classes=["person"])
+    w = _analytics_worker(_session(env), fast_settings)
+    rc = w._resolved_processing_config
+    assert rc.status == "partially_applied"
+    assert rc.applied.selected_classes == ["person"]
+    assert rc.applied.confidence_threshold == 0.4
+    assert "selected_classes_requested_not_applied" not in rc.warnings
+    assert "selected_classes_analytics_counts_not_filtered" in rc.warnings
+    assert w._selected_classes == ("person",)
+
+
+def test_decode_worker_does_not_apply_selected_classes(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Decode mode produces no per-object output paths, so
+    selected_classes_apply_supported is False: a saved list is recorded as
+    requested_not_applied, applied stays [], and the per-worker filter tuple is
+    empty (byte-identical to today)."""
+    env = _envelope(revision=5, selected_classes=["person"])
+    w = _worker(_session(env), fast_settings, "deepstream.decode_probe.v0")
+    rc = w._resolved_processing_config
+    assert rc.status == "requested_not_applied"
+    assert rc.applied.selected_classes == []
     assert "selected_classes_requested_not_applied" in rc.warnings
+    assert "selected_classes_analytics_counts_not_filtered" not in rc.warnings
+    assert w._selected_classes == ()
 
 
 def test_metadata_worker_applies_confidence_clean_status_applied(fast_settings) -> None:  # type: ignore[no-untyped-def]
