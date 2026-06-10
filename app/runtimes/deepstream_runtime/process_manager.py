@@ -159,9 +159,7 @@ class DeepStreamProcessManager:
                 # docker-run client stalls on container/GPU cleanup. Same
                 # rationale as metadata_probe.stop().
                 try:
-                    await asyncio.wait_for(
-                        self._proc.wait(), timeout=self._stop_timeout
-                    )
+                    await asyncio.wait_for(self._proc.wait(), timeout=self._stop_timeout)
                 except TimeoutError:
                     _log.warning(
                         "decode subprocess did not reap after kill; "

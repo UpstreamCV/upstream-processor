@@ -4,6 +4,36 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-09 - M7E: Apply per-camera processing_fps as the perception-snapshot output cadence
+
+**What:** The saved per-camera `processing_fps` is now genuinely applied in the
+analytics mode (perception snapshots enabled): the worker derives its
+perception-snapshot emit interval from the operator value (`1/fps`), replacing
+the global `perception_snapshot_interval_seconds` for that session only. The
+resolver gains `processing_fps_apply_supported`; when an fps is applied it is
+echoed into `applied.processing_fps` with the honest always-on caveat
+`processing_fps_output_cadence_only`, and `processing_fps_requested_not_applied`
+is reserved for modes that cannot apply it (non-analytics modes, perception
+snapshots disabled) — exactly the M7C/M7D support-flag pattern.
+
+**What it is NOT:** This is an OUTPUT-CADENCE throttle, not inference FPS. The
+DeepStream pipeline / nvinfer interval / GStreamer config are untouched —
+frames keep decoding and inferring at the source rate, so this does NOT reduce
+GPU cost. The event-driven observation emits (line/zone/dwell) are NOT
+throttled — suppressing discrete events would drop real data, which is why the
+caveat code says output-cadence-only. The effective per-session interval is
+surfaced in the status payload's `perception_snapshot_interval_seconds`.
+
+**Files:** `app/processing/resolver.py` (new support kwarg + applied echo +
+caveat), `app/runtimes/deepstream_runtime/worker.py` (support gate, per-worker
+`_perception_interval_seconds`, loop gate + status payload use it).
+Tests: resolver (6 new), worker resolution (6 new), perception emit (6 new
+incl. throttle-vs-observations and M7C/M7D composition). 618 passed; ruff +
+mypy clean. No model switching, no tracker apply, no nvdsanalytics change, no
+class-filtered line/ROI counts.
+
+---
+
 ## 2026-06-02 - M7D fix: canonicalize class labels so registry "roadsign" matches model "road_sign"
 
 ### Summary

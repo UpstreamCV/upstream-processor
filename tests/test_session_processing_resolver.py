@@ -584,3 +584,95 @@ def test_status_payload_echoes_applied_selected_classes_when_supported() -> None
     assert payload["applied"]["selected_classes"] == ["person", "car"]
     assert payload["status"] == "partially_applied"
     assert "selected_classes_analytics_counts_not_filtered" in payload["warnings"]
+
+
+# --- M7E: processing_fps applied (output-cadence only) ------------------
+
+
+def test_processing_fps_applied_when_supported_is_partially_applied() -> None:
+    """M7E: with processing_fps_apply_supported=True a requested fps is
+    genuinely applied (echoed into applied.processing_fps) — and ALWAYS rides
+    with the honest output-cadence caveat (inference and event-driven
+    observations are not throttled), so an fps-applied config is at least
+    partially_applied, never plain applied."""
+    r = resolve_session_processing_config(
+        _envelope(processing_fps=5),
+        processing_fps_apply_supported=True,
+    )
+    assert r.status == "partially_applied"
+    assert r.applied.processing_fps == 5
+    assert r.requested.processing_fps == 5
+    assert "processing_fps_output_cadence_only" in r.warnings
+    assert "processing_fps_requested_not_applied" not in r.warnings
+
+
+def test_processing_fps_not_applied_when_unsupported_preserves_prior() -> None:
+    """Without support (default kwarg, the pre-M7E posture) a requested fps
+    stays stamp-only exactly as before."""
+    r = resolve_session_processing_config(_envelope(processing_fps=5))
+    assert r.status == "requested_not_applied"
+    assert r.applied.processing_fps is None
+    assert "processing_fps_requested_not_applied" in r.warnings
+    assert "processing_fps_output_cadence_only" not in r.warnings
+
+
+def test_null_processing_fps_is_applied_defaults_even_when_supported() -> None:
+    """fps=null means "runtime default" — nothing applied, no warnings, no
+    behavior change."""
+    r = resolve_session_processing_config(
+        _envelope(processing_fps=None),
+        processing_fps_apply_supported=True,
+    )
+    assert r.status == "applied_defaults"
+    assert r.applied.processing_fps is None
+    assert r.warnings == ()
+
+
+def test_out_of_range_processing_fps_falls_back_even_when_apply_supported() -> None:
+    """The envelope schema bounds fps to 1..30 — an out-of-range value fails
+    parsing and degrades to fallback defaults (never a crash, never a bogus
+    cadence), even when the mode could apply a valid fps."""
+    for bad in (0, -3, 31):
+        r = resolve_session_processing_config(
+            _envelope(processing_fps=bad),
+            processing_fps_apply_supported=True,
+        )
+        assert r.source == "fallback_default_on_error"
+        assert r.applied == DEFAULT_APPLIED
+        assert r.applied.processing_fps is None
+
+
+def test_fps_confidence_and_classes_all_applied_accumulates() -> None:
+    """M7C + M7D + M7E together: all three applied fields echo into applied,
+    each caveat/no-warning rule holds, and status is partially_applied (the
+    selected-classes + fps caveats keep it from plain applied)."""
+    r = resolve_session_processing_config(
+        _envelope(
+            selected_classes=["person"],
+            confidence_threshold=0.2,
+            processing_fps=5,
+        ),
+        confidence_apply_supported=True,
+        selected_classes_apply_supported=True,
+        processing_fps_apply_supported=True,
+    )
+    assert r.status == "partially_applied"
+    assert r.applied.confidence_threshold == 0.2
+    assert r.applied.selected_classes == ["person"]
+    assert r.applied.processing_fps == 5
+    assert "confidence_threshold_requested_not_applied" not in r.warnings
+    assert "selected_classes_requested_not_applied" not in r.warnings
+    assert "processing_fps_requested_not_applied" not in r.warnings
+    assert "selected_classes_analytics_counts_not_filtered" in r.warnings
+    assert "processing_fps_output_cadence_only" in r.warnings
+
+
+def test_status_payload_echoes_applied_processing_fps_when_supported() -> None:
+    payload = resolve_session_processing_config(
+        _envelope(processing_fps=10),
+        processing_fps_apply_supported=True,
+    ).status_payload()
+    assert payload["requested"]["processing_fps"] == 10
+    assert payload["applied"]["processing_fps"] == 10
+    assert payload["status"] == "partially_applied"
+    assert "processing_fps_output_cadence_only" in payload["warnings"]
