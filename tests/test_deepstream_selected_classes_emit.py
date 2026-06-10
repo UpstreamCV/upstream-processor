@@ -131,9 +131,7 @@ def _analytics_worker(
     *,
     selected_classes: list[str] | None = None,
 ) -> DeepStreamWorker:
-    processing_config = (
-        None if selected_classes is None else _processing_config(selected_classes)
-    )
+    processing_config = None if selected_classes is None else _processing_config(selected_classes)
     return DeepStreamWorker(
         session=_session(processing_config=processing_config),
         settings=settings,
@@ -146,9 +144,7 @@ def _analytics_worker(
 
 def _zone_obs(api: FakeApi, *, of_type: str | None = None) -> list[ObservationPayload]:
     types = (
-        (of_type,)
-        if of_type is not None
-        else ("processor.zone_entered", "processor.zone_exited")
+        (of_type,) if of_type is not None else ("processor.zone_entered", "processor.zone_exited")
     )
     return [o for o in api.observations if o.type in types]
 

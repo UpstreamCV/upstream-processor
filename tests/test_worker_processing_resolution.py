@@ -125,17 +125,17 @@ def test_null_processing_config_resolves_to_default(fast_settings) -> None:  # t
 
 
 def test_diverging_config_resolves_to_requested_not_applied(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    # M7C applies confidence and M7D applies selected_classes in analytics
-    # mode, so this stamp-only divergence case uses ONLY a field that remains
-    # stamp-only in every milestone (processing_fps). The
-    # confidence/selected-classes applied paths are covered explicitly below.
-    env = _envelope(revision=7, processing_fps=5)
+    # M7C applies confidence, M7D applies selected_classes, and M7E applies
+    # processing_fps in analytics mode, so this stamp-only divergence case uses
+    # ONLY a field that remains stamp-only in every milestone (tracker). The
+    # confidence/selected-classes/fps applied paths are covered explicitly below.
+    env = _envelope(revision=7, tracker="deepsort")
     w = _analytics_worker(_session(env), fast_settings)
     rc = w._resolved_processing_config
     assert rc.source == "operator_saved"
     assert rc.status == "requested_not_applied"
     assert rc.revision == 7
-    # Nothing applied (processing_fps remains stamp-only in all milestones).
+    # Nothing applied (tracker remains stamp-only in all milestones).
     assert rc.applied == DEFAULT_APPLIED
 
 
@@ -154,13 +154,13 @@ def test_malformed_config_resolves_to_fallback_without_raising(fast_settings) ->
 
 
 def test_status_payload_carries_applied_processing_config(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    # Use only stamp-only divergences (model switch + fps) so applied stays the
-    # runtime defaults. (M7D applies selected_classes on an analytics worker —
-    # see test_status_payload_carries_applied_selected_classes for that path.)
+    # Use only stamp-only divergences (model switch + tracker) so applied stays
+    # the runtime defaults. (M7D applies selected_classes and M7E applies
+    # processing_fps on an analytics worker — see the dedicated tests below.)
     env = _envelope(
         revision=11,
         model_key="some_future_model_v9",
-        processing_fps=5,
+        tracker="deepsort",
     )
     w = _analytics_worker(_session(env), fast_settings)
     status = w._build("attached")
@@ -171,7 +171,7 @@ def test_status_payload_carries_applied_processing_config(fast_settings) -> None
     # applied stays the runtime defaults — these fields are never applied.
     assert block["applied"] == _DEFAULT_APPLIED_DICT
     assert "model_switch_requested_not_applied" in block["warnings"]
-    assert "processing_fps_requested_not_applied" in block["warnings"]
+    assert "tracker_requested_not_applied" in block["warnings"]
     # A diverging config must NOT flag a worker error_code.
     assert status.error_code is None
 
@@ -259,16 +259,16 @@ def test_caller_payload_merges_with_applied_processing_config(fast_settings) -> 
 def test_analytics_worker_applies_confidence_in_resolution(fast_settings) -> None:  # type: ignore[no-untyped-def]
     """An analytics worker computes confidence_apply_supported=True, so a
     saved confidence is genuinely applied. With a stamp-only field also
-    diverging (processing_fps) the resolved status is partially_applied and
+    diverging (tracker) the resolved status is partially_applied and
     applied.confidence_threshold echoes the operator value."""
-    env = _envelope(revision=8, confidence_threshold=0.55, processing_fps=5)
+    env = _envelope(revision=8, confidence_threshold=0.55, tracker="deepsort")
     w = _analytics_worker(_session(env), fast_settings)
     rc = w._resolved_processing_config
     assert rc.source == "operator_saved"
     assert rc.status == "partially_applied"
     assert rc.applied.confidence_threshold == 0.55
     assert "confidence_threshold_requested_not_applied" not in rc.warnings
-    assert "processing_fps_requested_not_applied" in rc.warnings
+    assert "tracker_requested_not_applied" in rc.warnings
 
 
 def test_analytics_worker_applies_selected_classes_in_resolution(fast_settings) -> None:  # type: ignore[no-untyped-def]
@@ -361,3 +361,96 @@ def test_default_pm_factory_forwards_none_when_mode_cannot_apply(fast_settings) 
     pm = w._default_pm_factory()
     assert isinstance(pm, DeepStreamMetadataProcessManager)
     assert pm._confidence_threshold == 0.4
+
+
+# ===========================================================================
+# M7E — processing_fps flows into the perception-snapshot cadence
+# ===========================================================================
+
+
+def test_analytics_worker_applies_processing_fps_in_resolution(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """M7E: an analytics worker (perception snapshots enabled) computes
+    processing_fps_apply_supported=True, so a saved fps is genuinely applied:
+    applied.processing_fps echoes the request, the honest output-cadence
+    caveat rides along, and the per-worker perception interval becomes 1/fps."""
+    env = _envelope(revision=13, processing_fps=5)
+    w = _analytics_worker(_session(env), fast_settings)
+    rc = w._resolved_processing_config
+    assert rc.status == "partially_applied"
+    assert rc.applied.processing_fps == 5
+    assert "processing_fps_output_cadence_only" in rc.warnings
+    assert "processing_fps_requested_not_applied" not in rc.warnings
+    assert w._perception_interval_seconds == 0.2
+
+
+def test_analytics_worker_null_fps_keeps_global_interval(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """No fps requested → byte-equivalent pre-M7E behavior: the cadence is the
+    global perception_snapshot_interval_seconds and applied stays null."""
+    w = _analytics_worker(_session(_envelope(processing_fps=None)), fast_settings)
+    assert w._resolved_processing_config.applied.processing_fps is None
+    assert w._perception_interval_seconds == float(
+        fast_settings.perception_snapshot_interval_seconds
+    )
+
+
+def test_metadata_worker_does_not_apply_processing_fps(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Non-analytics modes have no perception-snapshot cadence, so fps stays
+    stamp-only there (requested_not_applied) and the interval falls back to
+    the global setting."""
+    env = _envelope(processing_fps=5)
+    w = _worker(_session(env), fast_settings, "deepstream.metadata_probe.v0")
+    rc = w._resolved_processing_config
+    assert rc.applied.processing_fps is None
+    assert "processing_fps_requested_not_applied" in rc.warnings
+    assert "processing_fps_output_cadence_only" not in rc.warnings
+    assert w._perception_interval_seconds == float(
+        fast_settings.perception_snapshot_interval_seconds
+    )
+
+
+def test_perception_disabled_does_not_apply_processing_fps(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Analytics mode with perception snapshots disabled has no cadence seam
+    either — fps stays stamp-only and behavior is unchanged."""
+    settings = fast_settings.model_copy(update={"perception_snapshot_enabled": False})
+    env = _envelope(processing_fps=5)
+    w = _analytics_worker(_session(env), settings)
+    rc = w._resolved_processing_config
+    assert rc.applied.processing_fps is None
+    assert "processing_fps_requested_not_applied" in rc.warnings
+
+
+def test_fps_interval_is_per_worker_no_cross_camera_leakage(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Two workers with different fps configs each derive their own interval;
+    the shared Settings object is never mutated."""
+    before = float(fast_settings.perception_snapshot_interval_seconds)
+    w5 = _analytics_worker(_session(_envelope(processing_fps=5)), fast_settings)
+    w1 = _analytics_worker(_session(_envelope(processing_fps=1)), fast_settings)
+    w_none = _analytics_worker(_session(None), fast_settings)
+    assert w5._perception_interval_seconds == 0.2
+    assert w1._perception_interval_seconds == 1.0
+    assert w_none._perception_interval_seconds == before
+    assert float(fast_settings.perception_snapshot_interval_seconds) == before
+
+
+def test_status_payload_carries_applied_processing_fps(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """The M7B->M8 stamping path carries the new fps lineage unchanged: the
+    status payload block echoes applied.processing_fps with the caveat, and a
+    config combining all three applied fields accumulates honestly."""
+    env = _envelope(
+        revision=14,
+        selected_classes=["person"],
+        confidence_threshold=0.2,
+        processing_fps=5,
+    )
+    w = _analytics_worker(_session(env), fast_settings)
+    status = w._build("attached")
+    block = status.payload["applied_processing_config"]
+    assert block["status"] == "partially_applied"
+    assert block["requested"]["processing_fps"] == 5
+    assert block["applied"]["processing_fps"] == 5
+    assert block["applied"]["confidence_threshold"] == 0.2
+    assert block["applied"]["selected_classes"] == ["person"]
+    assert "processing_fps_output_cadence_only" in block["warnings"]
+    assert "selected_classes_analytics_counts_not_filtered" in block["warnings"]
+    assert "processing_fps_requested_not_applied" not in block["warnings"]
+    assert status.error_code is None

@@ -248,9 +248,7 @@ def test_pgie_confidence_override_sets_both_pre_cluster_lines() -> None:
     assert "pre-cluster-threshold=0.4\n" not in pgie
     # Everything except the two pre-cluster lines is unchanged from the default
     # build — diffing line-by-line proves no other field shifted.
-    changed = [
-        line for line in base.splitlines() if line not in pgie.splitlines()
-    ]
+    changed = [line for line in base.splitlines() if line not in pgie.splitlines()]
     assert changed == ["pre-cluster-threshold=0.2", "pre-cluster-threshold=0.4"]
     # Spot-check the fixed knobs the manifest forbids changing.
     assert "topk=20" in pgie

@@ -420,8 +420,8 @@ class DeepStreamWorker(Runtime):
             )
         # M7B/M7C: resolve the operator-saved processing config once. Done
         # defensively right next to the geometry resolve — the resolver never
-        # raises. model/tracker/selected_classes/fps stay at the worker's
-        # current defaults (stamp-only). M7C: confidence_threshold is genuinely
+        # raises. model/tracker stay at the worker's current defaults
+        # (stamp-only). M7C: confidence_threshold is genuinely
         # applied, but ONLY in the modes that actually render it into a PGIE
         # config — the metadata/tracker/analytics modes that construct a
         # DeepStreamMetadataProcessManager in ``_default_pm_factory``. The
@@ -442,11 +442,25 @@ class DeepStreamWorker(Runtime):
         )
         confidence_apply_supported = per_object_modes
         selected_classes_apply_supported = per_object_modes
+        # M7E: processing_fps is applied as an OUTPUT-CADENCE throttle on the
+        # perception-snapshot emit interval (1/fps replaces the global
+        # perception_snapshot_interval_seconds for this session). That seam
+        # only exists in the analytics mode with perception snapshots enabled;
+        # everywhere else the request stays stamp-only
+        # (processing_fps_requested_not_applied). The DeepStream pipeline /
+        # nvinfer interval is deliberately untouched, and the event-driven
+        # observation emits are NOT throttled (dropping real events is not a
+        # cadence) — the resolver stamps the honest
+        # processing_fps_output_cadence_only caveat whenever fps is applied.
+        processing_fps_apply_supported = self._mode == _ANALYTICS_MODE and bool(
+            settings.perception_snapshot_enabled
+        )
         self._resolved_processing_config: ResolvedProcessingConfig = (
             resolve_session_processing_config(
                 session.processing_config,
                 confidence_apply_supported=confidence_apply_supported,
                 selected_classes_apply_supported=selected_classes_apply_supported,
+                processing_fps_apply_supported=processing_fps_apply_supported,
             )
         )
         # M7D: single source of truth for the per-object class filter — the
@@ -454,6 +468,17 @@ class DeepStreamWorker(Runtime):
         # an empty list as "return unchanged"). Per-worker only; no global state.
         self._selected_classes: tuple[str, ...] = tuple(
             self._resolved_processing_config.applied.selected_classes
+        )
+        # M7E: single source of truth for the perception-snapshot cadence —
+        # the resolved APPLIED fps (1/fps), falling back to the global setting
+        # when no fps is applied. Per-worker only (no global Settings
+        # mutation, no cross-camera leakage); defensively guarded so a
+        # non-positive value can never produce a zero/negative interval.
+        applied_fps = self._resolved_processing_config.applied.processing_fps
+        self._perception_interval_seconds: float = (
+            1.0 / float(applied_fps)
+            if applied_fps is not None and applied_fps > 0
+            else float(settings.perception_snapshot_interval_seconds)
         )
         _log.info(
             "processing config resolved: camera_id=%s stream_session_id=%s source=%s "
@@ -971,9 +996,9 @@ class DeepStreamWorker(Runtime):
                 p["perception_snapshot_write_errors_count"] = (
                     counters.perception_snapshot_write_errors
                 )
-                p["perception_snapshot_interval_seconds"] = float(
-                    self._settings.perception_snapshot_interval_seconds
-                )
+                # M7E: report the EFFECTIVE per-session cadence (1/fps when an
+                # operator processing_fps is applied), not the global default.
+                p["perception_snapshot_interval_seconds"] = float(self._perception_interval_seconds)
                 p["last_perception_snapshot_at"] = (
                     counters.last_perception_snapshot_at.isoformat()
                     if counters.last_perception_snapshot_at is not None
@@ -1281,10 +1306,10 @@ class DeepStreamWorker(Runtime):
                 # the first qualifying frame posts immediately.
                 if perception_enabled:
                     now_mono = time.monotonic()
-                    if (
-                        now_mono - last_perception_post
-                        >= self._settings.perception_snapshot_interval_seconds
-                    ):
+                    # M7E: the effective interval is per-session — 1/fps when
+                    # an operator processing_fps is applied, else the global
+                    # default (see __init__).
+                    if now_mono - last_perception_post >= self._perception_interval_seconds:
                         last_perception_post = now_mono
                         payload = self._build_perception_payload(
                             frame=frame,
@@ -1338,9 +1363,7 @@ class DeepStreamWorker(Runtime):
         # supervisor force-stop after the per-worker budget expires).
         # The background perception sender runs alongside (not inside the
         # gather: it idles until the consumer ends, then is drained below).
-        sender_task = (
-            asyncio.create_task(_perception_sender()) if perception_enabled else None
-        )
+        sender_task = asyncio.create_task(_perception_sender()) if perception_enabled else None
         try:
             results = await asyncio.gather(_reader(), _consumer(), return_exceptions=True)
             for r in results:

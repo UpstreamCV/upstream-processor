@@ -35,10 +35,24 @@ warning means a selected-classes-applied config is always at LEAST
 stays at the defaults (``[]``) and emits ``selected_classes_requested_not_applied``
 exactly as before.
 
-Everything ELSE remains STAMP ONLY: ``model_key`` / ``processing_fps`` /
-``tracker`` are never applied — any meaningful request for them is recorded as
-a ``*_requested_not_applied`` warning and ``applied`` keeps the worker's
-current runtime defaults.
+M7E: ``processing_fps`` is now genuinely applied — but ONLY when the caller
+passes ``processing_fps_apply_supported=True`` (the analytics mode with
+perception snapshots enabled, which actually derives its snapshot cadence from
+the value). It is applied as an OUTPUT-CADENCE throttle: the perception
+snapshot emit interval becomes ``1/fps``. The DeepStream pipeline keeps
+receiving and inferring frames at the source rate (no nvinfer interval /
+GStreamer / pipeline change), and the line/zone/dwell observations are
+event-driven (throttling them would drop real events) so they are NOT
+throttled. That honesty rides as the always-on caveat
+``processing_fps_output_cadence_only`` whenever fps is applied — so, like an
+applied selected_classes, an fps-applied config is always at LEAST
+``partially_applied``. When the mode cannot apply it, the request stays at the
+defaults and emits ``processing_fps_requested_not_applied`` exactly as before.
+
+Everything ELSE remains STAMP ONLY: ``model_key`` / ``tracker`` are never
+applied — any meaningful request for them is recorded as a
+``*_requested_not_applied`` warning and ``applied`` keeps the worker's current
+runtime defaults.
 
 Unlike the geometry resolver, a bad/diverging processing config does NOT flag
 a worker ``error_code``: it lives only in this lineage block (the caller wires
@@ -73,8 +87,10 @@ class RequestedProcessingConfig:
 @dataclass(frozen=True)
 class AppliedProcessingConfig:
     """What the runtime actually applies. Starts from the static DeepStream
-    defaults; M7C may override ``confidence_threshold`` with the operator
-    value when the mode can apply it. All other fields stay at defaults."""
+    defaults; M7C may override ``confidence_threshold``, M7D
+    ``selected_classes``, and M7E ``processing_fps`` (output cadence) with the
+    operator value when the mode can apply them. ``model_key`` / ``tracker``
+    stay at defaults."""
 
     model_key: str
     selected_classes: list[str]
@@ -159,6 +175,7 @@ def resolve_session_processing_config(
     defaults: AppliedProcessingConfig = DEFAULT_APPLIED,
     confidence_apply_supported: bool = False,
     selected_classes_apply_supported: bool = False,
+    processing_fps_apply_supported: bool = False,
 ) -> ResolvedProcessingConfig:
     """Resolve the wire envelope into a ``ResolvedProcessingConfig``.
 
@@ -180,6 +197,17 @@ def resolve_session_processing_config(
     (aggregate line/ROI counts stay across all classes — out of scope);
     otherwise a non-empty request is recorded as
     ``selected_classes_requested_not_applied``.
+
+    ``processing_fps_apply_supported`` (default ``False``, which preserves the
+    pre-M7E stamp-only behavior for callers/tests that don't pass it) tells
+    the resolver the running mode actually derives its perception-snapshot
+    output cadence from the operator ``processing_fps``. When ``True`` and a
+    valid fps is requested, it is applied (echoed into
+    ``applied.processing_fps``) with the honest always-on caveat
+    ``processing_fps_output_cadence_only`` (the throttle changes the snapshot
+    emit cadence only — inference keeps running at the source rate and the
+    event-driven observations are not throttled); otherwise a request is
+    recorded as ``processing_fps_requested_not_applied``.
 
     See module docstring. NEVER raises.
     """
@@ -229,13 +257,27 @@ def resolve_session_processing_config(
     )
 
     # Per-field divergence vs what the runtime actually applies (defaults).
-    # Everything except confidence_threshold (M7C) and selected_classes (M7D)
-    # is still stamp-only: a meaningful request is recorded as
-    # "*_requested_not_applied" and never applied.
+    # Everything except confidence_threshold (M7C), selected_classes (M7D)
+    # and processing_fps (M7E) is still stamp-only: a meaningful request is
+    # recorded as "*_requested_not_applied" and never applied.
     warnings: list[str] = []
     applied_count = 0
+
+    # M7E: processing_fps is genuinely applied (perception-snapshot output
+    # cadence = 1/fps) when the mode supports it. An applied fps ALWAYS also
+    # adds the honest output-cadence caveat — inference keeps running at the
+    # source rate and event-driven observations are not throttled — so an
+    # fps-applied config is always at least partially_applied. The envelope
+    # schema bounds fps to 1..30; the > 0 check is defensive belt-and-braces
+    # so a future schema relaxation can never produce a zero/negative cadence.
+    applied_fps = defaults.processing_fps
     if config.processing_fps is not None:
-        warnings.append("processing_fps_requested_not_applied")
+        if processing_fps_apply_supported and config.processing_fps > 0:
+            applied_fps = config.processing_fps
+            applied_count += 1
+            warnings.append("processing_fps_output_cadence_only")
+        else:
+            warnings.append("processing_fps_requested_not_applied")
     if config.model_key != defaults.model_key:
         warnings.append("model_switch_requested_not_applied")
         if config.model_key not in MODEL_KEY_RUNTIME:
@@ -270,6 +312,7 @@ def resolve_session_processing_config(
         defaults,
         confidence_threshold=applied_confidence,
         selected_classes=applied_selected,
+        processing_fps=applied_fps,
     )
 
     if warnings and applied_count > 0:

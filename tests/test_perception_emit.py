@@ -195,9 +195,7 @@ async def test_slow_perception_post_does_not_block_frame_loop(
     api = SlowApi()
     # interval=100s so only frame 0 triggers a perception post (which blocks);
     # frame 1 carries the line crossing that must still emit meanwhile.
-    settings = fast_settings.model_copy(
-        update={"perception_snapshot_interval_seconds": 100.0}
-    )
+    settings = fast_settings.model_copy(update={"perception_snapshot_interval_seconds": 100.0})
     pm = FakeMetadataPM(
         [
             _frame_line(
@@ -297,3 +295,149 @@ async def test_perception_counters_in_status_payload(fast_settings: Any) -> None
     assert payload["perception_snapshot_write_errors_count"] == 0
     assert "perception_snapshot_interval_seconds" in payload
     assert payload["last_perception_snapshot_at"] is not None
+
+
+# --- M7E: operator processing_fps drives the snapshot cadence -----------
+
+
+def _fps_envelope(fps: int | None, **config_overrides: Any) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": [],
+        "tracker": None,
+        "confidence_threshold": None,
+        "processing_fps": fps,
+    }
+    config.update(config_overrides)
+    return {"revision": 3, "config": config}
+
+
+def _fps_worker(
+    api: FakeApi, settings: Any, pm: FakeMetadataPM, envelope: dict[str, Any]
+) -> DeepStreamWorker:
+    return DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL, processing_config=envelope),
+        settings=settings,
+        api=api,
+        package=resolve("deepstream.analytics_probe.v0"),
+        writer=ObservationWriter(api, _PROCESSOR_ID),
+        pm_factory=lambda: pm,
+    )
+
+
+async def test_applied_fps_overrides_global_interval(fast_settings: Any) -> None:
+    """fast_settings has interval 0.0 (every frame posts). An applied fps=1
+    flips the effective cadence to 1.0s, so 8 fast frames yield exactly ONE
+    post — and it is the FIRST frame (immediate first emit)."""
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [_frame_line(frame_num=i, objects=[_person()]) for i in range(8)],
+        exit_code=124,
+    )
+    w = _fps_worker(api, fast_settings, pm, _fps_envelope(1))
+    await asyncio.wait_for(w.run(), timeout=3)
+    assert len(api.perception_snapshots) == 1
+    assert api.perception_snapshots[0].snapshot["frame"]["frame_num"] == 0
+
+
+async def test_null_fps_preserves_pre_m7e_cadence(fast_settings: Any) -> None:
+    """A config row WITHOUT fps keeps the global interval — behavior-equivalent
+    pre-M7E: the loop gate uses exactly the settings value (0.0 here, i.e. no
+    extra throttle; the coalescing sender makes exact post counts scheduling-
+    dependent, so the structural guarantee is what's pinned)."""
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [_frame_line(frame_num=i, objects=[_person()]) for i in range(3)],
+        exit_code=124,
+    )
+    w = _fps_worker(api, fast_settings, pm, _fps_envelope(None))
+    assert w._perception_interval_seconds == float(
+        fast_settings.perception_snapshot_interval_seconds
+    )
+    await asyncio.wait_for(w.run(), timeout=3)
+    assert len(api.perception_snapshots) >= 1
+
+
+async def test_fps_30_does_not_over_throttle(fast_settings: Any) -> None:
+    """fps=30 (interval ~0.033s) must still emit the first frame immediately
+    and never compute a zero/negative interval."""
+    api = FakeApi()
+    pm = FakeMetadataPM([_frame_line(frame_num=0, objects=[_person()])], exit_code=124)
+    w = _fps_worker(api, fast_settings, pm, _fps_envelope(30))
+    assert 0.0 < w._perception_interval_seconds <= 1.0 / 30 + 1e-9
+    await asyncio.wait_for(w.run(), timeout=3)
+    assert len(api.perception_snapshots) == 1
+
+
+async def test_status_payload_reports_effective_interval(fast_settings: Any) -> None:
+    """The status payload's perception_snapshot_interval_seconds reports the
+    EFFECTIVE per-session cadence (1/fps), not the global default."""
+    api = FakeApi()
+    pm = FakeMetadataPM([_frame_line(frame_num=0, objects=[_person()])], exit_code=124)
+    w = _fps_worker(api, fast_settings, pm, _fps_envelope(5))
+    await asyncio.wait_for(w.run(), timeout=3)
+    payload = _last_metadata_payload(api)
+    assert payload["perception_snapshot_interval_seconds"] == 0.2
+
+
+async def test_fps_throttle_preserves_m7d_class_filter_and_m7c_lineage(
+    fast_settings: Any,
+) -> None:
+    """M7E composes with M7C/M7D: with fps=1 + selected_classes=["person"] +
+    confidence 0.2, the single throttled snapshot still carries ONLY the
+    selected-class objects and the stamped lineage shows all three applied."""
+    api = FakeApi()
+    car = {
+        "class_id": 0,
+        "label": "car",
+        "confidence": 0.9,
+        "tracker_id": "9",
+        "bbox_pixels": {"left": 50, "top": 60, "width": 30, "height": 40},
+    }
+    pm = FakeMetadataPM(
+        [_frame_line(frame_num=i, objects=[_person(), car]) for i in range(4)],
+        exit_code=124,
+    )
+    envelope = _fps_envelope(1, selected_classes=["person"], confidence_threshold=0.2)
+    w = _fps_worker(api, fast_settings, pm, envelope)
+    await asyncio.wait_for(w.run(), timeout=3)
+
+    assert len(api.perception_snapshots) == 1
+    body = api.perception_snapshots[0].snapshot
+    labels = {o["label"] for o in body["objects"]}
+    assert labels == {"person"}
+    block = body["source"]["applied_processing_config"]
+    assert block["applied"]["processing_fps"] == 1
+    assert block["applied"]["selected_classes"] == ["person"]
+    assert block["applied"]["confidence_threshold"] == 0.2
+    assert "processing_fps_output_cadence_only" in block["warnings"]
+
+
+async def test_fps_throttle_does_not_throttle_observations(fast_settings: Any) -> None:
+    """Observations are event-driven — an applied fps must NOT suppress them.
+    With fps=1 throttling snapshots to one, line-crossing observations from
+    later frames still flow (the honest output-cadence-only caveat)."""
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(frame_num=0, objects=[_person()]),
+            _frame_line(
+                frame_num=1,
+                objects=[_person()],
+                line_crossing_cumulative={"entry-line": 1},
+            ),
+            _frame_line(
+                frame_num=2,
+                objects=[_person()],
+                line_crossing_cumulative={"entry-line": 2},
+            ),
+        ],
+        exit_code=124,
+    )
+    w = _fps_worker(api, fast_settings, pm, _fps_envelope(1))
+    await asyncio.wait_for(w.run(), timeout=3)
+
+    assert len(api.perception_snapshots) == 1  # snapshots throttled
+    crossing_obs = [o for o in api.observations if o.type == "processor.line_crossing"]
+    assert len(crossing_obs) >= 2  # events NOT throttled

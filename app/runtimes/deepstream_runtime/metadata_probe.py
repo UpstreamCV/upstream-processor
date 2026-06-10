@@ -370,9 +370,7 @@ class DeepStreamMetadataProcessManager:
                         # already SIGKILLed; the OS reaps it eventually. Don't
                         # block teardown on it.
                         try:
-                            await asyncio.wait_for(
-                                self._proc.wait(), timeout=self._stop_timeout
-                            )
+                            await asyncio.wait_for(self._proc.wait(), timeout=self._stop_timeout)
                         except TimeoutError:
                             _log.warning(
                                 "metadata subprocess did not reap after kill; "
