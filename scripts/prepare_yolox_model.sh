@@ -83,10 +83,17 @@ if [ -f "$LIB_PATH" ] && [ "${FORCE_REBUILD:-0}" != "1" ]; then
 else
   echo "  compiling NvDsInferParseYolox inside $DEEPSTREAM_PYDS_IMAGE ..."
   cp "$PARSER_CPP" "$MODEL_DIR/nvdsparsebbox_yolox.cpp"
+  # The DS 8.0 samples image's default /usr/local/cuda/include is PARTIAL
+  # (crt/host_defines.h missing) — probe the cuda-* toolkit dirs for a
+  # complete include tree (live-found: /usr/local/cuda-12.5/targets/...).
   docker run --rm -v "$MODEL_DIR:$MODEL_DIR" "$DEEPSTREAM_PYDS_IMAGE" \
-    bash -lc "g++ -shared -fPIC -O2 -o $LIB_PATH $MODEL_DIR/nvdsparsebbox_yolox.cpp \
-      -I/opt/nvidia/deepstream/deepstream/sources/includes \
-      -I/usr/local/cuda/include" \
+    bash -lc "CUDA_INC=\$(for d in /usr/local/cuda/include /usr/local/cuda-*/targets/x86_64-linux/include; do
+        [ -f \"\$d/crt/host_defines.h\" ] && { echo \"\$d\"; break; }; done);
+      [ -n \"\$CUDA_INC\" ] || { echo 'no complete CUDA include dir found' >&2; exit 1; };
+      echo \"  cuda_include=\$CUDA_INC\";
+      g++ -shared -fPIC -O2 -o $LIB_PATH $MODEL_DIR/nvdsparsebbox_yolox.cpp \
+        -I/opt/nvidia/deepstream/deepstream/sources/includes \
+        -I\"\$CUDA_INC\"" \
     || { echo "FAIL parser compile failed" >&2; exit 1; }
 fi
 [ -f "$LIB_PATH" ] || { echo "FAIL parser .so missing after compile" >&2; exit 1; }
