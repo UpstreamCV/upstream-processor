@@ -131,10 +131,18 @@ def test_model_registry_loads_with_expected_entries() -> None:
     assert "deepstream_nvinfer" in tcn.runtime_support
     assert set(tcn.aliases) == {"trafficcamnet", "sample_trafficcamnet"}
     assert tcn.supported_classes == ("car", "bicycle", "person", "roadsign")
-    # YOLO candidates exist but are placeholders only.
-    for candidate in ("yolox_s_v1", "yolov8n_v1"):
-        assert registry[candidate].status == "planned"
-    # The AGPL candidate carries an explicit license-review flag.
+    # P5-B: YOLOX-S is wired (runnable) but not yet 'supported'; the AGPL
+    # candidate stays a planned placeholder with its license-review flag.
+    yolox = registry["yolox_s_v1"]
+    assert yolox.status in ("experimental", "probe")
+    assert yolox.status != "supported"  # never promoted prematurely
+    assert "Apache-2.0" in yolox.license_notes
+    assert yolox.deepstream is not None
+    assert yolox.deepstream.requires_custom_parser is True
+    assert yolox.deepstream.artifact_subdir == "yolox_s_v1"
+    assert len(yolox.supported_classes) == 80  # full COCO-80, in id order
+    assert yolox.class_id_map["person"] == 0
+    assert registry["yolov8n_v1"].status == "planned"
     assert "REVIEW REQUIRED" in registry["yolov8n_v1"].license_notes
 
 
@@ -376,7 +384,7 @@ def test_planned_components_are_never_referencable() -> None:
     # Even a probe package cannot bundle a planned (artifact-less) model
     # or a planned tracker profile.
     with pytest.raises(RegistryValidationError, match="status 'planned'"):
-        validate_package_compatibility(_pkg(model_id="yolox_s_v1"))
+        validate_package_compatibility(_pkg(model_id="yolov8n_v1"))
     with pytest.raises(RegistryValidationError, match="status 'planned'"):
         validate_package_compatibility(
             _pkg(
@@ -453,7 +461,7 @@ def test_model_dir_resolution_identical_to_pre_p5() -> None:
 
 def test_planned_model_is_not_runnable() -> None:
     with pytest.raises(ValueError, match="not runnable"):
-        resolve_model_dir("yolox_s_v1")
+        resolve_model_dir("yolov8n_v1")
     with pytest.raises(ValueError, match="unknown deepstream inference model"):
         resolve_model_dir("yolo-custom")
 

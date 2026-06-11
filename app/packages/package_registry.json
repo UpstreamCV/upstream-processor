@@ -85,6 +85,20 @@
       "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
       "compute_tier": "low",
       "pricing_tier": "free_probe"
+    },
+    {
+      "package_id": "deepstream.yolox_probe.v0",
+      "display_name": "DeepStream YOLOX Metadata Probe v0",
+      "runtime": "deepstream",
+      "description": "DeepStream 8.0 + pyds metadata probe running YOLOX-S (COCO-80) instead of the TrafficCamNet sample model. Same pyds pad probe / BoundedBridgeQueue seam as deepstream.metadata_probe.v0; the PGIE config is the registry-driven YOLOX plan (raw official ONNX + custom grid-decode bbox parser, FP16 engine cached in the host model store). Requires operator-prepared artifacts (scripts/prepare_yolox_model.sh). Status/debug evidence only -- no observations, no metadata adapter, no API writes. No tracker, no analytics.",
+      "outputs": [],
+      "supports": {
+        "metadata_probe": true
+      },
+      "status": "probe",
+      "model_id": "yolox_s_v1",
+      "compute_tier": "medium",
+      "pricing_tier": "free_probe"
     }
   ]
 }

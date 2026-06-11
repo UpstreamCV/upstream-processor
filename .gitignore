@@ -12,3 +12,17 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# Model artifacts (P5-B policy: never commit weights/ONNX/TensorRT engines,
+# downloaded model files, or DeepStream outputs — they live on the GPU host
+# under UPSTREAM_DEEPSTREAM_MODEL_STORE_DIR, default /opt/upstream/models)
+models/
+model-cache/
+*.onnx
+*.engine
+*.pth
+*.weights
+*.wts
+kitti-out/
+upstream-p*-probe*/
+*.so

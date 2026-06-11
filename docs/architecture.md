@@ -2021,9 +2021,9 @@ profiles, and packages. **Placeholder values — not final pricing, not
 billed, not wired to the api-server.** They exist so future processing
 usage metering has somewhere to hang.
 
-### P5-B prep — YOLO DeepStream probe (NOT implemented)
+### P5-B prep — YOLO DeepStream probe (now implemented — see the P5-B section below)
 
-YOLO support is **prepared, not live**. P5-B must decide/produce:
+The decision list P5-B had to resolve (kept for the record):
 
 1. **Model choice**: prefer `yolox_s_v1` (Apache-2.0, commercially safe).
    `yolov8n_v1` (Ultralytics) is AGPL-3.0 — **license/commercial review
@@ -2063,3 +2063,97 @@ compatibility matrix (unknown ids, wrong runtimes, class subsets,
 tracker-requiring outputs, status gating incl. planned-never-runnable),
 all six shipped packages still resolve with unchanged behavior, and the
 golden equivalence tests for model dir + IOU YAML + analytics flags.
+
+## Processing P5-B — YOLOX DeepStream Probe
+
+### Model selected and why
+
+**`yolox_s_v1` — YOLOX-S, Apache-2.0 (Megvii).** Chosen because it is the
+best practical *permissive* candidate: official **prebuilt raw ONNX**
+assets exist on the YOLOX `0.1.1rc0` GitHub release (no torch/export
+toolchain needed), the license is commercially safe, and the only
+integration cost is a small custom bbox parser. Ultralytics YOLOv8
+(`yolov8n_v1`) stays a `planned` placeholder — **AGPL-3.0,
+license/commercial review explicitly required** before any use.
+TrafficCamNet's person-misclassification (P4-D) is the quality problem
+this detector targets: YOLOX-S is COCO-80 with `person` as class 0.
+
+### What was implemented
+
+- **Custom bbox parser** —
+  `app/runtimes/deepstream_runtime/yolox_parser/nvdsparsebbox_yolox.cpp`
+  (`NvDsInferParseYolox`): grid decode of the raw YOLOX output (strides
+  8/16/32, `score = objectness × max(class)`), boxes in network pixels,
+  NMS left to nvinfer `cluster-mode=2`. Written from the published output
+  contract, not copied from SDK samples. Refuses (loudly) tensors whose
+  anchor count doesn't match a raw export. Compiled **inside the existing
+  `upstream-deepstream:8.0-pyds-v1.2.2` image** (g++ + DS headers are
+  already there — no image rebuild) into the host model store.
+- **Model runtime plan** — `build_model_runtime_plan` in
+  `runtimes/deepstream_runtime/inference.py` dispatches on the registry's
+  `deepstream.config_template`:
+  `builtin_trafficcamnet_int8_v1` → the exact pre-P5-B PGIE bytes
+  (golden-tested); `yolox_onnx_fp16_v1` → the YOLOX PGIE
+  (`net-scale-factor=1.0`, BGR, FP16, `maintain-aspect-ratio=1`,
+  custom parser lib, 80 classes, pre-cluster 0.25 with M7C operator
+  override parity), labels generated from the registry's COCO-ordered
+  `supported_classes`, FP16 engine **cached in the model dir** across
+  runs.
+- **Host model store** — `UPSTREAM_DEEPSTREAM_MODEL_STORE_DIR` (default
+  `/opt/upstream/models`); a model with registry `artifact_subdir` lives
+  at `<store>/<subdir>`, bind-mounted rw into the worker container at the
+  same absolute path. The metadata PM pre-checks `required_files` and
+  fails with a clear "run scripts/prepare_yolox_model.sh" message.
+- **Worker model selection** — the package's registry `model_id` now wins
+  over the global `UPSTREAM_DEEPSTREAM_INFERENCE_MODEL` setting
+  (`DeepStreamWorker._effective_model`); the metadata status payload's
+  `model` field reports it (existing TrafficCamNet packages now report
+  `trafficcamnet_v1` — same model, registry id instead of env alias).
+- **Probe package** — `deepstream.yolox_probe.v0` (status `probe`,
+  `model_id yolox_s_v1`, `supports.metadata_probe`, outputs `[]`, no
+  tracker/no analytics, compute `medium` / pricing `free_probe`
+  placeholders). Works through the normal resolver + compatibility
+  validation and `UPSTREAM_FORCE_PACKAGE_ID`.
+- **Operator scripts** — `scripts/prepare_yolox_model.sh` (explicit
+  `CONFIRM_DOWNLOAD=1` download of the official ONNX + sha256 print +
+  in-container parser compile; never run by tests or the worker) and
+  `scripts/probe_deepstream_yolox_metadata.sh` (manual pyds probe, same
+  shape as the P2 TrafficCamNet probe; redacted output; first run builds
+  the FP16 engine — use `PROBE_SECONDS>=240` once).
+
+### Artifact policy
+
+Weights/ONNX/TensorRT engines/compiled parsers are **never committed**
+(`.gitignore`: `models/`, `*.onnx`, `*.engine`, `*.so`, `*.pth`, …). They
+live on the GPU host under the model store; the registry's
+`model_artifact_path` documents the default location. Downloads are
+operator-run and explicit.
+
+### What this proves / does not prove
+
+Proves (once live-verified): a non-sample, permissively-licensed detector
+runs the FULL Upstream path — eligible session → DeepStream 8.0 nvinfer
+(TensorRT FP16, Blackwell) → custom parser → pyds pad probe → neutral
+metadata (correct `person` labels, confidence, bboxes) → status/debug
+evidence → clean shutdown — with **zero observations** and zero API
+contract changes. Does NOT prove: tracker/analytics semantics with YOLOX
+(deferred), strict accuracy parity with the YOLOX reference
+preprocessing (DS letterbox pads 0 vs YOLOX's 114 — accepted probe-level
+approximation), INT8, or any customer-facing surface.
+
+### Live verification status
+
+Unit/equivalence gates are green (692 tests). Live verification on
+crowdcountS2 (manual probe → supervisor-managed probe with
+`UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_probe.v0`) requires the
+uncommitted tree on the host plus an active validated stream; results are
+recorded in docs/commit-log.md when run. The registry entry stays
+`experimental` until the live run passes, after which it flips to
+`probe` and `known_working_image` / `blackwell_supported` get filled.
+
+### Security / redaction
+
+The raw RTSP URL reaches the container ONLY via the `RTSP_URL` env (PM)
+or temp-file/env (scripts); logs and script output use the redacted form;
+the pyds container never sees the Upstream webhook secret (unchanged
+P2 boundary). Pinned by tests (`tests/test_yolox_probe.py`).

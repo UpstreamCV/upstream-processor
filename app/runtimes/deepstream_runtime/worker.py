@@ -367,6 +367,14 @@ class DeepStreamWorker(Runtime):
         self._settings = settings
         self._api = api
         self._package = package
+        # P5-B: the package's registry model wins over the global
+        # ``deepstream_inference_model`` setting (the env stays a dev/probe
+        # default for packages that declare no model, e.g. decode_probe).
+        # For the TrafficCamNet packages both resolve to the same registry
+        # entry, so the rendered configs are unchanged; the status payload's
+        # ``model`` field now reports the registry id (e.g.
+        # ``trafficcamnet_v1``) instead of the env alias.
+        self._effective_model: str = package.model_id or settings.deepstream_inference_model
         # P4-B: only the analytics mode uses the writer (today, only for
         # ``processor.line_crossing``). decode_probe / inference_probe /
         # metadata_probe / tracker_probe modes ignore it. Optional so unit
@@ -556,7 +564,8 @@ class DeepStreamWorker(Runtime):
                 rtsp_transport=self._settings.deepstream_rtsp_transport,
                 probe_timeout_seconds=self._settings.deepstream_metadata_probe_timeout_seconds,
                 stop_timeout_seconds=self._settings.deepstream_process_stop_timeout_seconds,
-                model=self._settings.deepstream_inference_model,
+                model=self._effective_model,
+                model_store_dir=self._settings.deepstream_model_store_dir,
                 output_base_dir=self._settings.deepstream_inference_output_dir,
                 keep_temp_files=self._settings.deepstream_keep_temp_files,
                 sample_limit=self._settings.deepstream_metadata_sample_limit,
@@ -865,7 +874,10 @@ class DeepStreamWorker(Runtime):
             "mode": self._mode,
             "metadata_enabled": True,
             "metadata_source": "pyds_pad_probe",
-            "model": self._settings.deepstream_inference_model,
+            # P5-B: the EFFECTIVE model (package model_id when declared,
+            # else the global setting) so a YOLO probe is distinguishable
+            # from the TrafficCamNet probes in status evidence.
+            "model": self._effective_model,
             "image": self._settings.deepstream_pyds_image,
             "frames_seen": counters.frames_seen,
             "frames_with_objects": counters.frames_with_objects,

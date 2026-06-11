@@ -34,6 +34,7 @@ from uuid import uuid4
 
 from app.packages.registries import (
     RUNNABLE_COMPONENT_STATUSES,
+    ModelSpec,
     find_model_by_alias,
     find_runnable_deepstream_tracker_by_algorithm,
     load_model_registry,
@@ -55,16 +56,12 @@ def _runnable_deepstream_model_names() -> list[str]:
     return sorted(names)
 
 
-def resolve_model_dir(model: str) -> str:
-    """Map the configured model name to its in-container model dir, via the
-    Processing P5 model registry (``model_registry.json``). For the proven
-    TrafficCamNet aliases this returns exactly the path the pre-registry code
-    hardcoded (the symlinked DeepStream sample dir, valid in both 7.1 and 8.0
-    images — the M8.2C1-A probe built the engine from exactly this path).
-
-    Raises ``ValueError`` for an unknown or not-yet-runnable (planned /
-    deprecated) model so the worker posts ``failed`` with a clear message
-    rather than launching a misconfigured pipeline."""
+def _resolve_runnable_model_spec(model: str) -> ModelSpec:
+    """Registry lookup shared by ``resolve_model_dir`` and
+    ``build_model_runtime_plan``. Raises ``ValueError`` for an unknown or
+    not-yet-runnable (planned / deprecated) model so the worker posts
+    ``failed`` with a clear message rather than launching a misconfigured
+    pipeline."""
     spec = find_model_by_alias(model)
     if spec is None:
         raise ValueError(
@@ -82,6 +79,21 @@ def resolve_model_dir(model: str) -> str:
             f"unknown deepstream inference model {model!r}: registry entry "
             f"{spec.model_id!r} has no DeepStream deployment spec"
         )
+    return spec
+
+
+def resolve_model_dir(model: str) -> str:
+    """Map the configured model name to its in-container model dir, via the
+    Processing P5 model registry (``model_registry.json``). For the proven
+    TrafficCamNet aliases this returns exactly the path the pre-registry code
+    hardcoded (the symlinked DeepStream sample dir, valid in both 7.1 and 8.0
+    images — the M8.2C1-A probe built the engine from exactly this path).
+
+    Note: for host-mounted models (``artifact_subdir`` set) this returns the
+    DEFAULT store location; ``build_model_runtime_plan`` is the settings-aware
+    resolution used by the metadata-probe runtime."""
+    spec = _resolve_runnable_model_spec(model)
+    assert spec.deepstream is not None  # guaranteed by the resolver
     return spec.deepstream.model_artifact_path
 
 
@@ -123,6 +135,171 @@ def build_pgie_config(
         "topk=20\n"
         "nms-iou-threshold=0.5\n"
         f"pre-cluster-threshold={cls0_thr}\n"
+    )
+
+
+# --- P5-B YOLOX model runtime plan --------------------------------------
+
+# Filename conventions inside a YOLOX model store dir (created by the
+# operator-run scripts/prepare_yolox_model.sh; never committed).
+_YOLOX_ONNX_FILENAME = "yolox_s.onnx"
+_YOLOX_PARSER_LIB_FILENAME = "libnvdsparsebbox_yolox.so"
+_YOLOX_ENGINE_FILENAME = "yolox_s_b1_gpu0_fp16.engine"
+
+# Registry ``deepstream.config_template`` values this runtime knows how to
+# render. Anything else fails loudly at plan time.
+_TRAFFICCAMNET_TEMPLATE = "builtin_trafficcamnet_int8_v1"
+_YOLOX_TEMPLATE = "yolox_onnx_fp16_v1"
+
+
+def build_yolox_pgie_config(
+    *,
+    model_dir: str,
+    engine_path: str,
+    labels_path: str,
+    num_classes: int,
+    confidence_threshold: float | None = None,
+) -> str:
+    """PGIE config for the official (raw, undecoded) YOLOX ONNX export.
+
+    Preprocessing mirrors YOLOX's own demo: NO normalization
+    (``net-scale-factor=1.0``, no offsets) and BGR channel order
+    (``model-color-format=1``) — YOLOX removed input normalization in
+    v0.1.1+. ``maintain-aspect-ratio=1`` letterboxes like the YOLOX demo
+    (which pads bottom/right; padding VALUE differs — 0 vs 114 — an accepted
+    probe-level approximation). FP16 (``network-mode=2``); INT8 needs a
+    calibration cache we don't have. NMS is nvinfer's per-class
+    ``cluster-mode=2`` clustering; the custom parser
+    (``NvDsInferParseYolox``) only decodes grids + thresholds.
+
+    M7C parity: ``confidence_threshold`` overrides ``pre-cluster-threshold``
+    when an operator value is applied; default 0.25 (YOLOX demo default).
+    """
+    thr = "0.25" if confidence_threshold is None else f"{confidence_threshold}"
+    return (
+        "[property]\n"
+        "gpu-id=0\n"
+        "net-scale-factor=1.0\n"
+        "model-color-format=1\n"
+        f"onnx-file={model_dir}/{_YOLOX_ONNX_FILENAME}\n"
+        f"model-engine-file={engine_path}\n"
+        f"labelfile-path={labels_path}\n"
+        "batch-size=1\n"
+        "process-mode=1\n"
+        "network-mode=2\n"
+        f"num-detected-classes={num_classes}\n"
+        "interval=0\n"
+        "gie-unique-id=1\n"
+        "cluster-mode=2\n"
+        "maintain-aspect-ratio=1\n"
+        "symmetric-padding=0\n"
+        "parse-bbox-func-name=NvDsInferParseYolox\n"
+        f"custom-lib-path={model_dir}/{_YOLOX_PARSER_LIB_FILENAME}\n"
+        "[class-attrs-all]\n"
+        "topk=300\n"
+        "nms-iou-threshold=0.45\n"
+        f"pre-cluster-threshold={thr}\n"
+    )
+
+
+@dataclass(frozen=True)
+class ModelRuntimePlan:
+    """Everything the metadata process manager needs to run one registry
+    model: the rendered PGIE config, the labels file body (when the model's
+    labels are registry-generated rather than baked into the image), extra
+    container bind mounts, and the host files that must exist before start.
+    Built by ``build_model_runtime_plan``; pure data."""
+
+    model_id: str
+    model_family: str
+    model_dir: str
+    pgie_config: str
+    parser: str
+    inference_backend: str
+    labels_body: str | None
+    extra_mount_dirs: tuple[str, ...]
+    required_files: tuple[str, ...]
+    image_builtin: bool
+
+
+def build_model_runtime_plan(
+    *,
+    model: str,
+    work_dir: str,
+    model_store_dir: str,
+    confidence_threshold: float | None = None,
+) -> ModelRuntimePlan:
+    """Resolve a registry model into a concrete runtime plan for the pyds
+    metadata pipeline. Dispatches on the registry entry's
+    ``deepstream.config_template``:
+
+    - ``builtin_trafficcamnet_int8_v1`` — byte-identical to the pre-P5-B
+      behavior: image-builtin sample model, INT8 engine built per-run into
+      the temp work dir, no extra mounts, labels from the image.
+    - ``yolox_onnx_fp16_v1`` — host-mounted artifacts under
+      ``<model_store_dir>/<artifact_subdir>`` (official raw ONNX + the
+      compiled custom parser, both prepared by the operator script); the
+      TensorRT FP16 engine is CACHED in that dir across runs; labels are
+      generated from the registry's ``supported_classes`` (COCO order) into
+      the work dir.
+
+    Raises ``ValueError`` (worker posts ``failed``) for unknown/not-runnable
+    models or unsupported templates. Missing-artifact checks are left to the
+    process manager (host I/O) using ``required_files``.
+    """
+    spec = _resolve_runnable_model_spec(model)
+    ds = spec.deepstream
+    assert ds is not None  # guaranteed by the resolver
+
+    if ds.config_template == _TRAFFICCAMNET_TEMPLATE:
+        model_dir = ds.model_artifact_path
+        engine_path = f"{work_dir}/trafficcamnet_b1_gpu0_int8.engine"
+        return ModelRuntimePlan(
+            model_id=spec.model_id,
+            model_family=spec.family,
+            model_dir=model_dir,
+            pgie_config=build_pgie_config(
+                model_dir=model_dir,
+                engine_path=engine_path,
+                confidence_threshold=confidence_threshold,
+            ),
+            parser=ds.parser,
+            inference_backend="tensorrt_int8",
+            labels_body=None,
+            extra_mount_dirs=(),
+            required_files=(),
+            image_builtin=True,
+        )
+
+    if ds.config_template == _YOLOX_TEMPLATE:
+        subdir = ds.artifact_subdir or spec.model_id
+        model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
+        labels_path = f"{work_dir}/labels.txt"
+        return ModelRuntimePlan(
+            model_id=spec.model_id,
+            model_family=spec.family,
+            model_dir=model_dir,
+            pgie_config=build_yolox_pgie_config(
+                model_dir=model_dir,
+                engine_path=f"{model_dir}/{_YOLOX_ENGINE_FILENAME}",
+                labels_path=labels_path,
+                num_classes=len(spec.supported_classes),
+                confidence_threshold=confidence_threshold,
+            ),
+            parser=ds.parser,
+            inference_backend="tensorrt_fp16",
+            labels_body="\n".join(spec.supported_classes) + "\n",
+            extra_mount_dirs=(model_dir,),
+            required_files=(
+                f"{model_dir}/{_YOLOX_ONNX_FILENAME}",
+                f"{model_dir}/{_YOLOX_PARSER_LIB_FILENAME}",
+            ),
+            image_builtin=False,
+        )
+
+    raise ValueError(
+        f"deepstream inference model {model!r}: registry config_template "
+        f"{ds.config_template!r} is not supported by this runtime"
     )
 
 

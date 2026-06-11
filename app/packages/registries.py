@@ -80,6 +80,13 @@ class ModelDeepStreamSpec:
     model_artifact_path: str
     known_working_image: str | None
     blackwell_supported: bool | None
+    # P5-B: when set, the model's artifacts live OUTSIDE the DeepStream image
+    # on the GPU host, under ``<deepstream_model_store_dir>/<artifact_subdir>``
+    # (bind-mounted into the container at the same absolute path).
+    # ``model_artifact_path`` then documents the DEFAULT effective path.
+    # ``None`` = artifacts are baked into the image at ``model_artifact_path``
+    # (the TrafficCamNet sample case).
+    artifact_subdir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +264,7 @@ def _parse_model_deepstream(raw: Any, ctx: str) -> ModelDeepStreamSpec | None:
         model_artifact_path=_req_str(raw, "model_artifact_path", ctx),
         known_working_image=_opt_str(raw, "known_working_image", ctx),
         blackwell_supported=_opt_bool(raw, "blackwell_supported", ctx),
+        artifact_subdir=_opt_str(raw, "artifact_subdir", ctx),
     )
 
 
