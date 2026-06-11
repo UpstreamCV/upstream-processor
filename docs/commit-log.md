@@ -4,6 +4,63 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-10 - Side task: Workflow Condition Payload Enrichment
+
+**What:** Enrich observation payloads with fields the worker can PROVE from
+current DeepStream/tracker/analytics data, so the api-server's workflow
+engine can support richer rule conditions without guessing. Three changes:
+
+1. **zone_entered / zone_exited** gain `confidence` — the object's detection
+   confidence in the frame that COMMITTED the transition (the Nth stable
+   frame). Omitted when the producer had no confidence, never guessed.
+2. **dwell_started / dwell_updated / dwell_exceeded** gain `confidence` —
+   the entry-commit frame's value for dwell_started; the CURRENT tick
+   frame's value for updated/exceeded (worker passes a per-frame
+   `confidence_by_track` map into `DwellState.tick`). A track not detected
+   in the triggering frame (disappearance deliberately doesn't close the
+   session) emits with NO confidence field — a stale entry-time value is
+   never re-stamped.
+3. **roi_occupancy `class_counts`** is now populated. `total_count` stays
+   the nvdsanalytics aggregate counter (M7D posture); the breakdown comes
+   from a SECOND, object-attributed source — per-object
+   `analytics.roi_labels` x class labels. Unlabeled/metadata-less objects
+   are excluded, so the breakdown may legitimately sum below `total_count`;
+   it is never padded. The adapter (`absorb_roi_counts`) already accepted
+   `class_counts_by_roi` — only the worker wiring was missing. Cadence
+   consequence (pinned by test): the change detector compares the whole
+   snapshot, so a class-mix change at constant total now emits.
+
+This is a side task, not a numbered processor milestone. It does NOT add
+multi-step workflows, a visual builder, or alert delivery channels.
+
+**Deliberately NOT done (no per-object proof exists):** per-object line
+crossing attribution. Production line crossings come from cumulative
+`objLCCumCnt` counters; per-object `lcStatus` labels exist in object
+analytics metadata, so a per-object line_crossing producer (with
+track/class/confidence) is FEASIBLE — but it replaces the cumulative-counter
+state machine (idempotency keys derived from cumulative counts, dedupe
+memory, count_delta semantics) and risks double emission during transition.
+That redesign is the documented follow-up. nvdsanalytics direction-detection
+labels are rule-name strings, not a_to_b crossing directions — direction
+stays deferred with it.
+
+**Files:** `app/observations/observation_adapter.py` (ZoneTransitionEvent /
+DwellEvent `confidence` field + payload emission, `absorb_object` /
+`DwellState.tick` params), `app/runtimes/deepstream_runtime/worker.py`
+(zone call site passes `obj.confidence`; dwell tick builds
+`confidence_by_track`; ROI path computes `class_counts_by_roi`),
+`tests/test_payload_enrichment.py` (10 worker-level tests: stamping,
+omission paths, exclusion of unlabeled objects, empty-breakdown backward
+compat, class-mix cadence pin).
+
+**Checks:** `make test` 628 passed (10 new; all pre-existing emit suites
+unchanged — payloads without the new fields still validate). `make lint` +
+`uv run mypy app` clean.
+
+**Consumer:** api-server Workflow Engine unlocks `min_confidence`
+(zone/dwell) and `object_class`-scoped ROI count bounds off these fields;
+see upstream-api-server docs/api-contracts.md.
+
 ## 2026-06-09 - M7E: Apply per-camera processing_fps as the perception-snapshot output cadence
 
 **What:** The saved per-camera `processing_fps` is now genuinely applied in the

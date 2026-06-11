@@ -1609,11 +1609,16 @@ class DeepStreamWorker(Runtime):
         ``idempotency_key`` on every event makes a future server-side
         UNIQUE constraint safe to add."""
         assert self._writer is not None  # gated by the caller
-        # M7D: intentionally NOT class-filtered. These are nvdsanalytics
-        # AGGREGATE per-ROI occupancy counts across ALL classes, computed
-        # in-container; they are not per-class filterable post-inference (out of
-        # M7D scope — see the selected_classes_analytics_counts_not_filtered
-        # lineage warning).
+        # ``total_count`` stays the nvdsanalytics AGGREGATE per-ROI occupancy
+        # counter (cross-class, computed in-container — the M7D posture).
+        # Side task (workflow condition payload enrichment): ``class_counts``
+        # is now populated from a SECOND, object-attributed source — each
+        # object's per-object ``analytics.roi_labels`` x its class label.
+        # Only labeled objects with analytics metadata are counted, so the
+        # breakdown can legitimately sum below ``total_count`` (unlabeled or
+        # metadata-less objects); it is never padded to match. When no object
+        # carries usable metadata the breakdown is omitted entirely
+        # (empty ``class_counts``), never guessed.
         analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
         if not isinstance(analytics, dict):
             return
@@ -1629,8 +1634,24 @@ class DeepStreamWorker(Runtime):
         }
         if not roi_counts_clean:
             return
+        class_counts_by_roi: dict[str, dict[str, int]] = {}
+        for obj in frame.objects:
+            if not obj.label:
+                continue
+            obj_analytics = obj.debug.get("analytics") if isinstance(obj.debug, dict) else None
+            if not isinstance(obj_analytics, dict):
+                continue
+            raw_labels = obj_analytics.get("roi_labels")
+            if not isinstance(raw_labels, list):
+                continue
+            for roi_label in raw_labels:
+                if not isinstance(roi_label, str):
+                    continue
+                per_roi = class_counts_by_roi.setdefault(roi_label, {})
+                per_roi[obj.label] = per_roi.get(obj.label, 0) + 1
         events = roi_state.absorb_roi_counts(
             roi_counts=roi_counts_clean,
+            class_counts_by_roi=class_counts_by_roi,
             occurred_at=occurred_at,
             source=source_block,
             debug={
@@ -1728,6 +1749,7 @@ class DeepStreamWorker(Runtime):
                 occurred_at=occurred_at,
                 class_id=obj.class_id,
                 class_label=obj.label,
+                confidence=obj.confidence,
                 source=source_block,
                 debug={
                     "frame_num": int(frame.frame.frame_num),
@@ -1804,8 +1826,18 @@ class DeepStreamWorker(Runtime):
         if dwell_state.active_session_count() == 0:
             return
         occurred_at = frame.frame.timestamp or now_utc()
+        # Side task (workflow condition payload enrichment): the CURRENT
+        # frame's per-track detection confidence. Tracks not detected this
+        # frame are simply absent — their dwell events omit confidence
+        # rather than carrying a stale value.
+        confidence_by_track: dict[str, float] = {
+            obj.tracker_id: float(obj.confidence)
+            for obj in frame.objects
+            if obj.tracker_id is not None and obj.confidence is not None
+        }
         events = dwell_state.tick(
             occurred_at=occurred_at,
+            confidence_by_track=confidence_by_track,
             source=source_block,
             debug={
                 "frame_num": int(frame.frame.frame_num),
