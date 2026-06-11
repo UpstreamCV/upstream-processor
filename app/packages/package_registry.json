@@ -137,7 +137,7 @@
       "package_id": "deepstream.yolox_analytics_probe.v0",
       "display_name": "People Analytics — YOLOX Probe v0",
       "runtime": "deepstream",
-      "description": "People-analytics probe: YOLOX-S (COCO-80, P5-B live-verified person detection) through the existing IOU tracker + nvdsanalytics chain. Same analytics worker path as deepstream.analytics_probe.v0 — operator-saved dashboard geometry with probe-default fallback, pyds metadata, and the existing line/ROI/zone/dwell observation adapters — with the detector swapped to fix TrafficCamNet's person misclassification (P4-D). Requires operator-prepared YOLOX artifacts (scripts/prepare_yolox_model.sh). Internal probe only; not customer-facing.",
+      "description": "People-analytics probe: YOLOX-S (COCO-80, P5-B live-verified person detection) through the existing IOU tracker + nvdsanalytics chain. Same analytics worker path as deepstream.analytics_probe.v0 — operator-saved dashboard geometry with probe-default fallback, pyds metadata, and the existing line/ROI/zone/dwell observation adapters — with the detector swapped to fix TrafficCamNet's person misclassification (P4-D). Requires operator-prepared YOLOX artifacts (scripts/prepare_yolox_model.sh). Live status (P5-D, 2026-06-11): zone_entered / roi_occupancy / dwell_started / dwell_updated / dwell_exceeded verified live with person-scoped, bounded volume; zone_exited / line_crossing / line_crossing_object NOT yet observed live — analysis points at IOU track fragmentation during walking motion (detector strong, adapter paths unit-proven). Tracker profile expansion is the recommended fix. Internal probe only; not customer-facing.",
       "outputs": [
         "processor.line_crossing",
         "processor.line_crossing_object",
@@ -170,7 +170,8 @@
       "not_recommended_for": [
         "dense_crowds",
         "non_person_classes",
-        "production_sla"
+        "production_sla",
+        "line_crossing_until_tracker_expansion"
       ],
       "setup_complexity": "medium",
       "supported_shapes": [

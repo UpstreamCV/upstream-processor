@@ -4,7 +4,7 @@ Reverse chronological. Newest at top.
 
 ---
 
-## 2026-06-11 - Processing P5-D: YOLOX Analytics + Package Readiness (implementation; live verification pending)
+## 2026-06-11 - Processing P5-D: YOLOX Analytics + Package Readiness (LIVE: partial pass — see below)
 
 **Why:** P5-B fixed person detection; P5-D proves the FULL people-
 analytics chain on YOLOX (IOU tracker -> nvdsanalytics -> pyds -> the
@@ -47,10 +47,25 @@ runtime/worker.py, app/observations/writer.py,
 tests/test_yolox_analytics_package.py (16 tests),
 tests/test_package_resolver.py (honest-outputs pin), docs.
 
-**Checks:** `make test` 708 passed (+16); ruff check/format + `uv run
-mypy app` clean; bash -n clean; git diff --check clean. **Live
-verification pending** (needs commit on host + live stream + operator
-ROI walk-through).
+**Checks:** `make test` 713 passed (+21 incl. the live-found fix's 5);
+ruff check/format + `uv run mypy app` clean; bash -n clean.
+
+**Live verification (crowdcountS2, 2026-06-11, two rounds, operator
+walking, operator-saved geometry rev 12 = 1 ROI + 2 lines):**
+Round 1 found an observation flood (126 obs/190s) from COCO-80
+background objects churning tracks in the ROI -> fixed in-milestone
+(package supported_classes become the default per-object filter +
+single-class packages narrow the nvdsanalytics class-id; TrafficCamNet
+behavior byte-identical, 5 new tests). Round 2: 16 observations (-87%),
+person-only: zone_entered x2, dwell_started x2, dwell_updated x1,
+roi_occupancy x11; zero non-2xx; RTSP redacted; clean shutdown; no
+leftovers. Lineage stamped yolox_s_v1 + model_switch_requested_not_applied.
+VERIFIED LIVE: zone_entered, roi_occupancy, dwell_started/updated (+
+dwell_exceeded mechanically in round 1). NOT YET LIVE: zone_exited,
+line_crossing, line_crossing_object — blocker analysis points at IOU
+track fragmentation during walking motion (entries fire from fresh
+tracks; exits/line counters need the SAME track to persist through
+motion). Recommended fix: tracker profile expansion (NvDCF).
 
 ---
 
