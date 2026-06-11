@@ -1,0 +1,91 @@
+{
+  "trackers": [
+    {
+      "tracker_profile_id": "deepstream_iou_fast_v1",
+      "display_name": "IOU (fast, no ReID)",
+      "runtime": "deepstream",
+      "family": "nvmultiobjecttracker",
+      "status": "probe",
+      "algorithm": "iou",
+      "requires_reid": false,
+      "requires_model": null,
+      "deepstream": {
+        "ll_lib_path_default": "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+        "ll_config_format": "yaml_1_0",
+        "tracker_width": 960,
+        "tracker_height": 544
+      },
+      "best_for": ["low_compute", "sparse_scenes", "probe_baselines"],
+      "not_recommended_for": ["crowded_scenes", "long_occlusions", "reid_quality_requirements"],
+      "compute_tier": "low",
+      "estimated_cost_weight": 0.2,
+      "settings": {
+        "BaseConfig": { "minDetectorConfidence": 0 },
+        "TargetManagement": {
+          "preserveStreamUpdateOrder": 0,
+          "maxTargetsPerStream": 150,
+          "minIouDiff4NewTarget": 0.5,
+          "probationAge": 4,
+          "maxShadowTrackingAge": 38,
+          "earlyTerminationAge": 1
+        },
+        "TrajectoryManagement": { "useUniqueID": 0 },
+        "DataAssociator": {
+          "dataAssociatorType": 0,
+          "associationMatcherType": 0,
+          "checkClassMatch": 1,
+          "minMatchingScore4Overall": 0.0,
+          "minMatchingScore4SizeSimilarity": 0.0,
+          "minMatchingScore4Iou": 0.0,
+          "matchingScoreWeight4SizeSimilarity": 0.4,
+          "matchingScoreWeight4Iou": 0.6
+        }
+      },
+      "notes": "The ONLY live-verified tracker (P3 tracker probe: stable NvDsObjectMeta.object_id across frames). settings render byte-identically to the proven ll-config YAML — change them only with a live re-verification."
+    },
+    {
+      "tracker_profile_id": "deepstream_nvdcf_balanced_v1",
+      "display_name": "NvDCF (balanced, planned)",
+      "runtime": "deepstream",
+      "family": "nvmultiobjecttracker",
+      "status": "planned",
+      "algorithm": "nvdcf",
+      "requires_reid": false,
+      "requires_model": null,
+      "deepstream": {
+        "ll_lib_path_default": "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+        "ll_config_format": "yaml_1_0",
+        "tracker_width": 960,
+        "tracker_height": 544
+      },
+      "best_for": ["occlusion_robustness", "visual_tracking_quality"],
+      "not_recommended_for": ["minimal_compute_budgets"],
+      "compute_tier": "medium",
+      "estimated_cost_weight": 0.6,
+      "settings": {},
+      "notes": "NOT runnable: no Upstream-authored ll-config has been written or live-verified. P5-C (tracker profile expansion) authors and live-tests this against the same metadata worker path."
+    },
+    {
+      "tracker_profile_id": "deepstream_nvsort_fast_v1",
+      "display_name": "NvSORT (fast, planned)",
+      "runtime": "deepstream",
+      "family": "nvmultiobjecttracker",
+      "status": "planned",
+      "algorithm": "nvsort",
+      "requires_reid": false,
+      "requires_model": null,
+      "deepstream": {
+        "ll_lib_path_default": "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+        "ll_config_format": "yaml_1_0",
+        "tracker_width": 960,
+        "tracker_height": 544
+      },
+      "best_for": ["low_compute", "motion_based_association"],
+      "not_recommended_for": ["long_occlusions"],
+      "compute_tier": "low",
+      "estimated_cost_weight": 0.3,
+      "settings": {},
+      "notes": "NOT runnable: no Upstream-authored ll-config; planned for P5-C alongside NvDCF. Python trackers (bytetrack/ocsort/botsort) are deliberately NOT listed — no python runtime exists in this processor yet."
+    }
+  ]
+}

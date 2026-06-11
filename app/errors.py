@@ -20,6 +20,13 @@ class PackageResolutionError(ProcessorError):
     """package_id unknown, or runtime not supported in this milestone."""
 
 
+class RegistryValidationError(PackageResolutionError):
+    """A model / tracker / analytics registry entry is malformed, or a
+    package references an incompatible combination of registry components.
+    Subclasses ``PackageResolutionError`` so the supervisor's existing
+    resolution-failure path (post ``failed`` + quarantine) handles it."""
+
+
 class ApiError(ProcessorError):
     """An API call failed. ``code``/``request_id`` come from the server's
     error envelope when present; ``message`` is safe to log (no body)."""

@@ -32,28 +32,57 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.packages.registries import (
+    RUNNABLE_COMPONENT_STATUSES,
+    find_model_by_alias,
+    find_runnable_deepstream_tracker_by_algorithm,
+    load_model_registry,
+    runnable_deepstream_tracker_algorithms,
+)
 from app.redact import redact_rtsp
 
 _log = logging.getLogger("upstream_processor.deepstream.infer")
 
-# Symlinked sample-model path; valid in both DeepStream 7.1 and 8.0 images
-# (the M8.2C1-A probe built the engine from exactly this path).
-_MODEL_DIR = "/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector"
 
-# v0 wires only the bundled TrafficCamNet primary detector (Primary_Detector).
-_KNOWN_MODELS = {"trafficcamnet", "sample_trafficcamnet"}
+def _runnable_deepstream_model_names() -> list[str]:
+    """All operator-facing names (aliases + ids) that resolve to a runnable
+    DeepStream model — for error messages."""
+    names: list[str] = []
+    for spec in load_model_registry().values():
+        if spec.status in RUNNABLE_COMPONENT_STATUSES and spec.deepstream is not None:
+            names.append(spec.model_id)
+            names.extend(spec.aliases)
+    return sorted(names)
 
 
 def resolve_model_dir(model: str) -> str:
-    """Map the configured model name to its in-container sample dir.
+    """Map the configured model name to its in-container model dir, via the
+    Processing P5 model registry (``model_registry.json``). For the proven
+    TrafficCamNet aliases this returns exactly the path the pre-registry code
+    hardcoded (the symlinked DeepStream sample dir, valid in both 7.1 and 8.0
+    images — the M8.2C1-A probe built the engine from exactly this path).
 
-    Raises ``ValueError`` for an unknown model so the worker posts ``failed``
-    with a clear message rather than launching a misconfigured pipeline."""
-    if model.strip().lower() not in _KNOWN_MODELS:
+    Raises ``ValueError`` for an unknown or not-yet-runnable (planned /
+    deprecated) model so the worker posts ``failed`` with a clear message
+    rather than launching a misconfigured pipeline."""
+    spec = find_model_by_alias(model)
+    if spec is None:
         raise ValueError(
-            f"unknown deepstream inference model {model!r}; v0 supports: {sorted(_KNOWN_MODELS)}"
+            f"unknown deepstream inference model {model!r}; "
+            f"known runnable models: {_runnable_deepstream_model_names()}"
         )
-    return _MODEL_DIR
+    if spec.status not in RUNNABLE_COMPONENT_STATUSES:
+        raise ValueError(
+            f"unknown deepstream inference model {model!r}: registry entry "
+            f"{spec.model_id!r} is status {spec.status!r} and not runnable; "
+            f"known runnable models: {_runnable_deepstream_model_names()}"
+        )
+    if spec.deepstream is None:
+        raise ValueError(
+            f"unknown deepstream inference model {model!r}: registry entry "
+            f"{spec.model_id!r} has no DeepStream deployment spec"
+        )
+    return spec.deepstream.model_artifact_path
 
 
 def build_pgie_config(
@@ -157,49 +186,40 @@ def build_app_config(
 
 # --- P3 tracker-probe builders -----------------------------------------
 
-# v0 supports only the no-ReID IOU tracker (simplest stable-id proof; no
-# model file beyond what's bundled in libnvds_nvmultiobjecttracker.so).
-_KNOWN_TRACKER_ALGORITHMS = {"iou"}
+
+def render_tracker_ll_config(settings: dict[str, dict[str, Any]]) -> str:
+    """Render a tracker profile's ``settings`` (section -> key -> scalar,
+    from ``tracker_registry.json``) into the nvtracker low-level YAML body.
+
+    DS 8.0 nvtracker parses %YAML:1.0 (note the colon, not a space) — keep
+    the prefix exactly. Section/key order follows the registry JSON order,
+    which mirrors the SDK sample. Pure / side-effect free."""
+    lines = ["%YAML:1.0\n"]
+    for section, values in settings.items():
+        lines.append(f"{section}:\n")
+        for key, value in values.items():
+            lines.append(f"  {key}: {value}\n")
+    return "".join(lines)
 
 
 def build_tracker_config(algorithm: str = "iou") -> str:
-    """Low-level tracker YAML config for ``nvtracker``.
+    """Low-level tracker YAML config for ``nvtracker``, resolved from the
+    Processing P5 tracker registry (``tracker_registry.json``).
 
     The DS 8.0 sample IOU config (``config_tracker_IOU.yml``) is the upstream
-    template; we ship our own minimal copy so the worker is self-contained
-    and tunables live in this repo. Required by ``nvtracker`` via the
-    ``ll-config-file`` property. Pure / side-effect free."""
-    algo = algorithm.strip().lower()
-    if algo not in _KNOWN_TRACKER_ALGORITHMS:
+    template; the registry's ``deepstream_iou_fast_v1`` profile ships our own
+    minimal copy so the worker is self-contained and tunables live in this
+    repo (rendered byte-identically to the pre-registry hardcoded YAML).
+    Required by ``nvtracker`` via the ``ll-config-file`` property. Planned
+    profiles (NvDCF / NvSORT — no authored, live-verified settings yet) are
+    rejected exactly like unknown algorithms. Pure / side-effect free."""
+    profile = find_runnable_deepstream_tracker_by_algorithm(algorithm)
+    if profile is None:
         raise ValueError(
             f"unknown deepstream tracker algorithm {algorithm!r}; "
-            f"v0 supports: {sorted(_KNOWN_TRACKER_ALGORITHMS)}"
+            f"runnable profiles support: {runnable_deepstream_tracker_algorithms()}"
         )
-    # DS 8.0 nvtracker parses %YAML:1.0 (note the colon, not a space) — keep
-    # the prefix exactly. Sections / keys mirror the SDK sample.
-    return (
-        "%YAML:1.0\n"
-        "BaseConfig:\n"
-        "  minDetectorConfidence: 0\n"
-        "TargetManagement:\n"
-        "  preserveStreamUpdateOrder: 0\n"
-        "  maxTargetsPerStream: 150\n"
-        "  minIouDiff4NewTarget: 0.5\n"
-        "  probationAge: 4\n"
-        "  maxShadowTrackingAge: 38\n"
-        "  earlyTerminationAge: 1\n"
-        "TrajectoryManagement:\n"
-        "  useUniqueID: 0\n"
-        "DataAssociator:\n"
-        "  dataAssociatorType: 0\n"
-        "  associationMatcherType: 0\n"
-        "  checkClassMatch: 1\n"
-        "  minMatchingScore4Overall: 0.0\n"
-        "  minMatchingScore4SizeSimilarity: 0.0\n"
-        "  minMatchingScore4Iou: 0.0\n"
-        "  matchingScoreWeight4SizeSimilarity: 0.4\n"
-        "  matchingScoreWeight4Iou: 0.6\n"
-    )
+    return render_tracker_ll_config(profile.settings)
 
 
 # --- P3.5 analytics-probe config builder -------------------------------

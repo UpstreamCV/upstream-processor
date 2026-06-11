@@ -1,14 +1,22 @@
 """Resolve a ``package_id`` to a package spec.
 
 The package registry entry declares the runtime; the worker manager
-dispatches on ``spec.runtime``. M8.2B supports two runtimes:
+dispatches on ``spec.runtime``. Two runtimes are supported:
 
 - ``mock``       — M8.1 mock handoff (``mock.detect.v0``)
-- ``deepstream`` — M8.2B decode-only probe (``deepstream.decode_probe.v0``)
+- ``deepstream`` — the DeepStream probe packages (decode / inference /
+  metadata / tracker / analytics)
 
-Strict: an unknown ``package_id`` or a package whose runtime is not in the
-supported set is rejected clearly (``PackageResolutionError``) so the worker
-posts ``failed`` rather than silently mis-running.
+Processing P5: packages now also reference the model / tracker / analytics
+registries (``app.packages.registries``) via optional ``model_id`` /
+``tracker_profile_id`` / ``analytics_profile_id`` fields, and ``resolve``
+runs ``validate_package_compatibility`` so an invalid combination is
+rejected at resolution time.
+
+Strict: an unknown ``package_id``, an unsupported runtime, or an
+incompatible registry combination is rejected clearly
+(``PackageResolutionError``) so the worker posts ``failed`` rather than
+silently mis-running.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from functools import lru_cache
 from importlib import resources
 
 from app.errors import PackageResolutionError
+from app.packages.compatibility import validate_package_compatibility
 
 SUPPORTED_RUNTIMES: frozenset[str] = frozenset({"mock", "deepstream"})
 
@@ -31,6 +40,19 @@ class PackageSpec:
     description: str
     outputs: tuple[str, ...]
     supports: dict[str, bool] = field(default_factory=dict)
+    # --- Processing P5: registry references + product metadata -----------
+    # status gates which component statuses the package may reference
+    # (see app.packages.compatibility). All current packages are probes.
+    status: str = "probe"
+    model_id: str | None = None
+    tracker_profile_id: str | None = None
+    analytics_profile_id: str | None = None
+    # Classes this package exposes; must be a subset of the model's
+    # supported_classes. () = whatever the model detects (no narrowing).
+    supported_classes: tuple[str, ...] = ()
+    # Placeholder usage/cost metadata — NOT billed, NOT final pricing.
+    compute_tier: str | None = None
+    pricing_tier: str | None = None
 
 
 @lru_cache(maxsize=1)
@@ -50,6 +72,13 @@ def load_registry() -> dict[str, PackageSpec]:
             description=entry["description"],
             outputs=tuple(entry.get("outputs", [])),
             supports=dict(entry.get("supports", {})),
+            status=entry.get("status", "probe"),
+            model_id=entry.get("model_id"),
+            tracker_profile_id=entry.get("tracker_profile_id"),
+            analytics_profile_id=entry.get("analytics_profile_id"),
+            supported_classes=tuple(entry.get("supported_classes", [])),
+            compute_tier=entry.get("compute_tier"),
+            pricing_tier=entry.get("pricing_tier"),
         )
         registry[spec.package_id] = spec
     return registry
@@ -58,8 +87,9 @@ def load_registry() -> dict[str, PackageSpec]:
 def resolve(package_id: str) -> PackageSpec:
     """Return the spec for ``package_id``.
 
-    Raises ``PackageResolutionError`` if the package is unknown or if its
-    declared runtime is not in ``SUPPORTED_RUNTIMES``.
+    Raises ``PackageResolutionError`` if the package is unknown, if its
+    declared runtime is not in ``SUPPORTED_RUNTIMES``, or if its registry
+    references are unknown/incompatible (Processing P5).
     """
     registry = load_registry()
     spec = registry.get(package_id)
@@ -72,4 +102,5 @@ def resolve(package_id: str) -> PackageSpec:
             f"package {package_id!r} declares unsupported runtime "
             f"{spec.runtime!r}; supported: {sorted(SUPPORTED_RUNTIMES)}"
         )
+    validate_package_compatibility(spec)
     return spec
