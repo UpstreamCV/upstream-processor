@@ -53,6 +53,22 @@ class PackageSpec:
     # Placeholder usage/cost metadata — NOT billed, NOT final pricing.
     compute_tier: str | None = None
     pricing_tier: str | None = None
+    # --- P5-D: package-readiness metadata --------------------------------
+    # Internal product-facing candidate fields for the future package
+    # assignment API. NOT a package catalog, NOT exposed through api-server
+    # yet. ``production_ready`` is an honesty gate: it may only be true on
+    # ``supported`` packages (enforced in compatibility validation).
+    category: str | None = None
+    best_for: tuple[str, ...] = ()
+    not_recommended_for: tuple[str, ...] = ()
+    setup_complexity: str | None = None
+    supported_shapes: tuple[str, ...] = ()
+    supported_triggers: tuple[str, ...] = ()
+    default_target_fps: int | None = None
+    recommended_confidence_threshold: float | None = None
+    observation_policy: str | None = None
+    test_mode_safe: bool = True
+    production_ready: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -79,6 +95,17 @@ def load_registry() -> dict[str, PackageSpec]:
             supported_classes=tuple(entry.get("supported_classes", [])),
             compute_tier=entry.get("compute_tier"),
             pricing_tier=entry.get("pricing_tier"),
+            category=entry.get("category"),
+            best_for=tuple(entry.get("best_for", [])),
+            not_recommended_for=tuple(entry.get("not_recommended_for", [])),
+            setup_complexity=entry.get("setup_complexity"),
+            supported_shapes=tuple(entry.get("supported_shapes", [])),
+            supported_triggers=tuple(entry.get("supported_triggers", [])),
+            default_target_fps=entry.get("default_target_fps"),
+            recommended_confidence_threshold=entry.get("recommended_confidence_threshold"),
+            observation_policy=entry.get("observation_policy"),
+            test_mode_safe=entry.get("test_mode_safe", True),
+            production_ready=entry.get("production_ready", False),
         )
         registry[spec.package_id] = spec
     return registry

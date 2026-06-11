@@ -74,8 +74,17 @@
       "package_id": "deepstream.analytics_probe.v0",
       "display_name": "DeepStream Analytics Probe v0",
       "runtime": "deepstream",
-      "description": "DeepStream 8.0 + pyds metadata probe with nvtracker AND nvdsanalytics enabled. Same pyds pad probe as deepstream.tracker_probe.v0 but inserts an nvdsanalytics element after nvtracker; the pad probe walks NvDsUserMeta on both frames (NVDS_FRAME_META_NVDSANALYTICS -> NvDsAnalyticsFrameMeta: objInROIcnt / objLCCumCnt / objLCCurrCnt / ocStatus) and objects (NVDS_OBJ_META_NVDSANALYTICS -> NvDsAnalyticsObjInfo: roiStatus / lcStatus / dirStatus / ocStatus) and surfaces analytics counters/labels in the worker status payload. v0 ships a hand-authored ROI + line-crossing config (1280x720); dashboard-driven geometry is a later milestone. Status/debug evidence only -- no observations, no metadata adapter, no rules/events, no API writes.",
-      "outputs": [],
+      "description": "DeepStream 8.0 + pyds metadata probe with nvtracker AND nvdsanalytics enabled (TrafficCamNet sample detector). Same pyds pad probe as deepstream.tracker_probe.v0 but inserts an nvdsanalytics element after nvtracker; the pad probe walks NvDsUserMeta on frames (NvDsAnalyticsFrameMeta: objInROIcnt / objLCCumCnt / objLCCurrCnt / ocStatus) and objects (NvDsAnalyticsObjInfo: roiStatus / lcStatus / dirStatus / ocStatus). Geometry is the operator-saved dashboard geometry when present (P6-C), else the probe-default central ROI + midline. With an ObservationWriter wired (P4-B..P4-E) this mode EMITS the line/ROI/zone/dwell observation types listed in outputs; known limitation: TrafficCamNet misclassifies people in non-traffic scenes (P4-D), which is what the YOLOX analytics package exists to fix.",
+      "outputs": [
+        "processor.line_crossing",
+        "processor.line_crossing_object",
+        "processor.roi_occupancy",
+        "processor.zone_entered",
+        "processor.zone_exited",
+        "processor.dwell_started",
+        "processor.dwell_updated",
+        "processor.dwell_exceeded"
+      ],
       "supports": {
         "analytics_probe": true
       },
@@ -84,7 +93,31 @@
       "tracker_profile_id": "deepstream_iou_fast_v1",
       "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
       "compute_tier": "low",
-      "pricing_tier": "free_probe"
+      "pricing_tier": "free_probe",
+      "category": "people_analytics",
+      "setup_complexity": "medium",
+      "supported_shapes": [
+        "polygon_roi",
+        "line_segment"
+      ],
+      "supported_triggers": [
+        "line_crossing",
+        "roi_occupancy",
+        "zone_entered",
+        "zone_exited",
+        "dwell_exceeded"
+      ],
+      "observation_policy": "debounced_events_plus_interval_heartbeats",
+      "test_mode_safe": true,
+      "production_ready": false,
+      "best_for": [
+        "traffic_scenes",
+        "probe_baselines"
+      ],
+      "not_recommended_for": [
+        "person_analytics_in_non_traffic_scenes",
+        "production_sla"
+      ]
     },
     {
       "package_id": "deepstream.yolox_probe.v0",
@@ -99,6 +132,63 @@
       "model_id": "yolox_s_v1",
       "compute_tier": "medium",
       "pricing_tier": "free_probe"
+    },
+    {
+      "package_id": "deepstream.yolox_analytics_probe.v0",
+      "display_name": "People Analytics — YOLOX Probe v0",
+      "runtime": "deepstream",
+      "description": "People-analytics probe: YOLOX-S (COCO-80, P5-B live-verified person detection) through the existing IOU tracker + nvdsanalytics chain. Same analytics worker path as deepstream.analytics_probe.v0 — operator-saved dashboard geometry with probe-default fallback, pyds metadata, and the existing line/ROI/zone/dwell observation adapters — with the detector swapped to fix TrafficCamNet's person misclassification (P4-D). Requires operator-prepared YOLOX artifacts (scripts/prepare_yolox_model.sh). Internal probe only; not customer-facing.",
+      "outputs": [
+        "processor.line_crossing",
+        "processor.line_crossing_object",
+        "processor.roi_occupancy",
+        "processor.zone_entered",
+        "processor.zone_exited",
+        "processor.dwell_started",
+        "processor.dwell_updated",
+        "processor.dwell_exceeded"
+      ],
+      "supports": {
+        "analytics_probe": true
+      },
+      "status": "probe",
+      "model_id": "yolox_s_v1",
+      "tracker_profile_id": "deepstream_iou_fast_v1",
+      "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
+      "supported_classes": [
+        "person"
+      ],
+      "compute_tier": "medium",
+      "pricing_tier": "free_probe",
+      "category": "people_analytics",
+      "best_for": [
+        "person_entry_exit",
+        "zone_presence",
+        "line_crossing_counts",
+        "dwell_monitoring"
+      ],
+      "not_recommended_for": [
+        "dense_crowds",
+        "non_person_classes",
+        "production_sla"
+      ],
+      "setup_complexity": "medium",
+      "supported_shapes": [
+        "polygon_roi",
+        "line_segment"
+      ],
+      "supported_triggers": [
+        "line_crossing",
+        "roi_occupancy",
+        "zone_entered",
+        "zone_exited",
+        "dwell_exceeded"
+      ],
+      "default_target_fps": 30,
+      "recommended_confidence_threshold": 0.4,
+      "observation_policy": "debounced_events_plus_interval_heartbeats",
+      "test_mode_safe": true,
+      "production_ready": false
     }
   ]
 }

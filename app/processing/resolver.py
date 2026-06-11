@@ -58,16 +58,20 @@ Unlike the geometry resolver, a bad/diverging processing config does NOT flag
 a worker ``error_code``: it lives only in this lineage block (the caller wires
 it as ``payload.applied_processing_config`` and sets no error).
 
-Pure / side-effect free: no I/O, no logging. Logging is the caller's job.
+Pure / side-effect free apart from the cached one-time model-registry read
+backing ``model_key_runtime_map`` (P5-D); no logging. Logging is the
+caller's job.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from app.packages.registries import load_model_registry
 from app.processing.session_processing import SessionProcessingConfigEnvelope
 
 ResolvedProcessingConfigSource = Literal["operator_saved", "default", "fallback_default_on_error"]
@@ -112,13 +116,43 @@ DEFAULT_APPLIED = AppliedProcessingConfig(
     processing_fps=None,
 )
 
-# Lineage-only static map: which runtime a model_key would route to. Used
-# only to flag a requested model that has no known runtime mapping; it does
-# NOT influence any applied value (M7B applies nothing).
-MODEL_KEY_RUNTIME = {
-    "trafficcamnet_v1": "deepstream",
-    "mock_detect_v0": "mock",
+# P5-D: the lineage model-key → runtime mapping is now DERIVED from the
+# model registry instead of a hand-maintained map. Only models that exist
+# outside the registry need a static supplement (the mock runtime ships no
+# registry entry).
+_STATIC_MODEL_KEY_RUNTIME = {"mock_detect_v0": "mock"}
+
+# Model ``runtime_support`` token → the lineage runtime name it maps to.
+_RUNTIME_SUPPORT_TO_RUNTIME = {
+    "deepstream_nvinfer": "deepstream",
+    "deepstream_nvinferserver": "deepstream",
+    "python": "python",
+    "triton": "triton",
 }
+
+
+@lru_cache(maxsize=1)
+def model_key_runtime_map() -> dict[str, str]:
+    """Which runtime a requested ``model_key`` would route to — registry ids
+    AND aliases, every status (lineage asks "is this a known key", not "is it
+    runnable"), plus the static mock supplement. Used ONLY to flag a
+    requested model that has no known runtime mapping; it never influences
+    any applied value."""
+    mapping = dict(_STATIC_MODEL_KEY_RUNTIME)
+    for spec in load_model_registry().values():
+        runtime = next(
+            (
+                _RUNTIME_SUPPORT_TO_RUNTIME[token]
+                for token in spec.runtime_support
+                if token in _RUNTIME_SUPPORT_TO_RUNTIME
+            ),
+            None,
+        )
+        if runtime is None:
+            continue
+        for key in (spec.model_id, *spec.aliases):
+            mapping[key] = runtime
+    return mapping
 
 
 @dataclass(frozen=True)
@@ -280,7 +314,7 @@ def resolve_session_processing_config(
             warnings.append("processing_fps_requested_not_applied")
     if config.model_key != defaults.model_key:
         warnings.append("model_switch_requested_not_applied")
-        if config.model_key not in MODEL_KEY_RUNTIME:
+        if config.model_key not in model_key_runtime_map():
             warnings.append("model_key_no_runtime_mapping")
     if config.tracker not in (None, defaults.tracker):
         warnings.append("tracker_requested_not_applied")

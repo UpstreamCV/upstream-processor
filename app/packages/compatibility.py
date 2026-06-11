@@ -40,6 +40,9 @@ if TYPE_CHECKING:  # runtime import would cycle (resolver imports this module)
 
 PACKAGE_STATUSES = frozenset({"probe", "experimental", "supported", "deprecated"})
 
+# P5-D package-readiness enums.
+SETUP_COMPLEXITIES = frozenset({"low", "medium", "high"})
+
 # Which component statuses a package of a given status may reference.
 _ALLOWED_COMPONENT_STATUSES: dict[str, frozenset[str]] = {
     "supported": frozenset({"supported"}),
@@ -105,6 +108,18 @@ def validate_package_compatibility(
     if spec.pricing_tier is not None and spec.pricing_tier not in PRICING_TIERS:
         raise RegistryValidationError(
             f"package {pid!r}: invalid pricing_tier {spec.pricing_tier!r}"
+        )
+    if spec.setup_complexity is not None and spec.setup_complexity not in SETUP_COMPLEXITIES:
+        raise RegistryValidationError(
+            f"package {pid!r}: invalid setup_complexity {spec.setup_complexity!r}; "
+            f"allowed: {sorted(SETUP_COMPLEXITIES)}"
+        )
+    # Honesty gate: production_ready is a claim only a 'supported' package
+    # (license + deployment verified) may make.
+    if spec.production_ready and spec.status != "supported":
+        raise RegistryValidationError(
+            f"package {pid!r}: production_ready=true requires status 'supported' "
+            f"(got {spec.status!r})"
         )
 
     model: ModelSpec | None = None
@@ -191,6 +206,12 @@ def validate_package_compatibility(
             raise RegistryValidationError(
                 f"package {pid!r} declares outputs {sorted(unsupported)} not supported by "
                 f"analytics profile {profile.analytics_profile_id!r}"
+            )
+        unsupported_shapes = set(spec.supported_shapes) - set(profile.supported_shapes)
+        if unsupported_shapes:
+            raise RegistryValidationError(
+                f"package {pid!r} declares supported_shapes {sorted(unsupported_shapes)} not "
+                f"supported by analytics profile {profile.analytics_profile_id!r}"
             )
 
     tracked_outputs = set(spec.outputs) & OUTPUTS_REQUIRING_TRACKER

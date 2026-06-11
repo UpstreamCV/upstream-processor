@@ -57,7 +57,10 @@ def test_resolves_deepstream_analytics_probe_package() -> None:
     spec = resolve("deepstream.analytics_probe.v0")
     assert spec.package_id == "deepstream.analytics_probe.v0"
     assert spec.runtime == "deepstream"
-    assert spec.outputs == ()  # status/debug evidence only — no observations
+    # P5-D metadata cleanup: this mode HAS emitted observations since
+    # P4-B..P4-E — the outputs list is now honest about it.
+    assert "processor.line_crossing" in spec.outputs
+    assert "processor.zone_entered" in spec.outputs
     assert spec.supports.get("analytics_probe") is True
     # distinct from the other deepstream packages (most-specific-wins)
     assert spec.supports.get("tracker_probe") is None
