@@ -29,10 +29,10 @@ from uuid import uuid4
 from app.redact import redact_rtsp
 from app.runtimes.deepstream_runtime.inference import (
     AnalyticsGeometry,
+    ModelRuntimePlan,
     build_analytics_config,
-    build_pgie_config,
+    build_model_runtime_plan,
     build_tracker_config,
-    resolve_model_dir,
 )
 
 _log = logging.getLogger("upstream_processor.deepstream.meta")
@@ -59,6 +59,7 @@ def build_metadata_docker_command(
     tracker_height: int = 544,
     analytics_enabled: bool = False,
     gpus: str = "all",
+    extra_mount_dirs: tuple[str, ...] = (),
 ) -> list[str]:
     """Docker argv for one bounded metadata- / tracker- / analytics-probe
     run. Pure / side-effect free so it is unit-testable without Docker.
@@ -91,6 +92,13 @@ def build_metadata_docker_command(
     analytics_args = ""
     if analytics_enabled:
         analytics_args = f"--analytics-config-path {work_dir}/analytics_config.txt "
+    # P5-B: host-stored model artifacts (e.g. the YOLOX store dir) are
+    # bind-mounted at the SAME absolute path so the PGIE config's paths
+    # resolve identically on host and in-container. Mounted rw so nvinfer
+    # can cache the built TensorRT engine next to the ONNX.
+    mount_args: list[str] = []
+    for mount_dir in extra_mount_dirs:
+        mount_args.extend(["-v", f"{mount_dir}:{mount_dir}"])
     inner = (
         f"timeout -s INT {int(probe_timeout_seconds)} "
         f"python3 -B {work_dir}/pyds_metadata_app.py "
@@ -106,6 +114,7 @@ def build_metadata_docker_command(
         "docker", "run", "--rm", "--name", container_name,
         "--gpus", gpus, "--network", network,
         "-v", f"{work_dir}:{work_dir}",
+        *mount_args,
         "-e", "PYTHONDONTWRITEBYTECODE=1",
         "-e", f"RTSP_URL={rtsp_url}",
         image, "bash", "-lc", inner,
@@ -159,6 +168,11 @@ class DeepStreamMetadataProcessManager:
         # (the default, so existing callers/tests are unaffected) keeps the
         # built-in pre-cluster-threshold defaults; a float overrides them.
         confidence_threshold: float | None = None,
+        # P5-B: base dir for host-stored model artifacts (models whose
+        # registry entry carries ``artifact_subdir``). Default matches the
+        # ``deepstream_model_store_dir`` setting default so existing
+        # callers/tests are unaffected (TrafficCamNet never touches it).
+        model_store_dir: str = "/opt/upstream/models",
     ) -> None:
         if analytics_enabled and not tracker_enabled:
             raise ValueError(
@@ -189,6 +203,10 @@ class DeepStreamMetadataProcessManager:
         self._analytics_geometry = analytics_geometry
         self._gpus = gpus
         self._confidence_threshold = confidence_threshold
+        self._model_store_dir = model_store_dir
+        # Resolved in _prepare_work_dir (registry lookups may raise — keep
+        # that inside start() so the worker posts ``failed`` cleanly).
+        self._plan: ModelRuntimePlan | None = None
         # Container name prefix encodes the mode for easy `docker ps`
         # grouping: -dsm (metadata), -dst (tracker), -dsa (analytics).
         if analytics_enabled:
@@ -209,7 +227,6 @@ class DeepStreamMetadataProcessManager:
     # --- temp work dir ---------------------------------------------------
 
     def _prepare_work_dir(self) -> Path:
-        model_dir = resolve_model_dir(self._model)  # may raise ValueError
         if self._tracker_enabled:
             # Validate the tracker algorithm up-front so a typo posts
             # ``failed`` cleanly rather than failing inside the container.
@@ -233,16 +250,25 @@ class DeepStreamMetadataProcessManager:
         else:
             prefix = "upstream-p2-meta."
         work = Path(tempfile.mkdtemp(prefix=prefix, dir=base))
-        pgie_path = work / "pgie.txt"
-        engine_path = work / "trafficcamnet_b1_gpu0_int8.engine"
-        pgie_path.write_text(
-            build_pgie_config(
-                model_dir=model_dir,
-                engine_path=str(engine_path),
-                confidence_threshold=self._confidence_threshold,
-            ),
-            encoding="utf-8",
+        # P5-B: registry-driven model plan (may raise ValueError for an
+        # unknown/not-runnable model — the worker then posts ``failed``).
+        # For TrafficCamNet this renders the exact pre-P5-B PGIE config.
+        plan = build_model_runtime_plan(
+            model=self._model,
+            work_dir=str(work),
+            model_store_dir=self._model_store_dir,
+            confidence_threshold=self._confidence_threshold,
         )
+        missing = [f for f in plan.required_files if not Path(f).is_file()]
+        if missing:
+            raise ValueError(
+                f"model artifacts missing for {plan.model_id!r}: {missing}; "
+                "run scripts/prepare_yolox_model.sh on the GPU host first"
+            )
+        self._plan = plan
+        (work / "pgie.txt").write_text(plan.pgie_config, encoding="utf-8")
+        if plan.labels_body is not None:
+            (work / "labels.txt").write_text(plan.labels_body, encoding="utf-8")
         if self._tracker_enabled:
             (work / "tracker_config.yml").write_text(
                 build_tracker_config(self._tracker_algorithm),
@@ -295,6 +321,7 @@ class DeepStreamMetadataProcessManager:
             tracker_height=self._tracker_height,
             analytics_enabled=self._analytics_enabled,
             gpus=self._gpus,
+            extra_mount_dirs=(self._plan.extra_mount_dirs if self._plan is not None else ()),
         )
 
     async def start(self) -> None:

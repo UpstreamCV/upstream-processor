@@ -41,9 +41,10 @@ What each file owns.
   enforces the three mock types; stamps tz-aware `observed_at`.
 
 ### `app/packages/`
-- `package_registry.json` — the six probe packages (`mock.detect.v0` + the
-  five DeepStream probes), each referencing model/tracker/analytics registry
-  ids plus placeholder compute/pricing metadata (Processing P5).
+- `package_registry.json` — the seven probe packages (`mock.detect.v0`, the
+  five TrafficCamNet DeepStream probes, and P5-B's
+  `deepstream.yolox_probe.v0`), each referencing model/tracker/analytics
+  registry ids plus placeholder compute/pricing metadata (Processing P5).
 - `model_registry.json` / `tracker_registry.json` / `analytics_registry.json`
   — curated lower-level components (Processing P5): the live-verified
   TrafficCamNet model + planned YOLO placeholders, the live-verified IOU

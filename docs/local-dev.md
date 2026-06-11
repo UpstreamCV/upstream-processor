@@ -1025,3 +1025,37 @@ rm -rf /tmp/upstream-live-p4e
   printed) returns the expected `{"sessions":[…]}` envelope and parses into
   our schema. No writes to prod; the agent-stream rows above remain a manual
   operator step.
+
+## P5-B — YOLOX metadata probe (GPU host)
+
+One-time artifact prep (downloads the official Apache-2.0 ONNX, compiles
+the custom parser inside the existing pyds image; nothing is committed):
+
+```sh
+# default store is /opt/upstream/models (needs a one-time
+#   sudo mkdir -p /opt/upstream/models && sudo chown $USER /opt/upstream/models
+# or override both MODEL_DIR and UPSTREAM_DEEPSTREAM_MODEL_STORE_DIR):
+CONFIRM_DOWNLOAD=1 scripts/prepare_yolox_model.sh
+```
+
+Manual probe against a live validated stream (first run builds the FP16
+TensorRT engine, 1–3 min — it is cached in the model dir afterwards):
+
+```sh
+PROBE_SECONDS=240 scripts/probe_deepstream_yolox_metadata.sh \
+  "rtsp://127.0.0.1:18554/sess_XXXX"
+```
+
+Expect `label_counts` dominated by `person` when an operator is in frame
+(class 0), `has_bbox=true`, `has_confidence=true`.
+
+Supervisor-managed probe (stop the systemd processor first so two
+supervisors don't grab the same session):
+
+```sh
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_probe.v0 \
+UPSTREAM_DEEPSTREAM_METADATA_PROBE_TIMEOUT_SECONDS=120 \
+uv run python -m app.main
+# status payload shows mode=metadata_probe model=yolox_s_v1; expect
+# label_counts.person, zero observation POSTs, clean stopped status.
+```

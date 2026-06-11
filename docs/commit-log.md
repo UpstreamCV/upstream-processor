@@ -4,6 +4,59 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-11 - Processing P5-B: YOLOX DeepStream Probe (implementation; live verification pending)
+
+**Why:** TrafficCamNet (the only live-verified model) misclassifies
+people in non-traffic scenes (P4-D), which blocked reliable
+zone-transition verification. P5-B proves a better, permissively-licensed
+detector through the real DeepStream 8.0 + pyds metadata path.
+
+**Model decision:** YOLOX-S (`yolox_s_v1`), Apache-2.0 — official
+prebuilt RAW ONNX from the Megvii 0.1.1rc0 release (no torch export).
+Ultralytics YOLOv8 stays `planned` (AGPL-3.0, license review required).
+
+**What:** Upstream-authored custom bbox parser
+(`app/runtimes/deepstream_runtime/yolox_parser/nvdsparsebbox_yolox.cpp`,
+grid decode + obj×cls scoring; NMS stays nvinfer cluster-mode=2),
+registry-driven `build_model_runtime_plan` (TrafficCamNet branch golden-
+tested byte-identical; YOLOX branch renders FP16/BGR/no-norm PGIE +
+COCO-80 labels from the registry + cached engine), host model store
+(`UPSTREAM_DEEPSTREAM_MODEL_STORE_DIR`, default /opt/upstream/models;
+`artifact_subdir` dirs bind-mounted rw at the same path; missing
+artifacts fail with a clear prepare-script message), package-driven model
+selection (`DeepStreamWorker._effective_model` — package model_id wins
+over the env; metadata status payload `model` now reports the registry id),
+new probe package `deepstream.yolox_probe.v0` (metadata mode, no
+tracker/analytics, outputs []), and operator scripts
+`prepare_yolox_model.sh` (CONFIRM_DOWNLOAD-gated download + in-container
+parser compile — the existing pyds v1.2.2 image already has g++ and the
+DS headers, no image rebuild) + `probe_deepstream_yolox_metadata.sh`
+(manual probe, redacted). `.gitignore` hardened (models/, *.onnx,
+*.engine, *.so, *.pth — artifacts are never committed). Registry:
+`yolox_s_v1` promoted planned → **experimental** (probe only after live
+verification), full COCO-80 class_id_map, alias `yolox_s`, license/
+provenance notes.
+
+**No new observation types; no api-server/dashboard/agent changes; mock +
+all five TrafficCamNet probe packages unchanged (golden equivalence
+tests); UPSTREAM_FORCE_PACKAGE_ID behavior unchanged.**
+
+**Files:** app/runtimes/deepstream_runtime/yolox_parser/ (new),
+inference.py (plan + yolox PGIE builder), metadata_probe.py (plan-driven
+work dir + extra mounts), worker.py (_effective_model), config.py
+(model_store_dir), app/packages/{model,package}_registry.json,
+registries.py (artifact_subdir), scripts/{prepare_yolox_model,
+probe_deepstream_yolox_metadata}.sh (new), tests/test_yolox_probe.py
+(17 tests), tests/test_registries.py (yolox status updates), .gitignore,
+docs (architecture P5-B section, local-dev operator steps, module-map).
+
+**Checks:** `make test` 692 passed (+17); ruff check + format --check +
+`uv run mypy app` clean; `bash -n` clean on all scripts. **Live
+verification on crowdcountS2 pending** (needs the tree on the host + an
+active validated stream); registry stays `experimental` until it passes.
+
+---
+
 ## 2026-06-11 - Processing P5: Model + Tracker Registry Foundation
 
 **Why:** Upstream's product direction is a flexible CV platform where

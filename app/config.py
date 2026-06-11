@@ -92,6 +92,17 @@ class Settings(BaseSettings):
     deepstream_inference_model: str = "trafficcamnet"
     deepstream_keep_temp_files: bool = False
 
+    # --- P5-B host-side model artifact store ------------------------------
+    # Base dir on the GPU host for models that are NOT baked into the
+    # DeepStream image (model registry entries with ``artifact_subdir``).
+    # Each model's artifacts (ONNX, compiled custom parser .so, cached
+    # TensorRT engine) live under ``<store>/<artifact_subdir>`` and the dir
+    # is bind-mounted into the worker container at the same absolute path.
+    # Artifacts are prepared by operator-run scripts (e.g.
+    # scripts/prepare_yolox_model.sh) — never downloaded by the worker and
+    # never committed to the repo.
+    deepstream_model_store_dir: str = "/opt/upstream/models"
+
     # --- P2 DeepStream metadata-probe runtime ---------------------------
     # Bounded pyds metadata extraction under the supervisor. Uses a separate
     # DeepStream 8.0 + pyds image (built from docker/Dockerfile.pyds in the
