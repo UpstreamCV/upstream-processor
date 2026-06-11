@@ -4,6 +4,67 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-11 - Processing P5: Model + Tracker Registry Foundation
+
+**Why:** Upstream's product direction is a flexible CV platform where
+packages bundle a model + tracker + analytics profile + observation
+policy + compute/pricing tier. Before packages become product-facing,
+the processor needs curated registries of those lower-level components
+plus compatibility rules, so invalid combinations are rejected at
+package-resolution time instead of mis-running a pipeline.
+
+**What:** Three new registries below the package layer
+(`app/packages/model_registry.json` / `tracker_registry.json` /
+`analytics_registry.json`) with strict typed loaders/validators
+(`app/packages/registries.py`, `RegistryValidationError` — a
+`PackageResolutionError` subclass so the supervisor's existing
+failure path is unchanged) and package↔registry compatibility
+validation (`app/packages/compatibility.py`) wired into
+`resolver.resolve()`. `PackageSpec` gains optional `status` /
+`model_id` / `tracker_profile_id` / `analytics_profile_id` /
+`supported_classes` / `compute_tier` / `pricing_tier`; all six
+existing packages updated as `probe` packages referencing the
+registry entries (mock + decode reference no components).
+
+**Entries:** model `trafficcamnet_v1` (probe — the only live-verified
+model; aliases map `UPSTREAM_DEEPSTREAM_INFERENCE_MODEL` values) +
+`yolox_s_v1` / `yolov8n_v1` as `planned` placeholders (no artifacts;
+YOLOX Apache-2.0 preferred, YOLOv8 flagged AGPL license-review-required).
+Tracker `deepstream_iou_fast_v1` (probe — the only live-verified
+tracker) + planned NvDCF/NvSORT (empty settings, never runnable).
+Analytics `deepstream_nvdsanalytics_probe_v1` (probe: LC + ROI + zone +
+dwell, requires_tracker, supports_direction=false — loose mode).
+Status gating: planned/deprecated components are NEVER resolvable;
+`supported` packages may only use `supported` components.
+
+**Config hooks (equivalence-preserving):** `resolve_model_dir` now
+resolves through the model registry's `deepstream.model_artifact_path`
+(same Primary_Detector path); `build_tracker_config` renders the IOU
+profile's registry `settings` into the nvtracker ll-config YAML —
+golden-tested byte-identical to the pre-P5 hardcoded string. PGIE /
+analytics INI / all probe modes behaviorally unchanged; no observation
+emission changes; dev/test `UPSTREAM_FORCE_PACKAGE_ID` untouched.
+
+**Usage/cost metadata:** compute_tier / pricing_tier /
+estimated_cost_weight / observation_volume_risk / default_target_fps /
+gpu_required across models/trackers/profiles/packages — PLACEHOLDERS
+for future processing metering, not billed, not final pricing.
+
+**Files:** `app/packages/{model,tracker,analytics}_registry.json` (new),
+`app/packages/registries.py` (new), `app/packages/compatibility.py`
+(new), `app/packages/resolver.py`, `app/packages/package_registry.json`,
+`app/errors.py` (`RegistryValidationError`),
+`app/runtimes/deepstream_runtime/inference.py` (registry-backed
+`resolve_model_dir` / `build_tracker_config` + `render_tracker_ll_config`),
+`tests/test_registries.py` (37 tests), `docs/architecture.md`
+(P5 section incl. P5-B YOLO prep decisions), `docs/module-map.md`.
+
+**Checks:** `make test` 675 passed (+37); `ruff check` + `ruff format
+--check` + `uv run mypy app` clean. No GPU live verification needed:
+golden tests prove the rendered configs are byte-identical.
+
+---
+
 ## 2026-06-10 - Side task: Per-Object Line Crossing Producer
 
 **Why:** Line crossing is a core workflow primitive, but the existing

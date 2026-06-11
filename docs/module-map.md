@@ -41,9 +41,22 @@ What each file owns.
   enforces the three mock types; stamps tz-aware `observed_at`.
 
 ### `app/packages/`
-- `package_registry.json` — the single `mock.detect.v0` entry.
-- `resolver.py` — `resolve(package_id, runtime)`; rejects unknown packages and
-  non-`mock` runtime clearly (`PackageResolutionError`).
+- `package_registry.json` — the six probe packages (`mock.detect.v0` + the
+  five DeepStream probes), each referencing model/tracker/analytics registry
+  ids plus placeholder compute/pricing metadata (Processing P5).
+- `model_registry.json` / `tracker_registry.json` / `analytics_registry.json`
+  — curated lower-level components (Processing P5): the live-verified
+  TrafficCamNet model + planned YOLO placeholders, the live-verified IOU
+  tracker profile + planned NvDCF/NvSORT, and the nvdsanalytics probe profile.
+- `registries.py` — strict typed loaders/validators for the three component
+  registries (`RegistryValidationError` on duplicates / missing fields / bad
+  enums) + runnable-entry lookup helpers used by the DeepStream config hooks.
+- `compatibility.py` — `validate_package_compatibility`: package ↔ registry
+  cross-checks (unknown ids, runtime support, class subsets, tracker-requiring
+  outputs, status gating; planned/deprecated components never resolvable).
+- `resolver.py` — `resolve(package_id)`; rejects unknown packages, unsupported
+  runtimes, and incompatible registry combinations clearly
+  (`PackageResolutionError`).
 
 ### `app/runtimes/`
 - `base.py` — `Runtime` ABC + `WorkerState`; documents the lifecycle and the

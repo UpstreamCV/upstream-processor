@@ -9,7 +9,10 @@
         "processor.mock_frame_seen",
         "processor.mock_heartbeat",
         "processor.mock_detection"
-      ]
+      ],
+      "status": "probe",
+      "compute_tier": "low",
+      "pricing_tier": "free_probe"
     },
     {
       "package_id": "deepstream.decode_probe.v0",
@@ -19,7 +22,10 @@
       "outputs": [],
       "supports": {
         "decode_only": true
-      }
+      },
+      "status": "probe",
+      "compute_tier": "low",
+      "pricing_tier": "free_probe"
     },
     {
       "package_id": "deepstream.inference_probe.v0",
@@ -29,7 +35,11 @@
       "outputs": [],
       "supports": {
         "inference_probe": true
-      }
+      },
+      "status": "probe",
+      "model_id": "trafficcamnet_v1",
+      "compute_tier": "low",
+      "pricing_tier": "free_probe"
     },
     {
       "package_id": "deepstream.metadata_probe.v0",
@@ -39,7 +49,11 @@
       "outputs": [],
       "supports": {
         "metadata_probe": true
-      }
+      },
+      "status": "probe",
+      "model_id": "trafficcamnet_v1",
+      "compute_tier": "low",
+      "pricing_tier": "free_probe"
     },
     {
       "package_id": "deepstream.tracker_probe.v0",
@@ -49,7 +63,12 @@
       "outputs": [],
       "supports": {
         "tracker_probe": true
-      }
+      },
+      "status": "probe",
+      "model_id": "trafficcamnet_v1",
+      "tracker_profile_id": "deepstream_iou_fast_v1",
+      "compute_tier": "low",
+      "pricing_tier": "free_probe"
     },
     {
       "package_id": "deepstream.analytics_probe.v0",
@@ -59,7 +78,13 @@
       "outputs": [],
       "supports": {
         "analytics_probe": true
-      }
+      },
+      "status": "probe",
+      "model_id": "trafficcamnet_v1",
+      "tracker_profile_id": "deepstream_iou_fast_v1",
+      "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
+      "compute_tier": "low",
+      "pricing_tier": "free_probe"
     }
   ]
 }

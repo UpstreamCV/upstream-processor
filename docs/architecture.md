@@ -1925,3 +1925,141 @@ The analytics-mode status payload gains:
 - Per-zone configurable dwell thresholds (one global setting).
 - Dashboard-driven dwell thresholds.
 - Direction / track-update / telemetry types.
+
+## Processing P5 — Model + Tracker Registry Foundation
+
+> Naming note: this is the *registry* P5 milestone (2026-06-11). It is
+> unrelated to the earlier perception-snapshot milestone that was also
+> labelled "P5-C" in May — that one publishes latest-perception snapshots.
+
+### Why this exists
+
+Upstream is heading toward a flexible CV processing platform where a user
+picks a use case, a processing package, and safe model/tracker presets.
+Before packages can become product-facing, the processor needs a curated
+foundation describing **what models, trackers, and analytics profiles
+exist, what they're compatible with, and what they cost to run** — so
+invalid combinations are impossible to ship, and so future packages are
+assembled from validated parts instead of hardcoded constants.
+
+### Layering
+
+```
+model_registry.json + tracker_registry.json + analytics_registry.json
+        (curated lower-level building blocks, app/packages/registries.py)
+    → package_registry.json (product-facing bundles, app/packages/resolver.py)
+    → validate_package_compatibility (app/packages/compatibility.py)
+    → resolved runtime config (PGIE / nvtracker ll-config / nvdsanalytics INI)
+    → DeepStream worker
+```
+
+Models / tracker profiles / analytics profiles are **not customer-facing**.
+Packages will later combine them with observation policy, compute tier,
+pricing tier, supported outputs/shapes, and setup guidance.
+
+### Registries
+
+- **`app/packages/model_registry.json`** — `trafficcamnet_v1` (the only
+  live-verified model; status `probe`; aliases `trafficcamnet` /
+  `sample_trafficcamnet` map the `UPSTREAM_DEEPSTREAM_INFERENCE_MODEL`
+  setting onto the registry) plus two `planned` YOLO-family placeholders
+  (`yolox_s_v1`, `yolov8n_v1`) with **no artifacts** — see P5-B prep below.
+- **`app/packages/tracker_registry.json`** — `deepstream_iou_fast_v1`
+  (the only live-verified tracker; status `probe`; its `settings` render
+  byte-identically to the proven nvtracker ll-config YAML) plus `planned`
+  NvDCF / NvSORT placeholders with empty settings (not runnable). Python
+  trackers (bytetrack/ocsort/botsort) are deliberately NOT listed — no
+  python runtime exists in this processor.
+- **`app/packages/analytics_registry.json`** —
+  `deepstream_nvdsanalytics_probe_v1` (status `probe`): line crossing +
+  ROI occupancy + zone transitions + dwell, `requires_tracker`,
+  `config_mode: generated_ini`. Geometry is operator-saved (P6-C) with
+  the probe-default central-ROI/midline fallback; `supports_direction`
+  stays **false** (lines run `mode=loose`; dirStatus is lineage-only).
+
+Statuses gate use: `probe`/`supported`/`experimental` are runnable;
+`planned` (no artifacts) and `deprecated` are **never** resolvable.
+Loaders (`app/packages/registries.py`) are strict — duplicate ids,
+missing required fields, and invalid enums raise `RegistryValidationError`
+(a `PackageResolutionError` subclass, so the supervisor's existing
+resolution-failure path posts `failed` + quarantines).
+
+### Compatibility validation
+
+`resolver.resolve()` now runs `validate_package_compatibility` after its
+runtime check. Rules: referenced model/tracker/analytics ids must exist;
+the model must support the package runtime (`deepstream` →
+`deepstream_nvinfer`); tracker/analytics runtimes must match the package
+runtime; package `supported_classes` ⊆ model classes; declared outputs ⊆
+the analytics profile's `supported_outputs`; per-track outputs (zone /
+dwell / per-object line crossing) require a tracker; an analytics profile
+with `requires_tracker` requires one too; `supported` packages may only
+reference `supported` components while probe/experimental packages may
+also use probe/experimental ones; compute/pricing tiers must be valid
+enums. Deliberately not overbuilt — it exists to stop invalid combos.
+
+### DeepStream config hooks (equivalence-preserving)
+
+- `resolve_model_dir()` resolves the model dir through the model
+  registry's `deepstream.model_artifact_path` (same Primary_Detector
+  path as before; planned models are rejected as not runnable).
+- `build_tracker_config()` renders the tracker profile's `settings`
+  into the nvtracker ll-config YAML (`render_tracker_ll_config`) —
+  byte-identical to the pre-P5 hardcoded IOU YAML (golden-tested in
+  `tests/test_registries.py`). NvDCF/NvSORT raise like unknown algorithms.
+- The nvdsanalytics INI, PGIE template, and all probe modes are
+  behaviorally unchanged; the analytics registry describes (does not yet
+  drive) the analytics capability surface. `build_pgie_config` keeps the
+  M7C confidence plumbing; the registry's threshold fields are metadata.
+
+### Usage/cost metadata (placeholders)
+
+`compute_tier` / `pricing_tier` / `estimated_cost_weight` /
+`observation_volume_risk` / `default_target_fps` / `gpu_required` /
+`recommended_resolution` now exist on models, trackers, analytics
+profiles, and packages. **Placeholder values — not final pricing, not
+billed, not wired to the api-server.** They exist so future processing
+usage metering has somewhere to hang.
+
+### P5-B prep — YOLO DeepStream probe (NOT implemented)
+
+YOLO support is **prepared, not live**. P5-B must decide/produce:
+
+1. **Model choice**: prefer `yolox_s_v1` (Apache-2.0, commercially safe).
+   `yolov8n_v1` (Ultralytics) is AGPL-3.0 — **license/commercial review
+   required** before any use; do not promote past `planned` without it.
+2. **Source + export**: official YOLOX release → ONNX (static 640x640,
+   batch 1) → TensorRT engine built per-run like TrafficCamNet
+   (`engine_strategy: build_from_onnx_per_run`).
+3. **nvinfer config**: new PGIE template (net-scale-factor / offsets per
+   YOLOX preprocessing; `network-mode=2` FP16 first, INT8 needs
+   calibration).
+4. **Custom parser**: YOLO-family outputs need a custom bbox parser
+   (`parse-bbox-func-name` + `custom-lib-path`) compiled for DS 8.0 —
+   `requires_custom_parser: true` in the registry.
+5. **Labels/class map**: COCO-80 labels file + class_id_map; package
+   `supported_classes` stays a subset.
+6. **Image**: extend `upstream-deepstream:8.0-pyds-*` (or a sibling) with
+   the parser lib; record it in `known_working_image`.
+7. **Live verification**: same ladder as TrafficCamNet — bounded inference
+   probe (engine builds, no Unsupported SM on Blackwell), then pyds
+   metadata probe confirming correct class ids/labels/confidence/bboxes
+   in `NvDsObjectMeta` on a live Upstream stream.
+
+### Deferred (explicit)
+
+- BYOM / custom model upload; Triton (`deepstream_nvinferserver` /
+  `triton` runtime_support values are reserved enum tokens only).
+- Package marketplace UI / dashboard package wizard / package billing.
+- New observation types (none added); dashboard changes (none).
+- Camera-selected packages (still `UPSTREAM_FORCE_PACKAGE_ID` or the
+  session's `package_id`) — see P6 Package Assignment API candidate.
+
+### Coverage
+
+`tests/test_registries.py` — 37 tests: registry loading + strict
+validation (duplicates, missing fields, bad enums, duplicate aliases),
+compatibility matrix (unknown ids, wrong runtimes, class subsets,
+tracker-requiring outputs, status gating incl. planned-never-runnable),
+all six shipped packages still resolve with unchanged behavior, and the
+golden equivalence tests for model dir + IOU YAML + analytics flags.

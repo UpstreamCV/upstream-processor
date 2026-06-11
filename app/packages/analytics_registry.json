@@ -1,0 +1,32 @@
+{
+  "analytics_profiles": [
+    {
+      "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
+      "display_name": "nvdsanalytics ROI + line crossing (probe)",
+      "runtime": "deepstream",
+      "status": "probe",
+      "supported_outputs": [
+        "processor.line_crossing",
+        "processor.line_crossing_object",
+        "processor.roi_occupancy",
+        "processor.zone_entered",
+        "processor.zone_exited",
+        "processor.dwell_started",
+        "processor.dwell_updated",
+        "processor.dwell_exceeded"
+      ],
+      "supported_shapes": ["polygon_roi", "line_segment"],
+      "requires_tracker": true,
+      "supports_line_crossing": true,
+      "supports_roi_occupancy": true,
+      "supports_zone_transitions": true,
+      "supports_dwell": true,
+      "supports_direction": false,
+      "config_mode": "generated_ini",
+      "compute_tier": "low",
+      "estimated_cost_weight": 0.3,
+      "observation_volume_risk": "medium",
+      "notes": "The live-verified nvdsanalytics probe path (P3.5 metadata, P4-B/C/D/E observations). Geometry: operator-saved dashboard geometry when present (P6-C, lineage-verified P6-D), else the probe-default central ROI + midline fallback. Line crossings run mode=loose — supports_direction stays false until strict-direction rules are implemented (nvdsanalytics dirStatus labels are surfaced as lineage only). Zone-transition quality is bounded by detector quality, not API validation."
+    }
+  ]
+}
