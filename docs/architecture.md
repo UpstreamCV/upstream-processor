@@ -2243,8 +2243,31 @@ crowding/occlusion (IOU is the only profile), strict-direction line
 semantics (still mode=loose), dwell threshold tuning, or any
 customer-facing selection flow (next milestone).
 
-### Live verification status
+### Live verification status — PARTIAL PASS (2026-06-11, crowdcountS2, two rounds)
 
-PENDING — see docs/commit-log.md for the result when run
-(`UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_analytics_probe.v0` on
-crowdcountS2, operator entering/exiting the ROI and crossing the line).
+Round 1 (no class scoping) proved the chain works but found a real flood:
+126 observations in ~190s — COCO-80 background objects (books/tv/chair)
+confidence-flapping inside the ROI churned tracks (12 zone_entered with
+zero exits, 11 dwell_exceeded from stationary furniture, 43
+roi_occupancy). Fixed in-milestone: the worker now scopes per-object
+paths to the package's `supported_classes` (operator config still wins)
+and narrows the nvdsanalytics aggregate class-id for single-class
+packages (person=0).
+
+Round 2 (with scoping, operator walking the scene): **16 observations**
+(-87%) — zone_entered×2, dwell_started×2, dwell_updated×1,
+roi_occupancy×11, all person-attributed, zero non-2xx, RTSP fully
+redacted, clean shutdown, no leftover containers/temp dirs. Operator-
+saved geometry (revision 12: 1 ROI + 2 lines) loaded and lineage stamped
+`yolox_s_v1` with the honest `model_switch_requested_not_applied`.
+
+**Verified live:** zone_entered, roi_occupancy, dwell_started,
+dwell_updated, dwell_exceeded (round 1). **NOT yet observed live:**
+zone_exited, line_crossing, line_crossing_object. Blocker analysis: not
+detection (person detected continuously), not geometry (entries fire),
+not the API (types accepted), not the adapters (unit-proven; exits
+require the SAME track to survive leaving the zone, and line counters
+require a continuous track across the line) — the remaining suspect is
+**IOU track fragmentation during walking motion**, plus the deliberate
+"track disappearance ≠ zone exit" policy. Tracker profile expansion
+(NvDCF) is the smallest credible fix.
