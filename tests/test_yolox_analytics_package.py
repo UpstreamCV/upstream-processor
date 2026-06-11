@@ -428,3 +428,128 @@ async def test_yolox_analytics_without_writer_emits_nothing(fast_settings) -> No
     )
     await asyncio.wait_for(worker.run(), timeout=5)
     assert api.observations == []
+
+
+# --- P5-D live-found fix: package-derived class scoping ------------------------
+
+
+def test_package_classes_become_default_object_filter(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """Live-found (P5-D run 1): without this, COCO-80 background objects
+    (books/tv/chairs) flood the zone/dwell paths. The package's
+    supported_classes are the default per-object filter; the analytics
+    aggregate filter narrows to the model's class id for single-class
+    packages."""
+    worker = DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL),
+        settings=fast_settings,
+        api=FakeApi(),
+        package=resolve(_PKG),
+        pm_factory=lambda: FakeMetadataPM([]),
+    )
+    assert worker._selected_classes == ("person",)
+    assert worker._analytics_class_ids == "0"  # YOLOX person class id
+
+
+def test_operator_selected_classes_still_win(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    worker = DeepStreamWorker(
+        session=_session(
+            internal_rtsp_url=_URL,
+            processing_config={
+                "revision": 4,
+                "config": {
+                    "version": 1,
+                    "model_key": "yolox_s_v1",
+                    "selected_classes": ["car"],
+                },
+            },
+        ),
+        settings=fast_settings,
+        api=FakeApi(),
+        package=resolve(_PKG),
+        pm_factory=lambda: FakeMetadataPM([]),
+    )
+    assert worker._selected_classes == ("car",)  # operator narrows; package default yields
+
+
+def test_trafficcamnet_class_scoping_unchanged(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    worker = DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL),
+        settings=fast_settings,
+        api=FakeApi(),
+        package=resolve("deepstream.analytics_probe.v0"),
+        pm_factory=lambda: FakeMetadataPM([]),
+    )
+    # No supported_classes on the TrafficCamNet package -> no filter, and the
+    # aggregate class filter stays at the env setting. Byte-identical configs.
+    assert worker._selected_classes == ()
+    assert worker._analytics_class_ids == fast_settings.deepstream_analytics_class_ids
+
+
+def test_worker_pm_gets_package_scoped_analytics_class_id(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    worker = DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL),
+        settings=fast_settings,
+        api=FakeApi(),
+        package=resolve(_PKG),
+    )
+    pm = worker._default_pm_factory()
+    assert isinstance(pm, DeepStreamMetadataProcessManager)
+    assert pm._analytics_class_ids == "0"
+
+
+async def test_background_objects_do_not_emit_zone_or_dwell(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """A tracked 'book' inside the ROI emits NOTHING on the per-object
+    paths with the YOLOX package; the person still does."""
+    api = FakeApi()
+    book = {
+        "class_id": 73,
+        "label": "book",
+        "confidence": 0.31,
+        "bbox_pixels": {"left": 900.0, "top": 500.0, "width": 60.0, "height": 80.0},
+        "bbox_normalized": {"x": 0.70, "y": 0.69, "w": 0.05, "h": 0.11},
+        "tracker_id": "42",
+        "debug": {"analytics": {"roi_labels": ["entry-roi"]}},
+    }
+    person = {
+        "class_id": 0,
+        "label": "person",
+        "confidence": 0.91,
+        "bbox_pixels": {"left": 100.0, "top": 100.0, "width": 200.0, "height": 400.0},
+        "bbox_normalized": {"x": 0.078, "y": 0.139, "w": 0.156, "h": 0.556},
+        "tracker_id": "7",
+        "debug": {"analytics": {"roi_labels": ["entry-roi"]}},
+    }
+    frames = [
+        "UPSTREAM_METADATA="
+        + json.dumps(
+            {
+                "runtime": "deepstream",
+                "metadata_source": "pyds_pad_probe",
+                "stream_session_id": None,
+                "frame": {"frame_num": n, "width": 1280, "height": 720},
+                "objects": [book, person],
+                "source": {"analytics": {"roi_counts": {"entry-roi": 2}}},
+            }
+        )
+        for n in (1, 2)
+    ]
+    worker = DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL),
+        settings=fast_settings,
+        api=api,
+        package=resolve(_PKG),
+        writer=ObservationWriter(api, "proc_test_001"),
+        pm_factory=lambda: FakeMetadataPM(frames),
+    )
+    await asyncio.wait_for(worker.run(), timeout=5)
+    zone_tracks = [
+        o.payload["track_id"]
+        for o in api.observations
+        if o.type in ("processor.zone_entered", "processor.zone_exited")
+    ]
+    dwell_tracks = [
+        o.payload["track_id"] for o in api.observations if o.type.startswith("processor.dwell_")
+    ]
+    assert "7" in zone_tracks  # the person enters
+    assert "42" not in zone_tracks  # the book never does
+    assert "42" not in dwell_tracks
