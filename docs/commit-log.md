@@ -4,7 +4,7 @@ Reverse chronological. Newest at top.
 
 ---
 
-## 2026-06-11 - Processing P5-B: YOLOX DeepStream Probe (implementation; live verification pending)
+## 2026-06-11 - Processing P5-B: YOLOX DeepStream Probe (LIVE-VERIFIED)
 
 **Why:** TrafficCamNet (the only live-verified model) misclassifies
 people in non-traffic scenes (P4-D), which blocked reliable
@@ -51,9 +51,25 @@ probe_deepstream_yolox_metadata}.sh (new), tests/test_yolox_probe.py
 docs (architecture P5-B section, local-dev operator steps, module-map).
 
 **Checks:** `make test` 692 passed (+17); ruff check + format --check +
-`uv run mypy app` clean; `bash -n` clean on all scripts. **Live
-verification on crowdcountS2 pending** (needs the tree on the host + an
-active validated stream); registry stays `experimental` until it passes.
+`uv run mypy app` clean; `bash -n` clean on all scripts.
+
+**Live verification (crowdcountS2, 2026-06-11, RTX 5070 Ti / TRT 10.9 /
+upstream-deepstream:8.0-pyds-v1.2.2, live h264 1280x720@30 stream):**
+artifact prep OK (onnx sha256 c5c2d13e…8063, parser compiled in-container
+against /usr/local/cuda-12.5 includes); FP16 engine built 222s via trtexec
+(no Unsupported SM — Blackwell OK) and deserialized from cache in 0.02s on
+later runs. Manual probe: 1300 frames/45s (~29 fps), 1300 frames with
+objects, 3995 objects, has_bbox/has_confidence true, label_counts
+person=1300 (class 0, conf ~0.93 sample) + plausible scene labels
+(tv/chair/book) — **the live operator classified `person` on every frame
+where TrafficCamNet was unreliable**. Supervisor-managed run
+(UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_probe.v0, bounded 90s):
+package override honored over the session's mock package, worker
+mode=metadata_probe, status lifecycle posted (200s), bounded probe ended
+→ stopped → supervisor re-spawned per design, **zero observation POSTs**,
+clean SIGINT shutdown, no leftover P5-B containers, RTSP redacted in all
+output. Registry: yolox_s_v1 promoted experimental → **probe**,
+known_working_image + blackwell_supported filled.
 
 ---
 
