@@ -4,6 +4,61 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-10 - Side task: Per-Object Line Crossing Producer
+
+**Why:** Line crossing is a core workflow primitive, but the existing
+`processor.line_crossing` events come from nvdsanalytics CUMULATIVE line
+counters — counts with no per-object attribution, so the workflow engine
+could not support "person crossed line A" / track / confidence conditions.
+
+**What:** A NEW observation type, `processor.line_crossing_object`,
+emitted ALONGSIDE the aggregate events (coexistence, not replacement —
+the aggregate type keeps its exact count semantics and payload shape).
+Per-object evidence comes from nvdsanalytics' per-object `lcStatus`
+labels, which are exactly the saved geometry line ids (the analytics INI
+writes `line-crossing-<line.id>=` and the parser strips the prefix), so
+mapping is safe.
+
+**Payload:** line_id, line_label, track_id (REQUIRED — untracked
+crossings stay aggregate-only), event_mode "object_crossing", sequence,
+idempotency_key, plus class_id/class_label/confidence when provable and
+`analytics_direction_label` when nvdsanalytics provides dirStatus.
+**Intentionally absent:** a `direction` field — dirStatus is a
+direction-RULE name, not a geometry-relative a_to_b/b_to_a crossing
+direction (and the generated INI defines no direction rules today), so
+true direction stays deferred and is never faked.
+
+**Dedupe (`LineCrossingObjectState`):** rising-edge per (track, line) —
+emit exactly once on absent → present; no re-emission while the label
+persists across sightings; label clearing re-arms the pair so a genuine
+re-crossing emits with a bumped sequence. Idempotency key:
+`sess:<sid>:processor.line_crossing_object:<line>:<track>:<seq>`.
+Memory is bounded: past `max_entries` (4096), pairs unseen for
+`stale_after_seconds` (600, frame-time based) are pruned. Documented
+limitation: a track that disappears with an active label and reappears
+still carrying it does not re-emit (indistinguishable from a held label);
+the aggregate counter still counts such crossings.
+
+**Consumer contract:** the api-server maps both observation types to the
+same line_crossing rule family and partitions on payload event_mode — a
+rule with per-object conditions matches ONLY per-object events, a plain
+rule ONLY aggregate events, so one physical crossing (which produces both
+observations) never double-fires a rule.
+
+**Files:** `app/observations/observation_adapter.py`
+(LineCrossingObjectEvent/State + key builder + candidate type),
+`app/observations/schemas.py` (ObservationType lock-step),
+`app/runtimes/deepstream_runtime/worker.py` (`_emit_line_crossing_objects`
++ state construction + per-type counter in the status payload),
+`tests/test_line_crossing_object_emit.py` (10 tests: coexistence with
+unchanged aggregate payloads, no frame spam, re-cross sequence bump,
+untracked → aggregate-only, omission of missing class/confidence,
+analytics_direction_label passthrough, no-metadata no-op, two-track
+attribution, state pruning).
+
+**Checks:** `make test` 638 passed (+10); `make lint` + `uv run mypy app`
+clean.
+
 ## 2026-06-10 - Side task: Workflow Condition Payload Enrichment
 
 **What:** Enrich observation payloads with fields the worker can PROVE from

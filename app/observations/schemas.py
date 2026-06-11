@@ -31,6 +31,12 @@ ObservationType = Literal[
     # ``upstream-api-server``'s ``ProcessorObservationType`` (any drift
     # 422s the write at the server's pydantic layer).
     "processor.line_crossing",
+    # Side task (per-object line crossing): per-OBJECT crossing evidence
+    # from nvdsanalytics lcStatus. Flows ALONGSIDE the aggregate
+    # cumulative-counter type above — the aggregate keeps count
+    # semantics; this type carries track/class/confidence attribution.
+    # Lock-step with the api-server Literal.
+    "processor.line_crossing_object",
     # P4-C: ROI occupancy snapshot (on-change OR interval, never per-frame).
     "processor.roi_occupancy",
     # P4-D: per-track zone transitions. Stable outside-to-inside emits
@@ -59,6 +65,7 @@ OBSERVATION_TYPES: tuple[ObservationType, ...] = (
     "processor.mock_heartbeat",
     "processor.mock_detection",
     "processor.line_crossing",
+    "processor.line_crossing_object",
     "processor.roi_occupancy",
     "processor.zone_entered",
     "processor.zone_exited",

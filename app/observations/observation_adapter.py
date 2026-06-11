@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -51,6 +51,12 @@ from uuid import UUID
 # until then prevents accidental production POSTs. P4-B will move these
 # into ``schemas.ObservationType`` in lock-step with the api-server PR.
 CANDIDATE_LINE_CROSSING_TYPE = "processor.line_crossing"
+# Side task (per-object line crossing): per-OBJECT crossing evidence from
+# nvdsanalytics' per-object ``lcStatus``, distinct from the aggregate
+# cumulative-counter type above. Both flow side by side: the aggregate
+# type keeps its count semantics; this type carries track/class/confidence
+# attribution for workflow conditions.
+CANDIDATE_LINE_CROSSING_OBJECT_TYPE = "processor.line_crossing_object"
 CANDIDATE_ROI_OCCUPANCY_TYPE = "processor.roi_occupancy"
 # P4-D zone transition types. The two are kept as separate constants
 # because their event payloads share zone_id / track_id / sequence but
@@ -67,6 +73,7 @@ CANDIDATE_DWELL_EXCEEDED_TYPE = "processor.dwell_exceeded"
 
 CANDIDATE_OBSERVATION_TYPES: tuple[str, ...] = (
     CANDIDATE_LINE_CROSSING_TYPE,
+    CANDIDATE_LINE_CROSSING_OBJECT_TYPE,
     CANDIDATE_ROI_OCCUPANCY_TYPE,
     CANDIDATE_ZONE_ENTERED_TYPE,
     CANDIDATE_ZONE_EXITED_TYPE,
@@ -258,6 +265,191 @@ class LineCrossingState:
                 list(self.recently_emitted_keys)[-(self.recently_emitted_keys_max - 1) :]
             )
         self.recently_emitted_keys.add(key)
+
+
+# --- per-object line crossing (side task) -------------------------------
+
+
+@dataclass(frozen=True)
+class LineCrossingObjectEvent:
+    """One ``processor.line_crossing_object`` event — per-OBJECT crossing
+    evidence, distinct from the aggregate cumulative-counter
+    ``processor.line_crossing`` type.
+
+    ``track_id`` is REQUIRED: this type exists to attribute a crossing to
+    a tracked object; untracked objects are skipped by the state (their
+    crossings are still counted by the aggregate type). ``event_mode`` is
+    stamped into the payload so consumers (the api-server rule matcher)
+    can partition per-object vs aggregate events without relying on the
+    type string alone.
+
+    ``analytics_direction_label`` is the raw nvdsanalytics direction-RULE
+    name (``dirStatus``) when present — deliberately NOT named
+    ``direction`` because it is not a geometry-relative a_to_b/b_to_a
+    crossing direction. The generated analytics config doesn't define
+    direction rules today, so in production this is absent."""
+
+    type: str  # CANDIDATE_LINE_CROSSING_OBJECT_TYPE
+    stream_session_id: UUID
+    occurred_at: datetime
+    line_id: str
+    line_label: str
+    track_id: str
+    sequence: int
+    idempotency_key: str
+    class_id: int | None = None
+    class_label: str | None = None
+    confidence: float | None = None
+    analytics_direction_label: str | None = None
+    source: dict[str, Any] = field(default_factory=dict)
+    debug: dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "line_id": self.line_id,
+            "line_label": self.line_label,
+            "track_id": self.track_id,
+            "event_mode": "object_crossing",
+            "sequence": int(self.sequence),
+            "idempotency_key": self.idempotency_key,
+            "source": dict(self.source),
+            "debug": dict(self.debug),
+        }
+        if self.class_id is not None:
+            body["class_id"] = int(self.class_id)
+        if self.class_label is not None:
+            body["class_label"] = self.class_label
+        if self.confidence is not None:
+            body["confidence"] = round(float(self.confidence), 4)
+        if self.analytics_direction_label is not None:
+            body["analytics_direction_label"] = self.analytics_direction_label
+        return body
+
+
+def build_line_crossing_object_idempotency_key(
+    *,
+    stream_session_id: UUID,
+    line_id: str,
+    track_id: str,
+    sequence: int,
+) -> str:
+    """``sess:<sid>:processor.line_crossing_object:<line>:<track>:<seq>``.
+
+    ``sequence`` is the per-(track, line) crossing counter from
+    ``LineCrossingObjectState`` — a re-crossing by the same track gets
+    sequence 2 while the first crossing stays 1, so keys never collide.
+    Pure / dependency-free so the server can re-derive it later."""
+    return (
+        f"sess:{stream_session_id}:{CANDIDATE_LINE_CROSSING_OBJECT_TYPE}:"
+        f"{line_id}:{track_id}:{int(sequence)}"
+    )
+
+
+@dataclass
+class LineCrossingObjectState:
+    """Per-stream-per-worker dedupe state for per-object line crossings.
+
+    Rising-edge semantics: nvdsanalytics sets a per-object ``lcStatus``
+    label when the object crosses that line. We emit exactly once when a
+    (track, line) label transitions absent → present, and we do NOT
+    re-emit while the label stays present on consecutive sightings
+    (defensive — lcStatus is typically momentary, but some producer
+    versions hold it). The label clearing (object sighted WITHOUT the
+    label) re-arms the pair, so a genuine re-crossing emits again with a
+    bumped sequence.
+
+    Known limitation (documented, accepted): if a track disappears while
+    a label is active and reappears later already carrying the same
+    label, that sighting does not re-emit — we cannot distinguish a
+    re-crossing from a held label across the gap. The aggregate
+    cumulative counter still counts such crossings.
+
+    Memory bound: state is keyed per (track, line) and pruned when the
+    map exceeds ``max_entries`` — entries not seen for
+    ``stale_after_seconds`` are dropped (frame-time based, not
+    wall-clock). A pruned-then-reappearing pair behaves like a fresh
+    track (one emit on its next rising edge); sequences restart, but
+    idempotency keys stay unique in practice because pruning only
+    happens after ``stale_after_seconds`` of absence."""
+
+    stream_session_id: UUID
+    max_entries: int = 4096
+    stale_after_seconds: float = 600.0
+    # (track_id, line_id) -> label active on the most recent sighting.
+    active_by_track_line: dict[tuple[str, str], bool] = field(default_factory=dict)
+    # (track_id, line_id) -> last frame-time the pair was updated.
+    last_seen_by_track_line: dict[tuple[str, str], datetime] = field(default_factory=dict)
+    # (track_id, line_id) -> crossings emitted (idempotency sequence).
+    sequence_by_track_line: dict[tuple[str, str], int] = field(default_factory=dict)
+
+    def absorb_object(
+        self,
+        *,
+        track_id: str,
+        line_labels: set[str] | frozenset[str],
+        known_lines: set[str] | frozenset[str],
+        occurred_at: datetime,
+        class_id: int | None = None,
+        class_label: str | None = None,
+        confidence: float | None = None,
+        analytics_direction_label: str | None = None,
+        source: dict[str, Any] | None = None,
+        debug: dict[str, Any] | None = None,
+    ) -> list[LineCrossingObjectEvent]:
+        """Update crossing state for one tracked object's sighting.
+
+        ``line_labels`` is the object's ``lcStatus`` set for this frame;
+        ``known_lines`` is the frame's full line universe (typically the
+        keys of ``analytics.line_crossing_cumulative``, falling back to
+        ``line_labels`` itself) — pairs in ``known_lines`` but not in
+        ``line_labels`` are cleared (re-armed). Caller is responsible for
+        filtering out objects without a ``tracker_id``."""
+        events: list[LineCrossingObjectEvent] = []
+        for line_id in known_lines | set(line_labels):
+            key = (track_id, line_id)
+            crossing_now = line_id in line_labels
+            was_active = self.active_by_track_line.get(key, False)
+            self.active_by_track_line[key] = crossing_now
+            self.last_seen_by_track_line[key] = occurred_at
+            if not crossing_now or was_active:
+                continue
+            seq = self.sequence_by_track_line.get(key, 0) + 1
+            self.sequence_by_track_line[key] = seq
+            events.append(
+                LineCrossingObjectEvent(
+                    type=CANDIDATE_LINE_CROSSING_OBJECT_TYPE,
+                    stream_session_id=self.stream_session_id,
+                    occurred_at=occurred_at,
+                    line_id=line_id,
+                    line_label=line_id,
+                    track_id=track_id,
+                    sequence=seq,
+                    idempotency_key=build_line_crossing_object_idempotency_key(
+                        stream_session_id=self.stream_session_id,
+                        line_id=line_id,
+                        track_id=track_id,
+                        sequence=seq,
+                    ),
+                    class_id=class_id,
+                    class_label=class_label,
+                    confidence=confidence,
+                    analytics_direction_label=analytics_direction_label,
+                    source=dict(source or {}),
+                    debug=dict(debug or {}),
+                )
+            )
+        self._prune(occurred_at)
+        return events
+
+    def _prune(self, occurred_at: datetime) -> None:
+        if len(self.active_by_track_line) <= self.max_entries:
+            return
+        stale_before = occurred_at - timedelta(seconds=self.stale_after_seconds)
+        for key, last_seen in list(self.last_seen_by_track_line.items()):
+            if last_seen < stale_before:
+                self.active_by_track_line.pop(key, None)
+                self.last_seen_by_track_line.pop(key, None)
+                self.sequence_by_track_line.pop(key, None)
 
 
 # --- ROI occupancy -----------------------------------------------------
