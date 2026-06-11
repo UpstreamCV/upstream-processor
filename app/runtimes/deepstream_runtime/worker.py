@@ -496,9 +496,24 @@ class DeepStreamWorker(Runtime):
         # M7D: single source of truth for the per-object class filter — the
         # resolved APPLIED list ([] = no filter; filter_objects_by_class treats
         # an empty list as "return unchanged"). Per-worker only; no global state.
-        self._selected_classes: tuple[str, ...] = tuple(
-            self._resolved_processing_config.applied.selected_classes
+        # P5-D: when the operator has NOT narrowed classes, the PACKAGE's
+        # declared supported_classes become the filter. Live-found: a COCO-80
+        # detector without this floods the zone/dwell paths with confidence-
+        # flapping background objects (books/tv/chairs) inside the ROI —
+        # 12 zone_entered / 11 dwell_exceeded from furniture in one 190s run.
+        # TrafficCamNet packages declare no supported_classes, so they are
+        # byte-identical to pre-P5-D. The lineage stamp is NOT touched: the
+        # package bound is package metadata, not an operator request.
+        operator_selected = tuple(self._resolved_processing_config.applied.selected_classes)
+        self._selected_classes: tuple[str, ...] = operator_selected or tuple(
+            package.supported_classes
         )
+        # P5-D: single-class packages also narrow the nvdsanalytics AGGREGATE
+        # counts (ROI occupancy / line counters) to that class — the
+        # nvdsanalytics parser accepts exactly one int per section, which is
+        # precisely the person-only people-analytics case. Multi-class and
+        # class-less packages keep the env setting (default "all"), unchanged.
+        self._analytics_class_ids: str = self._package_analytics_class_ids()
         # M7E: single source of truth for the perception-snapshot cadence —
         # the resolved APPLIED fps (1/fps), falling back to the global setting
         # when no fps is applied. Per-worker only (no global Settings
@@ -547,6 +562,22 @@ class DeepStreamWorker(Runtime):
         queue = self._metadata_queue
         if queue is not None:
             queue.close()
+
+    def _package_analytics_class_ids(self) -> str:
+        """The nvdsanalytics ``class-id`` value for this worker: the model's
+        class id when the package declares exactly ONE supported class that
+        the model registry maps (e.g. person → 0 for YOLOX), else the env
+        setting (``deepstream_analytics_class_ids``, default "all")."""
+        classes = self._package.supported_classes
+        if len(classes) != 1:
+            return self._settings.deepstream_analytics_class_ids
+        spec = find_model_by_alias(self._effective_model)
+        if spec is None:
+            return self._settings.deepstream_analytics_class_ids
+        class_id = spec.class_id_map.get(classes[0])
+        if class_id is None:
+            return self._settings.deepstream_analytics_class_ids
+        return str(class_id)
 
     @property
     def _mode(self) -> str:
@@ -599,7 +630,7 @@ class DeepStreamWorker(Runtime):
                 tracker_height=self._settings.deepstream_tracker_height,
                 analytics_enabled=analytics_enabled,
                 analytics_roi_margin_pct=(self._settings.deepstream_analytics_roi_margin_pct),
-                analytics_class_ids=self._settings.deepstream_analytics_class_ids,
+                analytics_class_ids=self._analytics_class_ids,
                 analytics_geometry=analytics_geometry,
                 gpus=self._settings.deepstream_gpus,
                 # M7C: the resolved APPLIED confidence threshold (a float when
@@ -937,7 +968,9 @@ class DeepStreamWorker(Runtime):
             # suppressed". The first three are pre-adapter; the fourth
             # is a P4-D regression. Surface enough of the upstream state
             # in the status payload to triage without re-running.
-            p["analytics_class_ids"] = self._settings.deepstream_analytics_class_ids
+            # P5-D: the EFFECTIVE class filter (package-derived for
+            # single-class packages), not the raw env setting.
+            p["analytics_class_ids"] = self._analytics_class_ids
             p["analytics_roi_margin_pct"] = float(
                 self._settings.deepstream_analytics_roi_margin_pct
             )
