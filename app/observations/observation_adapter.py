@@ -552,14 +552,20 @@ class ZoneTransitionEvent:
     idempotency_key: str
     class_id: int | None = None
     class_label: str | None = None
+    # Side task (workflow condition payload enrichment): the object's
+    # detection confidence in the frame that COMMITTED the transition (the
+    # Nth stable frame). None when the producer didn't have it — omitted
+    # from the payload, never guessed.
+    confidence: float | None = None
     source: dict[str, Any] = field(default_factory=dict)
     debug: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         """Body for the ``payload`` field of ``ObservationPayload``.
-        Optional fields (``class_id`` / ``class_label``) are omitted
-        when None so an analytics frame without classifier metadata
-        doesn't produce ``"class_id": null`` noise."""
+        Optional fields (``class_id`` / ``class_label`` /
+        ``confidence``) are omitted when None so an analytics frame
+        without classifier metadata doesn't produce ``"class_id":
+        null`` noise."""
         body: dict[str, Any] = {
             "zone_id": self.zone_id,
             "zone_label": self.zone_label,
@@ -573,6 +579,8 @@ class ZoneTransitionEvent:
             body["class_id"] = int(self.class_id)
         if self.class_label is not None:
             body["class_label"] = self.class_label
+        if self.confidence is not None:
+            body["confidence"] = round(float(self.confidence), 4)
         return body
 
 
@@ -677,6 +685,7 @@ class ZoneMembershipState:
         occurred_at: datetime,
         class_id: int | None = None,
         class_label: str | None = None,
+        confidence: float | None = None,
         source: dict[str, Any] | None = None,
         debug: dict[str, Any] | None = None,
     ) -> list[ZoneTransitionEvent]:
@@ -760,6 +769,7 @@ class ZoneMembershipState:
                     idempotency_key=idem,
                     class_id=class_id,
                     class_label=class_label,
+                    confidence=confidence,
                     source=dict(source or {}),
                     debug=merged_debug,
                 )
@@ -795,6 +805,13 @@ class DwellEvent:
     idempotency_key: str
     class_id: int | None = None
     class_label: str | None = None
+    # Side task (workflow condition payload enrichment): the object's
+    # detection confidence in the frame that TRIGGERED this event — the
+    # zone-entry commit frame for dwell_started, the tick frame for
+    # dwell_updated / dwell_exceeded. None (omitted from the payload) when
+    # the track wasn't detected in that frame; a stale entry-time value is
+    # never re-stamped onto later events.
+    confidence: float | None = None
     # Only set for ``dwell_updated``; the rolling per-session sequence.
     update_sequence: int | None = None
     # Only set for ``dwell_exceeded``; the threshold that was crossed.
@@ -827,6 +844,8 @@ class DwellEvent:
             body["class_id"] = int(self.class_id)
         if self.class_label is not None:
             body["class_label"] = self.class_label
+        if self.confidence is not None:
+            body["confidence"] = round(float(self.confidence), 4)
         if self.update_sequence is not None:
             body["update_sequence"] = int(self.update_sequence)
         if self.threshold_seconds is not None:
@@ -1008,6 +1027,8 @@ class DwellState:
                     idempotency_key=idem,
                     class_id=zone_event.class_id,
                     class_label=zone_event.class_label,
+                    # Same frame as the committed zone entry — provable.
+                    confidence=zone_event.confidence,
                     source=dict(source or {}),
                     debug=merged_debug,
                 )
@@ -1025,6 +1046,7 @@ class DwellState:
         self,
         *,
         occurred_at: datetime,
+        confidence_by_track: dict[str, float] | None = None,
         source: dict[str, Any] | None = None,
         debug: dict[str, Any] | None = None,
     ) -> list[DwellEvent]:
@@ -1034,8 +1056,15 @@ class DwellState:
         time). Updates come BEFORE the exceeded check inside the same
         tick — operationally identical because both are idempotent
         per session but the order makes the sequence numbering
-        deterministic in tests."""
+        deterministic in tests.
+
+        ``confidence_by_track`` is the CURRENT tick frame's per-track
+        detection confidence (side task: workflow condition payload
+        enrichment). A track absent from the map — e.g. temporarily
+        undetected, which deliberately does NOT close its session —
+        emits with no ``confidence`` field rather than a stale value."""
         events: list[DwellEvent] = []
+        confidences = confidence_by_track or {}
         for (track_id, zone_id), active in list(self.active_dwells.items()):
             duration = (occurred_at - active.started_at).total_seconds()
             since_last = (occurred_at - active.last_update_at).total_seconds()
@@ -1068,6 +1097,7 @@ class DwellState:
                         idempotency_key=idem,
                         class_id=active.class_id,
                         class_label=active.class_label,
+                        confidence=confidences.get(track_id),
                         update_sequence=active.update_sequence,
                         source=dict(source or {}),
                         debug=merged_debug,
@@ -1104,6 +1134,7 @@ class DwellState:
                         idempotency_key=idem_exc,
                         class_id=active.class_id,
                         class_label=active.class_label,
+                        confidence=confidences.get(track_id),
                         threshold_seconds=self.exceeded_threshold_seconds,
                         source=dict(source or {}),
                         debug=merged_debug_exc,
