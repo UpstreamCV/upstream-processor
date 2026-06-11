@@ -63,7 +63,7 @@
       "family": "yolox",
       "task": "object_detection",
       "version": "yolox_s_coco_0.1.1rc0_onnx",
-      "status": "experimental",
+      "status": "probe",
       "license": "Apache-2.0",
       "license_notes": "Apache-2.0 (Megvii YOLOX) — permissive, commercially usable. Artifact is the official prebuilt raw ONNX from the YOLOX 0.1.1rc0 GitHub release (no torch export step). Verify weights provenance/sha256 via scripts/prepare_yolox_model.sh output before promoting to supported.",
       "source": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx",
@@ -247,8 +247,8 @@
         "requires_custom_parser": true,
         "model_artifact_path": "/opt/upstream/models/yolox_s_v1",
         "artifact_subdir": "yolox_s_v1",
-        "known_working_image": null,
-        "blackwell_supported": null
+        "known_working_image": "upstream-deepstream:8.0-pyds-v1.2.2",
+        "blackwell_supported": true
       },
       "input": {
         "width": 640,
@@ -264,7 +264,7 @@
       "gpu_required": true,
       "estimated_cost_weight": 2.0,
       "observation_volume_risk": "high",
-      "notes": "P5-B candidate wired through the pyds metadata path: official raw ONNX + Upstream-authored custom bbox parser (grid decode, strides 8/16/32), FP16 TensorRT engine cached in the host model store. Artifacts are operator-prepared (scripts/prepare_yolox_model.sh) and never committed. Status experimental until live-verified on an Upstream stream; compute/pricing values remain placeholders."
+      "notes": "LIVE-VERIFIED probe (P5-B, 2026-06-11, crowdcountS2 RTX 5070 Ti): official raw ONNX (sha256 c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063) + Upstream custom grid-decode parser through the pyds metadata path on a live h264 1280x720@30 stream — person detected in 1300/1300 frames (conf ~0.93) where TrafficCamNet was unreliable. FP16 TensorRT engine (TRT 10.9) builds in ~222s and is cached in the host model store. Artifacts operator-prepared (scripts/prepare_yolox_model.sh), never committed. Tracker/analytics with YOLOX not yet verified; compute/pricing values remain placeholders."
     },
     {
       "model_id": "yolov8n_v1",

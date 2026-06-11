@@ -2141,15 +2141,18 @@ contract changes. Does NOT prove: tracker/analytics semantics with YOLOX
 preprocessing (DS letterbox pads 0 vs YOLOX's 114 — accepted probe-level
 approximation), INT8, or any customer-facing surface.
 
-### Live verification status
+### Live verification status — PASSED (2026-06-11, crowdcountS2)
 
-Unit/equivalence gates are green (692 tests). Live verification on
-crowdcountS2 (manual probe → supervisor-managed probe with
-`UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_probe.v0`) requires the
-uncommitted tree on the host plus an active validated stream; results are
-recorded in docs/commit-log.md when run. The registry entry stays
-`experimental` until the live run passes, after which it flips to
-`probe` and `known_working_image` / `blackwell_supported` get filled.
+RTX 5070 Ti (Blackwell), TensorRT 10.9, `upstream-deepstream:8.0-pyds-v1.2.2`,
+live h264 1280x720@30 stream. FP16 engine built in ~222s (trtexec, no
+Unsupported SM), cached + deserialized in 0.02s thereafter. Manual probe:
+1300/1300 frames with objects at ~29 fps, **person in every frame
+(conf ~0.93)** — the scene where TrafficCamNet misclassified the operator.
+Supervisor-managed run honored `UPSTREAM_FORCE_PACKAGE_ID` over the
+session's package, posted the full status lifecycle, emitted ZERO
+observations, shut down cleanly, left no containers. `yolox_s_v1` is now
+status `probe`; tracker/analytics with YOLOX remain unverified (next
+milestone).
 
 ### Security / redaction
 
