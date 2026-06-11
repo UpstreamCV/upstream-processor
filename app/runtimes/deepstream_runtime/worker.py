@@ -49,6 +49,7 @@ from app.observations.bridge_queue import BoundedBridgeQueue, DropPolicy
 from app.observations.metadata_models import NeutralFrameMetadata
 from app.observations.observation_adapter import (
     DwellState,
+    LineCrossingObjectState,
     LineCrossingState,
     RoiOccupancyState,
     ZoneMembershipState,
@@ -212,6 +213,7 @@ class _MetadataCounters:
     # querying the api-server.
     observations_emitted: int = 0
     line_crossing_observations_emitted: int = 0
+    line_crossing_object_observations_emitted: int = 0
     # P4-C: ROI occupancy emit counter (parallel to the line-crossing
     # one). Errors increment the shared ``observation_write_errors``
     # counter — the writer error path does not distinguish.
@@ -931,6 +933,9 @@ class DeepStreamWorker(Runtime):
                 p["line_crossing_observations_emitted"] = (
                     counters.line_crossing_observations_emitted
                 )
+                p["line_crossing_object_observations_emitted"] = (
+                    counters.line_crossing_object_observations_emitted
+                )
                 # P4-C: parallel ROI occupancy counter so operators can
                 # tell line vs ROI throughput apart from the status row.
                 p["roi_occupancy_observations_emitted"] = (
@@ -1079,6 +1084,14 @@ class DeepStreamWorker(Runtime):
         observations_enabled = self._mode == _ANALYTICS_MODE and self._writer is not None
         line_state: LineCrossingState | None = (
             LineCrossingState(stream_session_id=self._session.session_id)
+            if observations_enabled
+            else None
+        )
+        # Side task (per-object line crossing): rising-edge per-(track,
+        # line) crossing evidence from lcStatus, emitted ALONGSIDE the
+        # aggregate cumulative-counter events above. Same gate.
+        line_object_state: LineCrossingObjectState | None = (
+            LineCrossingObjectState(stream_session_id=self._session.session_id)
             if observations_enabled
             else None
         )
@@ -1268,6 +1281,13 @@ class DeepStreamWorker(Runtime):
                     await self._emit_line_crossings(
                         frame=frame,
                         line_state=line_state,
+                        source_block=source_block,
+                        counters=counters,
+                    )
+                if line_object_state is not None:
+                    await self._emit_line_crossing_objects(
+                        frame=frame,
+                        line_object_state=line_object_state,
                         source_block=source_block,
                         counters=counters,
                     )
@@ -1583,6 +1603,99 @@ class DeepStreamWorker(Runtime):
             counters.observations_emitted += 1
             counters.line_crossing_observations_emitted += 1
             counters.last_observation_at = event.occurred_at
+
+    # --- side task: per-object line crossing emission ---------------------
+
+    async def _emit_line_crossing_objects(
+        self,
+        *,
+        frame: NeutralFrameMetadata,
+        line_object_state: LineCrossingObjectState,
+        source_block: dict[str, Any],
+        counters: _MetadataCounters,
+    ) -> None:
+        """Per-OBJECT line-crossing evidence, emitted alongside the
+        aggregate cumulative events (``_emit_line_crossings``) for the
+        same frame. Only tracked objects participate — an untracked
+        object's crossing is still counted by the aggregate path, just
+        never attributed. ``known_lines`` is the frame's cumulative
+        counter keys plus the object's own labels, so a label that
+        clears re-arms the (track, line) pair (rising-edge dedupe — see
+        ``LineCrossingObjectState``). Error handling mirrors
+        ``_emit_line_crossings`` exactly."""
+        assert self._writer is not None  # gated by the caller
+        analytics = frame.source.get("analytics") if isinstance(frame.source, dict) else None
+        cumulative = (
+            analytics.get("line_crossing_cumulative") if isinstance(analytics, dict) else None
+        )
+        known_lines: set[str] = (
+            {str(k) for k in cumulative} if isinstance(cumulative, dict) else set()
+        )
+        occurred_at = frame.frame.timestamp or now_utc()
+        for obj in frame.objects:
+            if obj.tracker_id is None:
+                continue
+            obj_analytics = obj.debug.get("analytics") if isinstance(obj.debug, dict) else None
+            if not isinstance(obj_analytics, dict):
+                continue
+            raw_labels = obj_analytics.get("line_labels")
+            line_labels: set[str] = (
+                {str(label) for label in raw_labels if isinstance(label, str)}
+                if isinstance(raw_labels, list)
+                else set()
+            )
+            if not line_labels and not known_lines:
+                # No crossing labels and no line universe — nothing to
+                # emit and nothing to re-arm for this sighting.
+                continue
+            direction_raw = obj_analytics.get("direction")
+            events = line_object_state.absorb_object(
+                track_id=obj.tracker_id,
+                line_labels=line_labels,
+                known_lines=known_lines,
+                occurred_at=occurred_at,
+                class_id=obj.class_id,
+                class_label=obj.label,
+                confidence=obj.confidence,
+                analytics_direction_label=(
+                    direction_raw if isinstance(direction_raw, str) and direction_raw else None
+                ),
+                source=source_block,
+                debug={
+                    "frame_num": int(frame.frame.frame_num),
+                    "geometry_source": "probe_default",
+                },
+            )
+            for event in events:
+                try:
+                    await self._writer.emit(
+                        stream_session_id=self._session.session_id,
+                        obs_type="processor.line_crossing_object",
+                        payload=event.to_payload(),
+                        package_id=self._package.package_id,
+                        observed_at=event.occurred_at,
+                    )
+                except ApiSessionGoneError:
+                    raise
+                except ApiValidationError as exc:
+                    counters.observation_write_errors += 1
+                    _log.error(
+                        "wire contract drift on line_crossing_object emit for %s: %s",
+                        self.session_id,
+                        exc,
+                    )
+                    continue
+                except TRANSIENT_API_ERRORS as exc:
+                    counters.observation_write_errors += 1
+                    _log.warning(
+                        "transient line_crossing_object emit for %s: %s",
+                        self.session_id,
+                        exc,
+                    )
+                    continue
+                counters.observations_emitted += 1
+                counters.line_crossing_object_observations_emitted += 1
+                counters.last_observation_at = event.occurred_at
 
     # --- P4-C: per-frame ROI occupancy emission --------------------------
 
