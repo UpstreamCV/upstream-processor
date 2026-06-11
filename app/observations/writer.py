@@ -8,6 +8,7 @@ the worker's job; the writer just builds + posts and raises typed errors.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -21,6 +22,8 @@ from app.observations.schemas import (
     ObservationResponse,
     ObservationType,
 )
+
+_log = logging.getLogger("upstream_processor.observations.writer")
 
 
 class ObservationWriter:
@@ -52,4 +55,15 @@ class ObservationWriter:
             processor_id=self._processor_id,
             package_id=package_id,
         )
-        return await self._api.post_observation(body)
+        response = await self._api.post_observation(body)
+        # P5-D: one bounded INFO line per accepted observation — the live-
+        # verification evidence trail for which types actually posted.
+        # Observations are debounced/event-driven (never per-frame), so this
+        # cannot flood. No payload contents, no URLs, no secrets.
+        _log.info(
+            "observation posted: type=%s session=%s package=%s",
+            obs_type,
+            stream_session_id,
+            package_id,
+        )
+        return response

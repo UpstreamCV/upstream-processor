@@ -30,7 +30,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -57,11 +57,13 @@ from app.observations.observation_adapter import (
 )
 from app.observations.schemas import EligibleSession
 from app.observations.writer import ObservationWriter
+from app.packages.registries import find_model_by_alias
 from app.packages.resolver import PackageSpec
 from app.perception.builder import build_perception_snapshot
 from app.perception.schemas import PerceptionSnapshotPayload
 from app.processing.class_filter import filter_objects_by_class
 from app.processing.resolver import (
+    DEFAULT_APPLIED,
     ResolvedProcessingConfig,
     resolve_session_processing_config,
 )
@@ -375,6 +377,16 @@ class DeepStreamWorker(Runtime):
         # ``model`` field now reports the registry id (e.g.
         # ``trafficcamnet_v1``) instead of the env alias.
         self._effective_model: str = package.model_id or settings.deepstream_inference_model
+        # P5-D: the canonical registry id of the effective model — used for
+        # the processing-config lineage stamp (``applied.model_key``) and the
+        # status payload's ``model_id``, so a YOLOX worker stamps
+        # ``yolox_s_v1`` and an env alias like ``trafficcamnet`` stamps
+        # ``trafficcamnet_v1``. Falls back to the raw name for models the
+        # registry doesn't know (the lineage then carries what was asked).
+        _model_spec = find_model_by_alias(self._effective_model)
+        self._effective_model_id: str = (
+            _model_spec.model_id if _model_spec is not None else self._effective_model
+        )
         # P4-B: only the analytics mode uses the writer (today, only for
         # ``processor.line_crossing``). decode_probe / inference_probe /
         # metadata_probe / tracker_probe modes ignore it. Optional so unit
@@ -468,6 +480,14 @@ class DeepStreamWorker(Runtime):
         self._resolved_processing_config: ResolvedProcessingConfig = (
             resolve_session_processing_config(
                 session.processing_config,
+                # P5-D: the lineage's APPLIED model is the worker's effective
+                # registry model (package-driven since P5-B), so a YOLOX
+                # worker stamps yolox_s_v1 and an operator request for a
+                # different model is honestly recorded as
+                # model_switch_requested_not_applied. tracker stays at the
+                # static default (the tracker algorithm is not yet
+                # package-driven).
+                defaults=replace(DEFAULT_APPLIED, model_key=self._effective_model_id),
                 confidence_apply_supported=confidence_apply_supported,
                 selected_classes_apply_supported=selected_classes_apply_supported,
                 processing_fps_apply_supported=processing_fps_apply_supported,
@@ -878,6 +898,11 @@ class DeepStreamWorker(Runtime):
             # else the global setting) so a YOLO probe is distinguishable
             # from the TrafficCamNet probes in status evidence.
             "model": self._effective_model,
+            # P5-D: canonical registry component ids for package-readiness
+            # evidence. Bounded scalars only.
+            "model_id": self._effective_model_id,
+            "tracker_profile_id": self._package.tracker_profile_id,
+            "analytics_profile_id": self._package.analytics_profile_id,
             "image": self._settings.deepstream_pyds_image,
             "frames_seen": counters.frames_seen,
             "frames_with_objects": counters.frames_with_objects,

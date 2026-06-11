@@ -4,6 +4,56 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-11 - Processing P5-D: YOLOX Analytics + Package Readiness (implementation; live verification pending)
+
+**Why:** P5-B fixed person detection; P5-D proves the FULL people-
+analytics chain on YOLOX (IOU tracker -> nvdsanalytics -> pyds -> the
+existing line/ROI/zone/dwell adapters -> observations) and readies
+registry/lineage/package metadata for a package assignment API.
+
+**Package:** `deepstream.yolox_analytics_probe.v0` ("People Analytics —
+YOLOX Probe v0"): yolox_s_v1 + deepstream_iou_fast_v1 +
+deepstream_nvdsanalytics_probe_v1, status probe, supported_classes
+[person], outputs = the eight EXISTING API-supported observation types
+(no new taxonomy). Same analytics worker path; only the model plan
+differs. Works with UPSTREAM_FORCE_PACKAGE_ID.
+
+**Package readiness (internal):** PackageSpec gains category / best_for /
+not_recommended_for / setup_complexity (enum) / supported_shapes
+(validated against the analytics profile) / supported_triggers /
+default_target_fps / recommended_confidence_threshold /
+observation_policy / test_mode_safe / production_ready — with an honesty
+gate: production_ready=true is REJECTED unless status is 'supported'.
+Not exposed via api-server; not a catalog.
+
+**Lineage cleanup:** static MODEL_KEY_RUNTIME replaced by
+model_key_runtime_map() derived from the model registry (ids + aliases,
+all statuses) + the mock_detect_v0 static supplement; worker stamps
+applied.model_key from its effective registry model (YOLOX workers stamp
+yolox_s_v1; mismatched operator requests record
+model_switch_requested_not_applied; TrafficCamNet lineage regression-
+pinned). Analytics status payload adds model_id / tracker_profile_id /
+analytics_profile_id. ObservationWriter.emit logs one bounded INFO line
+per accepted observation (live per-type evidence; debounced, no
+payload/URL/secret).
+
+**Honesty cleanup:** deepstream.analytics_probe.v0's stale description
+("no observations", "dashboard geometry later") and empty outputs fixed
+to match P4-B..P4-E / P6-C reality.
+
+**Files:** app/packages/{package_registry.json,resolver.py,
+compatibility.py}, app/processing/resolver.py, app/runtimes/deepstream_
+runtime/worker.py, app/observations/writer.py,
+tests/test_yolox_analytics_package.py (16 tests),
+tests/test_package_resolver.py (honest-outputs pin), docs.
+
+**Checks:** `make test` 708 passed (+16); ruff check/format + `uv run
+mypy app` clean; bash -n clean; git diff --check clean. **Live
+verification pending** (needs commit on host + live stream + operator
+ROI walk-through).
+
+---
+
 ## 2026-06-11 - Processing P5-B: YOLOX DeepStream Probe (LIVE-VERIFIED)
 
 **Why:** TrafficCamNet (the only live-verified model) misclassifies

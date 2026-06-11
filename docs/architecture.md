@@ -2160,3 +2160,91 @@ The raw RTSP URL reaches the container ONLY via the `RTSP_URL` env (PM)
 or temp-file/env (scripts); logs and script output use the redacted form;
 the pyds container never sees the Upstream webhook secret (unchanged
 P2 boundary). Pinned by tests (`tests/test_yolox_probe.py`).
+
+## Processing P5-D — YOLOX Analytics + Package Readiness
+
+### Why this exists
+
+P5-B proved YOLOX-S fixes TrafficCamNet's person misclassification at the
+detector level. P5-D answers the next question — **can YOLOX-S power the
+whole people-analytics chain** (IOU tracker → nvdsanalytics → pyds → the
+existing line/ROI/zone/dwell adapters → observations) — and cleans up the
+registry/lineage seams so the next milestone can be a package assignment
+API.
+
+### Package added
+
+`deepstream.yolox_analytics_probe.v0` — "People Analytics — YOLOX Probe
+v0": `yolox_s_v1` + `deepstream_iou_fast_v1` +
+`deepstream_nvdsanalytics_probe_v1`, runtime `deepstream`, status
+`probe`, `supported_classes: ["person"]`, outputs = the eight EXISTING
+observation types (line_crossing, line_crossing_object, roi_occupancy,
+zone_entered/exited, dwell_started/updated/exceeded — all API-supported
+since P4-B..P4-E; **no new observation types**). Works through the normal
+resolver/compatibility path and `UPSTREAM_FORCE_PACKAGE_ID`. Same
+analytics worker code path as the TrafficCamNet probe — only the
+registry-driven model plan differs (P5-B's host-mounted YOLOX artifacts).
+
+### Package-readiness metadata (internal, NOT a catalog)
+
+`PackageSpec` gains optional readiness fields for the future assignment
+API: `category`, `best_for`, `not_recommended_for`, `setup_complexity`
+(low/medium/high enum), `supported_shapes` (validated ⊆ the analytics
+profile's shapes), `supported_triggers`, `default_target_fps`,
+`recommended_confidence_threshold`, `observation_policy`,
+`test_mode_safe`, `production_ready`. **Honesty gate:**
+`production_ready: true` is rejected unless the package status is
+`supported` — probes can never claim it. Nothing is exposed through
+api-server yet.
+
+### Lineage cleanup
+
+- The static `MODEL_KEY_RUNTIME` map is replaced by
+  `model_key_runtime_map()` — derived from `model_registry.json` (ids AND
+  aliases, every status) plus the one static supplement
+  (`mock_detect_v0` — the mock runtime has no registry entry). Old
+  aliases (`trafficcamnet`, `sample_trafficcamnet`) keep mapping.
+- The worker now stamps `applied.model_key` from its EFFECTIVE registry
+  model (package-driven since P5-B): a YOLOX worker stamps `yolox_s_v1`,
+  and an operator request for a different model is honestly recorded as
+  `model_switch_requested_not_applied`. TrafficCamNet lineage is
+  byte-stable (regression-tested). Tracker stamping unchanged.
+- The analytics status payload now carries `model_id` /
+  `tracker_profile_id` / `analytics_profile_id` (bounded scalars).
+- `ObservationWriter.emit` logs ONE bounded INFO line per accepted
+  observation (type + session + package — no payloads/URLs/secrets);
+  observations are debounced so this cannot flood. This is the live
+  per-type evidence trail.
+
+### Metadata honesty cleanup
+
+`deepstream.analytics_probe.v0`'s description/outputs were stale (claimed
+"no observations" and "dashboard geometry is a later milestone" — both
+false since P4-B/P6-C). Its outputs now list what it actually emits, and
+both analytics packages describe the real geometry behavior
+(operator-saved with probe-default fallback).
+
+### Usage/cost readiness
+
+The YOLOX analytics package carries compute `medium`, pricing
+`free_probe`, target fps 30, recommended confidence 0.4, and the
+profile-level cost weights from P5. Still placeholders — nothing billed,
+nothing wired to api-server. Likely cost drivers: GPU inference (FP16
+YOLOX-S), per-event observation volume (debounced), perception snapshots
+(~1/s).
+
+### What this proves / does not prove
+
+Proves (once live-verified): the full people-analytics chain runs on a
+permissively-licensed detector with reliable person detection, emitting
+ONLY the existing observation taxonomy with bounded volume. Does NOT
+prove: production readiness (explicitly gated off), tracker quality under
+crowding/occlusion (IOU is the only profile), strict-direction line
+semantics (still mode=loose), dwell threshold tuning, or any
+customer-facing selection flow (next milestone).
+
+### Live verification status
+
+PENDING — see docs/commit-log.md for the result when run
+(`UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_analytics_probe.v0` on
+crowdcountS2, operator entering/exiting the ROI and crossing the line).
