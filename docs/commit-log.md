@@ -4,6 +4,42 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-11 - Processing P5-F: Perception Fanout Publisher
+
+**Why:** the coworker-built perception-fanout hot path (sidecar in
+upstream-streaming-server, stream-token mint in upstream-api-server, WS
+client in upstream-dashboard demo-mode) was live-verified end-to-end with
+a synthetic publisher; the missing producer was the processor. This
+milestone makes the analytics worker publish REAL detections at 10-15 Hz.
+
+**What:** `app/perception/fanout_publisher.py` — FanoutPublisher (httpx
+POST per frame to the sidecar's /v1/publish, dedicated
+X-Upstream-Webhook-Secret publish header, never raises, bounded error
+logging) with subscriber-aware cadence: hot (default 12 Hz) while the
+202 responses report watchers, idle (default 0.5 Hz) when nobody watches
+or after errors. Worker integration mirrors the P5-C perception sender
+exactly (second depth-1 coalescing slot + background task + bounded
+drain at teardown) so the fanout can never throttle the frame loop or
+disturb observations; the envelope reuses the SAME
+build_perception_snapshot output as the cold path — geometry rides
+every hot frame (kills the synthetic-test geometry-flashing artifact).
+Analytics mode only; enabled only when UPSTREAM_FANOUT_PUBLISH_URL +
+UPSTREAM_FANOUT_PUBLISH_SECRET are both set (secret never enters the
+DeepStream container). Status payload: fanout_publish_enabled /
+fanout_published_count / fanout_publish_errors_count /
+fanout_subscribers. Cold path (1 Hz api-server POSTs) unchanged.
+
+**Files:** app/perception/fanout_publisher.py (new), app/config.py
+(UPSTREAM_FANOUT_PUBLISH_* settings), app/runtimes/deepstream_runtime/
+worker.py (counters, slot/sender, loop hook, payload),
+tests/test_fanout_publisher.py (11 tests), .env.example,
+docs/architecture.md.
+
+**Checks:** `make test` 724 passed (+11); ruff check/format + `uv run
+mypy app` clean. Live verification recorded below when run.
+
+---
+
 ## 2026-06-11 - Processing P5-D: YOLOX Analytics + Package Readiness (LIVE: partial pass — see below)
 
 **Why:** P5-B fixed person detection; P5-D proves the FULL people-
