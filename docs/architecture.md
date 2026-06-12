@@ -2271,3 +2271,42 @@ require a continuous track across the line) — the remaining suspect is
 **IOU track fragmentation during walking motion**, plus the deliberate
 "track disappearance ≠ zone exit" policy. Tracker profile expansion
 (NvDCF) is the smallest credible fix.
+
+## Processing P5-F — Perception Fanout Publisher
+
+The producer side of the perception-fanout hot path (the sidecar +
+api-server token mint + dashboard WS client live in the other repos; see
+`upstream-streaming-server/docs/perception-fanout.md` for the contract).
+The analytics worker now publishes the SAME perception snapshot the cold
+path stores — same `build_perception_snapshot` output, geometry on every
+frame — to the sidecar's `POST /v1/publish` at a subscriber-aware cadence:
+
+- **hot (`fanout_publish_hz`, default 12)** while the sidecar's 202
+  responses report `subscribers > 0`;
+- **idle (`fanout_publish_idle_hz`, default 0.5)** when nobody is
+  watching or after any error (keeps the last-frame cache warm and the
+  subscriber count fresh — the POST response is HTTP mode's only
+  feedback channel).
+
+Implementation: `app/perception/fanout_publisher.py` (`FanoutPublisher`
+— own httpx client, dedicated `X-Upstream-Webhook-Secret` publish
+header, NEVER raises from `publish`, bounded error logging, errors
+collapse cadence to idle) + a second depth-1 coalescing slot/sender in
+the worker's metadata consumer mirroring the P5-C perception sender, so
+a slow/dead sidecar can never throttle the frame loop or disturb the
+observation paths. Analytics mode only; enabled only when BOTH
+`UPSTREAM_FANOUT_PUBLISH_URL` and `UPSTREAM_FANOUT_PUBLISH_SECRET` are
+set (the secret is the sidecar's dedicated publish credential and never
+enters the DeepStream container — the publisher runs in the worker
+process). Status payload gains `fanout_publish_enabled` /
+`fanout_published_count` / `fanout_publish_errors_count` /
+`fanout_subscribers`.
+
+Cold path unchanged: the ~1 Hz POSTs to the api-server remain the
+durable record and the dashboard's automatic fallback.
+
+Coverage: `tests/test_fanout_publisher.py` — 11 tests (publisher cadence
+/ error tolerance / secret hygiene / envelope contract; worker
+integration incl. geometry-on-every-frame, unreachable-sidecar
+resilience with observations still emitting, and non-analytics modes
+never constructing a publisher).

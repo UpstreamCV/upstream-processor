@@ -24,6 +24,7 @@ MetadataSource, no metadata adapter, no tracking, no nvdsanalytics.**
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -60,6 +61,7 @@ from app.observations.writer import ObservationWriter
 from app.packages.registries import find_model_by_alias
 from app.packages.resolver import PackageSpec
 from app.perception.builder import build_perception_snapshot
+from app.perception.fanout_publisher import FanoutPublisher, build_fanout_envelope
 from app.perception.schemas import PerceptionSnapshotPayload
 from app.processing.class_filter import filter_objects_by_class
 from app.processing.resolver import (
@@ -241,6 +243,11 @@ class _MetadataCounters:
     perception_snapshots_posted: int = 0
     perception_snapshot_write_errors: int = 0
     last_perception_snapshot_at: datetime | None = None
+    # P5-F fanout hot-path counters (mirrors of FanoutPublisher state so
+    # the status payload stays a plain-counters affair).
+    fanout_published: int = 0
+    fanout_publish_errors: int = 0
+    fanout_subscribers: int = 0
 
     def absorb(self, frame: NeutralFrameMetadata) -> None:
         self.frames_seen += 1
@@ -1079,6 +1086,17 @@ class DeepStreamWorker(Runtime):
                     if counters.last_perception_snapshot_at is not None
                     else None
                 )
+            # P5-F: fanout hot-path evidence. ``_enabled`` distinguishes
+            # "not configured" from "configured but nothing published yet".
+            fanout_configured = bool(
+                self._settings.fanout_publish_url
+                and self._settings.fanout_publish_secret is not None
+            )
+            p["fanout_publish_enabled"] = fanout_configured
+            if fanout_configured:
+                p["fanout_published_count"] = counters.fanout_published
+                p["fanout_publish_errors_count"] = counters.fanout_publish_errors
+                p["fanout_subscribers"] = counters.fanout_subscribers
         if last_app_summary is not None:
             p["app_summary"] = last_app_summary
         return p
@@ -1249,9 +1267,27 @@ class DeepStreamWorker(Runtime):
         perception_enabled = (
             self._mode == _ANALYTICS_MODE and self._settings.perception_snapshot_enabled
         )
+        # P5-F: the fanout hot path is analytics-mode-only like the cold
+        # path, enabled only when BOTH url + secret are configured. It
+        # reuses the same snapshot builder/geometry so the dashboard's one
+        # renderer serves both paths (and geometry rides EVERY hot frame).
+        fanout_publisher: FanoutPublisher | None = None
+        if (
+            self._mode == _ANALYTICS_MODE
+            and self._settings.fanout_publish_url
+            and self._settings.fanout_publish_secret is not None
+        ):
+            fanout_publisher = FanoutPublisher(
+                url=self._settings.fanout_publish_url,
+                secret=self._settings.fanout_publish_secret.get_secret_value(),
+                hot_interval_seconds=1.0 / max(self._settings.fanout_publish_hz, 0.1),
+                idle_interval_seconds=1.0 / max(self._settings.fanout_publish_idle_hz, 0.01),
+                timeout_seconds=self._settings.fanout_publish_timeout_seconds,
+            )
         perception_geometry: dict[str, Any] = (
             self._resolved_geometry.geometry.to_json()
-            if perception_enabled and self._resolved_geometry is not None
+            if (perception_enabled or fanout_publisher is not None)
+            and self._resolved_geometry is not None
             else {}
         )
 
@@ -1272,6 +1308,30 @@ class DeepStreamWorker(Runtime):
         perception_slot: dict[str, Any] = {"pending": None, "fatal": None}
         perception_wakeup = asyncio.Event()
         perception_stop = asyncio.Event()
+
+        # P5-F: the fanout sender mirrors the perception sender exactly —
+        # depth-1 coalescing slot, background task, drain-then-exit — so a
+        # slow/dead sidecar can never throttle the frame loop. Unlike the
+        # perception sender there is no fatal relay: fanout failures are
+        # best-effort by contract (publisher counts + drops to idle cadence).
+        fanout_slot: dict[str, Any] = {"pending": None}
+        fanout_wakeup = asyncio.Event()
+        fanout_stop = asyncio.Event()
+
+        async def _fanout_sender() -> None:
+            assert fanout_publisher is not None  # gated at task creation
+            while True:
+                await fanout_wakeup.wait()
+                fanout_wakeup.clear()
+                envelope = fanout_slot["pending"]
+                fanout_slot["pending"] = None
+                if envelope is not None:
+                    await fanout_publisher.publish(envelope)  # never raises
+                    counters.fanout_published = fanout_publisher.published
+                    counters.fanout_publish_errors = fanout_publisher.errors
+                    counters.fanout_subscribers = fanout_publisher.subscribers
+                if fanout_stop.is_set() and fanout_slot["pending"] is None:
+                    return
 
         async def _perception_sender() -> None:
             while True:
@@ -1337,6 +1397,7 @@ class DeepStreamWorker(Runtime):
         async def _consumer() -> None:
             last_proc_post = 0.0
             last_perception_post = 0.0
+            last_fanout_post = 0.0
             attached = False
             processing = False
             async for frame in source:
@@ -1413,6 +1474,31 @@ class DeepStreamWorker(Runtime):
                             # overwritten by this fresher one.
                             perception_slot["pending"] = payload
                             perception_wakeup.set()
+                # P5-F: fanout hot path. Same snapshot builder, separate
+                # coalescing slot, dynamic cadence: 1/hot_hz while the
+                # sidecar reports watchers, 1/idle_hz otherwise (the
+                # publisher owns that decision). Placed AFTER the
+                # observation emits + cold-path snapshot so a fanout
+                # problem can never disturb either.
+                if fanout_publisher is not None:
+                    now_mono = time.monotonic()
+                    if now_mono - last_fanout_post >= fanout_publisher.interval_seconds:
+                        last_fanout_post = now_mono
+                        payload = self._build_perception_payload(
+                            frame=frame,
+                            geometry=perception_geometry,
+                            counters=counters,
+                        )
+                        if payload is not None:
+                            fanout_slot["pending"] = build_fanout_envelope(
+                                camera_id=str(self._session.camera_id),
+                                stream_session_id=str(payload.stream_session_id),
+                                processor_id=payload.processor_id,
+                                package_id=payload.package_id,
+                                observed_at_iso=payload.observed_at.isoformat(),
+                                snapshot=payload.snapshot,
+                            )
+                            fanout_wakeup.set()
                 if not attached:
                     attached = True
                     self._state = WorkerState.ATTACHED
@@ -1454,6 +1540,9 @@ class DeepStreamWorker(Runtime):
         # The background perception sender runs alongside (not inside the
         # gather: it idles until the consumer ends, then is drained below).
         sender_task = asyncio.create_task(_perception_sender()) if perception_enabled else None
+        fanout_task = (
+            asyncio.create_task(_fanout_sender()) if fanout_publisher is not None else None
+        )
         try:
             results = await asyncio.gather(_reader(), _consumer(), return_exceptions=True)
             for r in results:
@@ -1475,6 +1564,20 @@ class DeepStreamWorker(Runtime):
                     )
                 except TimeoutError:
                     sender_task.cancel()
+            # P5-F: same drain-then-close for the fanout sender; then close
+            # the publisher's HTTP client. Best-effort end to end.
+            if fanout_task is not None:
+                fanout_stop.set()
+                fanout_wakeup.set()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(fanout_task), timeout=_PERCEPTION_FLUSH_TIMEOUT
+                    )
+                except TimeoutError:
+                    fanout_task.cancel()
+            if fanout_publisher is not None:
+                with contextlib.suppress(Exception):
+                    await fanout_publisher.aclose()
             try:
                 await asyncio.shield(
                     self._finalize_metadata_probe(

@@ -263,6 +263,26 @@ class Settings(BaseSettings):
     # size; ``debug.objects_seen`` still reports the true count.
     perception_snapshot_max_objects: int = 50
 
+    # --- P5-F perception-fanout hot path ------------------------------
+    # Best-effort high-rate publishing of the SAME perception snapshot to
+    # the perception-fanout WS sidecar (upstream-streaming-server) so the
+    # dashboard overlay can render detections at 10-15 Hz. Disabled unless
+    # BOTH url + secret are set. The cold path (1 Hz POSTs to the
+    # api-server) is unchanged and remains the durable record; the fanout
+    # is ephemeral and lossy by design. The publish secret is the
+    # SIDECAR's dedicated UPSTREAM_FANOUT_PUBLISH_SECRET — deliberately
+    # NOT the api-server webhook secret — and never enters the DeepStream
+    # container (the publisher runs in this worker process).
+    fanout_publish_url: str = ""
+    fanout_publish_secret: SecretStr | None = None
+    # Hot cadence while the sidecar reports subscribers > 0 (the sidecar's
+    # contract asks for 10-15 Hz); idle cadence while nobody is watching
+    # (keeps the sidecar's last-frame cache warm and the subscriber count
+    # fresh — the POST response is the only feedback channel).
+    fanout_publish_hz: float = 12.0
+    fanout_publish_idle_hz: float = 0.5
+    fanout_publish_timeout_seconds: float = 2.0
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
