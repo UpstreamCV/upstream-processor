@@ -36,7 +36,23 @@ tests/test_fanout_publisher.py (11 tests), .env.example,
 docs/architecture.md.
 
 **Checks:** `make test` 724 passed (+11); ruff check/format + `uv run
-mypy app` clean. Live verification recorded below when run.
+mypy app` clean.
+
+**Live verification (crowdcountS2 + local dashboard rig, 2026-06-11):**
+foreground processor, yolox analytics package, fanout pointed at the
+coworker's deployed sidecar (localhost). 313 frames published, ZERO
+fanout errors, 19 real observations posted concurrently (paths coexist).
+Subscriber-aware throttle proven both directions: ~0.5 Hz idle before
+the browser subscribed, hot when it did, idle again after disconnect.
+Operator-confirmed on the local dashboard: real YOLOX person boxes
+rendering smoothly, ROI + lines steady (geometry on every frame — the
+synthetic-test flashing is gone), "Live stream connected" chip.
+**Finding:** measured hot rate ~6 Hz vs the 12 Hz target — observation
+emits are awaited INLINE in the frame loop (P4 ordering), and each
+~100-300 ms api round-trip gates the publish check during active
+scenes. Follow-up candidate: move observation emits to their own
+background sender (touches P4 ordering semantics — own milestone).
+Also noted: httpx INFO request logs are chatty at fanout rates.
 
 ---
 

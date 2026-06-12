@@ -2310,3 +2310,13 @@ Coverage: `tests/test_fanout_publisher.py` — 11 tests (publisher cadence
 integration incl. geometry-on-every-frame, unreachable-sidecar
 resilience with observations still emitting, and non-analytics modes
 never constructing a publisher).
+
+### P5-F live verification — PASSED (2026-06-11)
+
+313 publishes / 0 errors against the deployed sidecar with 19 real
+observations posting concurrently; idle→hot→idle throttle confirmed via
+the sidecar's subscriber counts; operator-confirmed smooth real-person
+boxes with steady geometry on the dashboard WS hot path. Known finding:
+hot rate measured ~6 Hz (target 12) because observation emits are
+awaited inline in the frame loop — moving emits to a background sender
+is the follow-up that unlocks the full rate.
