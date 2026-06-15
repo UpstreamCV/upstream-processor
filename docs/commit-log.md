@@ -4,6 +4,59 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-15 - Processing P5-E: Tracker Profile Expansion / NvDCF Package Probe
+
+**Why:** P5-D live testing showed strong YOLOX-S person detection but the IOU
+tracker fragments track IDs during walking motion, which suppressed the four
+per-track events (`zone_exited`, `line_crossing`, `line_crossing_object`,
+`dwell_exceeded`). The codebase's own diagnosis named tracker profile
+expansion (NvDCF) as "the smallest credible fix." This milestone makes the
+running tracker package-driven and adds an NvDCF-backed YOLOX analytics package
+beside the IOU one for an A/B comparison — all `experimental`, promoted to
+`probe` only after live GPU verification. (Note: the registry previously
+attributed this work to "P5-C", which already named the 2026-05-21
+perception-snapshot milestone; it is now labelled **P5-E**.)
+
+**What:**
+- Registry/data only: promoted `deepstream_nvdcf_balanced_v1` from
+  `planned`/empty to `experimental` with authored ReID-free DS 8.0 NvDCF
+  *perf*-style ll-config settings (BaseConfig / TargetManagement /
+  TrajectoryManagement / DataAssociator / StateEstimator / VisualTracker /
+  ReID:reidType=0). Added package `deepstream.yolox_analytics_nvdcf_probe.v0`
+  (`yolox_s_v1` + `deepstream_nvdcf_balanced_v1` +
+  `deepstream_nvdsanalytics_probe_v1`, person-only, `status: experimental`,
+  `production_ready: false`) beside the IOU `deepstream.yolox_analytics_probe.v0`.
+- Runtime: `build_tracker_config` / `render_tracker_ll_config` were already
+  generic, so NvDCF renders with no rendering-code change. The real change is
+  **package-driven tracker selection**: `find_runnable_deepstream_tracker_by_profile_id`
+  (new, in `registries.py`) + the worker deriving
+  `_effective_tracker_algorithm` / lib / width / height from
+  `package.tracker_profile_id` (mirroring the package-driven model), threaded
+  into the process manager and stamped onto the status payload, observation
+  source block, and `applied.tracker` lineage. Fallback to the global setting
+  only when no profile is declared; **fail closed** (no silent IOU fallback)
+  when a declared profile is not runnable.
+- Tests: updated the three guardrail tests that asserted NvDCF was
+  non-runnable; added NvDCF render/structural/round-trip + a new
+  `test_yolox_analytics_nvdcf_package.py` (resolution, PM renders NvDCF YAML,
+  package-driven selection, lineage/status report `nvdcf`, IOU regression, and
+  a fail-closed case). 747 tests pass, mypy + ruff clean.
+- Probe tooling: `scripts/_tracker_ab_helpers.py` (pure, testable) +
+  `scripts/compare_tracker_ab.py` (CLI) + `scripts/probe_tracker_ab.sh`
+  (real-worker A/B driver, redaction-clean, `CONFIRM_RUN`-gated) with
+  `tests/test_tracker_ab_probe.py`. Runbook + smoke checklist + promotion
+  criteria in `docs/local-dev.md`.
+
+**Promotion gate (stay experimental until met, live on crowdcountS2):** stable
+startup; YOLOX detection preserved; measurably better track continuity than
+IOU; `line_crossing` + `line_crossing_object` fire; `zone_exited` reachable;
+`dwell_exceeded` from a real walker (or limitation documented); no observation
+flood; acceptable FPS/VRAM; no RTSP/secret leakage. NvDCF on Blackwell sm_120
+is unverified until then, and the authored NvDCF tunables must be reconciled
+against the in-container DS 8.0 sample during the live run.
+
+---
+
 ## 2026-06-11 - Processing P5-F: Perception Fanout Publisher
 
 **Why:** the coworker-built perception-fanout hot path (sidecar in

@@ -58,7 +58,11 @@ from app.observations.observation_adapter import (
 )
 from app.observations.schemas import EligibleSession
 from app.observations.writer import ObservationWriter
-from app.packages.registries import find_model_by_alias
+from app.packages.registries import (
+    find_model_by_alias,
+    find_runnable_deepstream_tracker_by_profile_id,
+    load_tracker_registry,
+)
 from app.packages.resolver import PackageSpec
 from app.perception.builder import build_perception_snapshot
 from app.perception.fanout_publisher import FanoutPublisher, build_fanout_envelope
@@ -394,6 +398,54 @@ class DeepStreamWorker(Runtime):
         self._effective_model_id: str = (
             _model_spec.model_id if _model_spec is not None else self._effective_model
         )
+        # P5-E: the running tracker is now PACKAGE-DRIVEN, mirroring the
+        # package-driven model above. When the package declares a
+        # ``tracker_profile_id`` we derive the algorithm + ll-lib / width /
+        # height from the resolved registry profile; the global
+        # ``deepstream_tracker_algorithm`` setting is only a fallback for
+        # packages that declare no tracker profile. Resolution is restart-time
+        # only, like the model. The IOU packages declare
+        # ``deepstream_iou_fast_v1`` whose registry values equal the Settings
+        # defaults, so their rendered tracker_config.yml is byte-identical.
+        _tracker_spec = (
+            find_runnable_deepstream_tracker_by_profile_id(package.tracker_profile_id)
+            if package.tracker_profile_id is not None
+            else None
+        )
+        if _tracker_spec is not None:
+            _ds = _tracker_spec.deepstream
+            self._effective_tracker_algorithm: str = _tracker_spec.algorithm
+            self._effective_tracker_lib_path: str = _ds.get(
+                "ll_lib_path_default", settings.deepstream_tracker_lib_path
+            )
+            self._effective_tracker_width: int = int(
+                _ds.get("tracker_width", settings.deepstream_tracker_width)
+            )
+            self._effective_tracker_height: int = int(
+                _ds.get("tracker_height", settings.deepstream_tracker_height)
+            )
+        elif package.tracker_profile_id is not None:
+            # Declared but NOT runnable (non-runnable status / no authored
+            # settings). The resolver already gates status, so this is a
+            # defensive belt-and-suspenders for an empty-settings profile. Fail
+            # CLOSED: keep the declared profile's algorithm so
+            # ``build_tracker_config`` raises clearly at process start (the
+            # worker then posts ``failed``) rather than silently running IOU.
+            _raw = load_tracker_registry().get(package.tracker_profile_id)
+            self._effective_tracker_algorithm = (
+                _raw.algorithm if _raw is not None else package.tracker_profile_id
+            )
+            self._effective_tracker_lib_path = settings.deepstream_tracker_lib_path
+            self._effective_tracker_width = settings.deepstream_tracker_width
+            self._effective_tracker_height = settings.deepstream_tracker_height
+        else:
+            # No package tracker profile: global Settings fallback (the
+            # pre-P5-E behavior; used by tracker-disabled / profile-less
+            # packages).
+            self._effective_tracker_algorithm = settings.deepstream_tracker_algorithm
+            self._effective_tracker_lib_path = settings.deepstream_tracker_lib_path
+            self._effective_tracker_width = settings.deepstream_tracker_width
+            self._effective_tracker_height = settings.deepstream_tracker_height
         # P4-B: only the analytics mode uses the writer (today, only for
         # ``processor.line_crossing``). decode_probe / inference_probe /
         # metadata_probe / tracker_probe modes ignore it. Optional so unit
@@ -491,10 +543,19 @@ class DeepStreamWorker(Runtime):
                 # registry model (package-driven since P5-B), so a YOLOX
                 # worker stamps yolox_s_v1 and an operator request for a
                 # different model is honestly recorded as
-                # model_switch_requested_not_applied. tracker stays at the
-                # static default (the tracker algorithm is not yet
-                # package-driven).
-                defaults=replace(DEFAULT_APPLIED, model_key=self._effective_model_id),
+                # model_switch_requested_not_applied.
+                # P5-E: the APPLIED tracker is now the worker's effective
+                # tracker algorithm (package-driven), so it reflects what
+                # actually runs (iou for the IOU packages, nvdcf for the NvDCF
+                # package) instead of the static "iou" default. An operator
+                # tracker request that diverges is still recorded as
+                # tracker_requested_not_applied (tracker stays package-driven,
+                # not operator-applied).
+                defaults=replace(
+                    DEFAULT_APPLIED,
+                    model_key=self._effective_model_id,
+                    tracker=self._effective_tracker_algorithm,
+                ),
                 confidence_apply_supported=confidence_apply_supported,
                 selected_classes_apply_supported=selected_classes_apply_supported,
                 processing_fps_apply_supported=processing_fps_apply_supported,
@@ -631,10 +692,13 @@ class DeepStreamWorker(Runtime):
                 width=self._session.approved.width,
                 height=self._session.approved.height,
                 tracker_enabled=tracker_enabled,
-                tracker_algorithm=self._settings.deepstream_tracker_algorithm,
-                tracker_lib_path=self._settings.deepstream_tracker_lib_path,
-                tracker_width=self._settings.deepstream_tracker_width,
-                tracker_height=self._settings.deepstream_tracker_height,
+                # P5-E: package-driven tracker (see __init__). Falls back to the
+                # global Settings values only when the package declares no
+                # tracker profile.
+                tracker_algorithm=self._effective_tracker_algorithm,
+                tracker_lib_path=self._effective_tracker_lib_path,
+                tracker_width=self._effective_tracker_width,
+                tracker_height=self._effective_tracker_height,
                 analytics_enabled=analytics_enabled,
                 analytics_roi_margin_pct=(self._settings.deepstream_analytics_roi_margin_pct),
                 analytics_class_ids=self._analytics_class_ids,
@@ -955,7 +1019,7 @@ class DeepStreamWorker(Runtime):
         }
         if tracker_enabled:
             p["tracker_enabled"] = True
-            p["tracker_algorithm"] = self._settings.deepstream_tracker_algorithm
+            p["tracker_algorithm"] = self._effective_tracker_algorithm
             p["unique_tracker_ids_count"] = len(counters.unique_tracker_ids)
             p["tracker_ids_sample"] = list(counters.tracker_ids_sample)
         if analytics_enabled:
@@ -1234,7 +1298,7 @@ class DeepStreamWorker(Runtime):
         source_block: dict[str, Any] = (
             deepstream_source_block(
                 package_id=self._package.package_id,
-                tracker_algorithm=self._settings.deepstream_tracker_algorithm,
+                tracker_algorithm=self._effective_tracker_algorithm,
                 # P6-C: stamp every emitted line-crossing / ROI observation
                 # with the geometry lineage so downstream consumers can
                 # correlate counts back to a specific dashboard save.
@@ -1636,7 +1700,7 @@ class DeepStreamWorker(Runtime):
                 runtime="deepstream",
                 metadata_source="pyds_pad_probe",
                 analytics_plugin="nvdsanalytics",
-                tracker_algorithm=self._settings.deepstream_tracker_algorithm,
+                tracker_algorithm=self._effective_tracker_algorithm,
                 observed_at=observed_at,
                 max_objects=self._settings.perception_snapshot_max_objects,
                 # M8: stamp the SAME requested-vs-applied lineage carried on

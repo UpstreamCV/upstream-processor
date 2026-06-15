@@ -1059,3 +1059,77 @@ uv run python -m app.main
 # status payload shows mode=metadata_probe model=yolox_s_v1; expect
 # label_counts.person, zero observation POSTs, clean stopped status.
 ```
+
+## P5-E — IOU vs NvDCF tracker A/B (GPU host)
+
+Compares the two YOLOX analytics packages on the SAME scene via the real
+worker path (the standalone pyds probe has no nvtracker, so it is not used):
+
+- `deepstream.yolox_analytics_probe.v0` — YOLOX-S + **IOU**
+- `deepstream.yolox_analytics_nvdcf_probe.v0` — YOLOX-S + **NvDCF** (P5-E,
+  `experimental`)
+
+Tracker selection is package-driven: forcing the package id is enough to
+switch the running tracker (no `UPSTREAM_DEEPSTREAM_TRACKER_ALGORITHM` needed).
+Prereq: the YOLOX artifacts are prepared (P5-B) and a validated session is
+active. Stop the systemd processor first so two supervisors don't grab the
+session, and source your processor secret env.
+
+### Driver (recommended)
+
+```sh
+# Source secret env first (UPSTREAM_PROCESSOR_WEBHOOK_SECRET, API base, etc.)
+CONFIRM_RUN=1 PROBE_SECONDS=180 scripts/probe_tracker_ab.sh
+# Runs the worker once per package, captures each REDACTED processor log, and
+# prints a side-by-side comparison via scripts/compare_tracker_ab.py.
+```
+
+Without `CONFIRM_RUN=1` the driver refuses to launch (it starts the real
+supervisor and posts to the API). The captured logs are redacted; the RTSP URL
+is never an argument.
+
+### Manual equivalent (two passes)
+
+```sh
+# Pass A (IOU baseline):
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_analytics_probe.v0 \
+  timeout -s INT 190 uv run python -m app.main 2>&1 | \
+  sed -E 's#(rtsp://[^/ ]*/)[A-Za-z0-9_.:-]+#\1sess_<redacted>#g' > /tmp/ab_iou.log
+# Pass B (NvDCF):
+UPSTREAM_FORCE_PACKAGE_ID=deepstream.yolox_analytics_nvdcf_probe.v0 \
+  timeout -s INT 190 uv run python -m app.main 2>&1 | \
+  sed -E 's#(rtsp://[^/ ]*/)[A-Za-z0-9_.:-]+#\1sess_<redacted>#g' > /tmp/ab_nvdcf.log
+# Compare (status-level tracker metrics + any captured event lines):
+scripts/compare_tracker_ab.py iou /tmp/ab_iou.log nvdcf /tmp/ab_nvdcf.log
+```
+
+For an event-level A/B, append each run's observation rows (one JSON object
+per line — from the API/DB the worker POSTs to) to the capture files before
+comparing; `compare_tracker_ab.py` aggregates status, observation, and
+perception-snapshot records.
+
+### Smoke checklist (walk a person in/out, perpendicular to the line)
+
+- track-ID stability: NvDCF fewer unique IDs / longer persistence / lower
+  `track_id_switch_proxy` than IOU on the same scene
+- `zone_entered` (regression — must still fire)
+- `zone_exited` from a real walker leaving the zone (unproven under IOU)
+- `line_crossing` increments on a perpendicular crossing (NOT parallel)
+- `line_crossing_object` emits with a stable `track_id`
+- `dwell_exceeded` from a real dwelling person (only "mechanical" before)
+- ROI occupancy stable (no flapping)
+- no observation flood; clean `starting → attached → processing → stopped`,
+  restart re-resolves the package
+- FPS/VRAM acceptable on the RTX 5070 Ti; no RTSP/secret leakage in logs
+
+### Promotion (experimental → probe)
+
+Promote `deepstream_nvdcf_balanced_v1` AND
+`deepstream.yolox_analytics_nvdcf_probe.v0` only after the checklist passes
+live. Reconcile the authored NvDCF ll-config tunables against the in-container
+DS 8.0 `config_tracker_NvDCF_perf.yml` during this run. Two deliberate design
+policies independently cap `zone_exited` / `dwell_exceeded` recall regardless
+of tracker — "track disappearance ≠ zone exit" (P4-D) and "disappearance ≠
+close dwell session" (P4-E) — so if either event stays weak after NvDCF,
+document the limitation rather than forcing a pass. Never `supported` without a
+separate license + deployment review (`production_ready` stays `false`).

@@ -25,16 +25,19 @@ from app.packages.compatibility import (
     validate_package_compatibility,
 )
 from app.packages.registries import (
+    find_runnable_deepstream_tracker_by_profile_id,
     load_analytics_registry,
     load_model_registry,
     load_tracker_registry,
     parse_analytics_registry,
     parse_model_registry,
     parse_tracker_registry,
+    runnable_deepstream_tracker_algorithms,
 )
 from app.packages.resolver import PackageSpec, resolve
 from app.runtimes.deepstream_runtime.inference import (
     build_tracker_config,
+    render_tracker_ll_config,
     resolve_model_dir,
 )
 
@@ -149,13 +152,20 @@ def test_model_registry_loads_with_expected_entries() -> None:
 def test_tracker_registry_loads_with_expected_entries() -> None:
     registry = load_tracker_registry()
     iou = registry["deepstream_iou_fast_v1"]
-    assert iou.status == "probe"  # the only live-verified tracker
+    assert iou.status == "probe"  # the only LIVE-verified tracker
     assert iou.algorithm == "iou"
     assert iou.settings  # authored, runnable config
-    # NvDCF / NvSORT are planned-only: no authored settings, never runnable.
-    for planned in ("deepstream_nvdcf_balanced_v1", "deepstream_nvsort_fast_v1"):
-        assert registry[planned].status == "planned"
-        assert registry[planned].settings == {}
+    # P5-E: NvDCF is now authored + runnable (experimental until live A/B), but
+    # NOT yet probe — it has authored ll-config settings and a runnable status.
+    nvdcf = registry["deepstream_nvdcf_balanced_v1"]
+    assert nvdcf.status == "experimental"
+    assert nvdcf.algorithm == "nvdcf"
+    assert nvdcf.settings  # authored ll-config
+    assert nvdcf.requires_reid is False  # ReID-free perf profile
+    # NvSORT is still planned-only: no authored settings, never runnable.
+    nvsort = registry["deepstream_nvsort_fast_v1"]
+    assert nvsort.status == "planned"
+    assert nvsort.settings == {}
 
 
 def test_analytics_registry_loads_and_outputs_are_known_types() -> None:
@@ -238,7 +248,13 @@ _ALL_PACKAGES = (
     "deepstream.metadata_probe.v0",
     "deepstream.tracker_probe.v0",
     "deepstream.analytics_probe.v0",
+    "deepstream.yolox_probe.v0",
+    "deepstream.yolox_analytics_probe.v0",
 )
+
+# P5-E: experimental packages resolve too, but carry a non-probe status (they
+# are runnable-but-unverified until live A/B promotes them).
+_EXPERIMENTAL_PACKAGES = ("deepstream.yolox_analytics_nvdcf_probe.v0",)
 
 
 @pytest.mark.parametrize("package_id", _ALL_PACKAGES)
@@ -247,6 +263,15 @@ def test_every_shipped_package_resolves(package_id: str) -> None:
     assert spec.package_id == package_id
     assert spec.status == "probe"
     assert spec.pricing_tier == "free_probe"
+
+
+@pytest.mark.parametrize("package_id", _EXPERIMENTAL_PACKAGES)
+def test_experimental_packages_resolve_but_are_not_probe(package_id: str) -> None:
+    spec = resolve(package_id)
+    assert spec.package_id == package_id
+    assert spec.status == "experimental"
+    assert spec.pricing_tier == "free_probe"
+    assert spec.production_ready is False
 
 
 def test_shipped_package_registry_references() -> None:
@@ -260,6 +285,16 @@ def test_shipped_package_registry_references() -> None:
     assert analytics_pkg.model_id == "trafficcamnet_v1"
     assert analytics_pkg.tracker_profile_id == "deepstream_iou_fast_v1"
     assert analytics_pkg.analytics_profile_id == "deepstream_nvdsanalytics_probe_v1"
+    # P5-E: the NvDCF variant sits beside the IOU YOLOX analytics package and
+    # differs ONLY in the tracker profile.
+    iou_yolox = resolve("deepstream.yolox_analytics_probe.v0")
+    nvdcf_yolox = resolve("deepstream.yolox_analytics_nvdcf_probe.v0")
+    assert iou_yolox.tracker_profile_id == "deepstream_iou_fast_v1"
+    assert nvdcf_yolox.tracker_profile_id == "deepstream_nvdcf_balanced_v1"
+    assert nvdcf_yolox.model_id == iou_yolox.model_id == "yolox_s_v1"
+    assert nvdcf_yolox.analytics_profile_id == iou_yolox.analytics_profile_id
+    assert nvdcf_yolox.outputs == iou_yolox.outputs
+    assert nvdcf_yolox.supported_classes == ("person",)
 
 
 def _pkg(**overrides: Any) -> PackageSpec:
@@ -385,11 +420,13 @@ def test_planned_components_are_never_referencable() -> None:
     # or a planned tracker profile.
     with pytest.raises(RegistryValidationError, match="status 'planned'"):
         validate_package_compatibility(_pkg(model_id="yolov8n_v1"))
+    # P5-E: NvDCF is no longer planned (it is referencable); NvSORT is still
+    # the planned, artifact-less tracker that must never be bundled.
     with pytest.raises(RegistryValidationError, match="status 'planned'"):
         validate_package_compatibility(
             _pkg(
                 model_id="trafficcamnet_v1",
-                tracker_profile_id="deepstream_nvdcf_balanced_v1",
+                tracker_profile_id="deepstream_nvsort_fast_v1",
             )
         )
 
@@ -447,9 +484,51 @@ def test_iou_tracker_config_is_byte_identical_to_pre_p5() -> None:
 
 
 def test_planned_tracker_algorithms_rejected_like_unknown() -> None:
-    for algo in ("nvdcf", "nvsort", "definitely-not-real"):
+    # P5-E: nvdcf is now runnable, so only nvsort (still planned) and unknown
+    # names are rejected like unknown algorithms.
+    for algo in ("nvsort", "definitely-not-real"):
         with pytest.raises(ValueError, match="unknown deepstream tracker algorithm"):
             build_tracker_config(algo)
+
+
+def test_nvdcf_is_runnable_and_renders_required_sections() -> None:
+    # P5-E: nvdcf is now a runnable algorithm alongside iou.
+    assert runnable_deepstream_tracker_algorithms() == ["iou", "nvdcf"]
+    body = build_tracker_config("nvdcf")
+    # nvtracker requires the %YAML:1.0 marker; the NvDCF perf profile adds the
+    # StateEstimator + VisualTracker sections on top of the IOU-style base.
+    assert body.startswith("%YAML:1.0\n")
+    for section in (
+        "BaseConfig:",
+        "TargetManagement:",
+        "TrajectoryManagement:",
+        "DataAssociator:",
+        "StateEstimator:",
+        "VisualTracker:",
+        "ReID:",
+    ):
+        assert section in body
+    assert "visualTrackerType: 1" in body  # NvDCF discriminative-correlation
+    assert "reidType: 0" in body  # ReID-free
+    assert "\t" not in body  # YAML is whitespace-sensitive
+
+
+def test_nvdcf_tracker_config_renders_registry_settings_verbatim() -> None:
+    # The builder is generic/data-driven: build_tracker_config("nvdcf") must be
+    # exactly render_tracker_ll_config of the registry profile's settings (no
+    # per-algorithm branching). This pins the rendering without committing to a
+    # fragile hand-authored golden before live verification.
+    nvdcf = load_tracker_registry()["deepstream_nvdcf_balanced_v1"]
+    assert build_tracker_config("nvdcf") == render_tracker_ll_config(nvdcf.settings)
+
+
+def test_nvdcf_resolvable_by_profile_id() -> None:
+    spec = find_runnable_deepstream_tracker_by_profile_id("deepstream_nvdcf_balanced_v1")
+    assert spec is not None
+    assert spec.algorithm == "nvdcf"
+    # NvSORT is planned (no settings) → not runnable by profile id either.
+    assert find_runnable_deepstream_tracker_by_profile_id("deepstream_nvsort_fast_v1") is None
+    assert find_runnable_deepstream_tracker_by_profile_id("nope_v1") is None
 
 
 def test_model_dir_resolution_identical_to_pre_p5() -> None:

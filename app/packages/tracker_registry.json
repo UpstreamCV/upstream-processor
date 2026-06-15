@@ -45,10 +45,10 @@
     },
     {
       "tracker_profile_id": "deepstream_nvdcf_balanced_v1",
-      "display_name": "NvDCF (balanced, planned)",
+      "display_name": "NvDCF (balanced)",
       "runtime": "deepstream",
       "family": "nvmultiobjecttracker",
-      "status": "planned",
+      "status": "experimental",
       "algorithm": "nvdcf",
       "requires_reid": false,
       "requires_model": null,
@@ -58,12 +58,62 @@
         "tracker_width": 960,
         "tracker_height": 544
       },
-      "best_for": ["occlusion_robustness", "visual_tracking_quality"],
+      "best_for": ["occlusion_robustness", "visual_tracking_quality", "track_continuity"],
       "not_recommended_for": ["minimal_compute_budgets"],
       "compute_tier": "medium",
       "estimated_cost_weight": 0.6,
-      "settings": {},
-      "notes": "NOT runnable: no Upstream-authored ll-config has been written or live-verified. P5-C (tracker profile expansion) authors and live-tests this against the same metadata worker path."
+      "settings": {
+        "BaseConfig": {
+          "minDetectorConfidence": 0.1894
+        },
+        "TargetManagement": {
+          "enableBboxUnClipping": 1,
+          "preserveStreamUpdateOrder": 0,
+          "maxTargetsPerStream": 150,
+          "minIouDiff4NewTarget": 0.3777,
+          "minTrackerConfidence": 0.2079,
+          "probationAge": 3,
+          "maxShadowTrackingAge": 30,
+          "earlyTerminationAge": 1
+        },
+        "TrajectoryManagement": {
+          "useUniqueID": 0
+        },
+        "DataAssociator": {
+          "dataAssociatorType": 0,
+          "associationMatcherType": 1,
+          "checkClassMatch": 1,
+          "minMatchingScore4Overall": 0.0,
+          "minMatchingScore4SizeSimilarity": 0.5043,
+          "minMatchingScore4Iou": 0.1219,
+          "minMatchingScore4VisualSimilarity": 0.2126,
+          "matchingScoreWeight4VisualSimilarity": 0.3631,
+          "matchingScoreWeight4SizeSimilarity": 0.5409,
+          "matchingScoreWeight4Iou": 0.4564
+        },
+        "StateEstimator": {
+          "stateEstimatorType": 1,
+          "processNoiseVar4Loc": 2.0,
+          "processNoiseVar4Size": 1.0,
+          "processNoiseVar4Vel": 0.1,
+          "measurementNoiseVar4Detector": 4.0,
+          "measurementNoiseVar4Tracker": 16.0
+        },
+        "VisualTracker": {
+          "visualTrackerType": 1,
+          "useColorNames": 1,
+          "useHog": 0,
+          "featureImgSizeLevel": 2,
+          "featureFocusOffsetFactor_y": -0.2,
+          "filterLr": 0.075,
+          "filterChannelWeightsLr": 0.1,
+          "gaussianSigma": 0.75
+        },
+        "ReID": {
+          "reidType": 0
+        }
+      },
+      "notes": "P5-E: ReID-free NvDCF profile authored from the DS 8.0 sample config_tracker_NvDCF_perf.yml pattern (VisualTracker correlation filter, regular Kalman state estimator, ReID disabled). EXPERIMENTAL — settings are best-effort and the exact tunables MUST be reconciled against the in-container DS 8.0 sample and LIVE-VERIFIED on the Blackwell/DS8 GPU host (crowdcountS2) before promotion to probe. Reuses the same libnvds_nvmultiobjecttracker.so as IOU; tracker_width/height are multiples of 32 as NvDCF requires."
     },
     {
       "tracker_profile_id": "deepstream_nvsort_fast_v1",
@@ -85,7 +135,7 @@
       "compute_tier": "low",
       "estimated_cost_weight": 0.3,
       "settings": {},
-      "notes": "NOT runnable: no Upstream-authored ll-config; planned for P5-C alongside NvDCF. Python trackers (bytetrack/ocsort/botsort) are deliberately NOT listed — no python runtime exists in this processor yet."
+      "notes": "NOT runnable: no Upstream-authored ll-config. Still planned (P5-E authored + promoted NvDCF only; NvSORT is a future milestone). Python trackers (bytetrack/ocsort/botsort) are deliberately NOT listed — no python runtime exists in this processor yet."
     }
   ]
 }
