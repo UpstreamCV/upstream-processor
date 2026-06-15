@@ -4,6 +4,37 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-15 - Processing P5-F (Track A): NvDCF config reconciliation + validation
+
+**Why:** P5-E's NvDCF settings were authored best-effort and over-fragmented in
+the recorded A/B. P5-F reconciles them to NVIDIA's real DS 8.0 sample and
+attempts a representative person-analytics A/B to decide promotion. (Track B —
+the API-side processing-package catalog — lands in the upstream-api-server repo.)
+
+**What:**
+- Reconciled `deepstream_nvdcf_balanced_v1.settings` in `tracker_registry.json`
+  **verbatim** to the in-container `config_tracker_NvDCF_perf.yml` (e.g.
+  `minDetectorConfidence` 0.1894→0.043, `maxShadowTrackingAge` 30→51,
+  `visualTrackerType` 1→2/VPI; added the tentative-association keys; removed the
+  ReID placeholder — perf is ReID-free). IOU byte-identical; NvDCF stays
+  `experimental`. Updated the NvDCF render test.
+- `scripts/probe_tracker_ab_clip.sh`: added `CLIP_HOST` to run the A/B against a
+  host-recorded clip (mounted into the work dir).
+- `probe_tracker_ab_clip.sh` also gained `EXTRA_MOUNT` (mount a model store so a
+  custom PRIMARY_GIE — e.g. YOLOX — can be used).
+- Re-ran the sample-clip A/B: the reconciled config (incl. VPI) **loads and
+  runs** (1443 frames). Then ran a **representative A/B** on an operator-supplied
+  45s people-crossing clip with the **YOLOX** detector (TrafficCamNet detected
+  people too sparsely): IOU **18** distinct ids / 323-frame longest track /
+  switch-proxy 12; reconciled NvDCF **33** ids / 245 / 28 — NvDCF fragmented
+  **more** (~83% more ids), fast (134 FPS) and stable.
+- **Decision: Outcome B — NvDCF stays `experimental` (do NOT promote).** The
+  P5-E "NvDCF reduces fragmentation" hypothesis is **not supported** on
+  representative people content. Signals **Outcome C**: the weak events are
+  likely capped by the P4-D/P4-E lifecycle policies, not the tracker — recommend
+  a `P5-Gap` analytics-lifecycle investigation. Recorded in
+  `docs/p5-e-nvdcf-tracker-ab.md`. 751 tests pass; mypy/ruff clean.
+
 ## 2026-06-15 - Processing P5-E: Tracker Profile Expansion / NvDCF Package Probe
 
 **Why:** P5-D live testing showed strong YOLOX-S person detection but the IOU

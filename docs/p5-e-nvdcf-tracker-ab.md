@@ -159,7 +159,58 @@ Never `supported` without a separate license + deployment review
 
 - Live A/B runbook + smoke checklist + promotion criteria:
   `docs/local-dev.md` → "P5-E — IOU vs NvDCF tracker A/B".
-- Clip A/B driver: `scripts/probe_tracker_ab_clip.sh`.
+- Clip A/B driver: `scripts/probe_tracker_ab_clip.sh` (P5-F added `CLIP_HOST`
+  to point it at a host-recorded clip).
 - Pure aggregation + KITTI parsing (unit-tested):
   `scripts/_tracker_ab_helpers.py`, `tests/test_tracker_ab_probe.py`.
 - Comparison CLI: `scripts/compare_tracker_ab.py`.
+
+---
+
+## P5-F update (2026-06-15) — config reconciliation + validation attempt
+
+### A1. NvDCF config reconciled to the DS 8.0 perf sample
+Read the in-container `/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml` and transcribed it **verbatim** into `deepstream_nvdcf_balanced_v1.settings`. The P5-E authored settings were materially off; key corrections:
+
+| key | P5-E (authored) | P5-F (DS 8.0 perf) |
+|---|---|---|
+| `BaseConfig.minDetectorConfidence` | 0.1894 | **0.043** |
+| `TargetManagement.minIouDiff4NewTarget` | 0.3777 | **0.7418** |
+| `TargetManagement.minTrackerConfidence` | 0.2079 | **0.4009** |
+| `TargetManagement.probationAge` | 3 | **2** |
+| `TargetManagement.maxShadowTrackingAge` | 30 | **51** |
+| `DataAssociator.minMatchingScore4Overall` | 0.0 | **0.429** |
+| `DataAssociator` (+tentative keys) | missing | **added** `tentativeDetectorConfidence`, `minMatchingScore4TentativeIou` |
+| `StateEstimator.processNoiseVar*` | 2.0/1.0/0.1/4.0/16.0 | **1.511/1.3159/0.03/3.0283/8.1505** |
+| `VisualTracker.visualTrackerType` | 1 (NvDCF_legacy) | **2 (NvDCF_VPI)** |
+| `ReID` section | `{reidType:0}` placeholder | **removed** (perf sample is ReID-free) |
+
+IOU unchanged (byte-identical golden still passes). NvDCF stays `experimental`.
+
+### A2. Reconciled config re-run (sample clip, GPU 1) — viability re-confirmed
+The reconciled config (incl. `visualTrackerType: 2`/VPI) **loads and runs** on the Blackwell GPU (1443 frames, no VPI error). On the (non-representative) car clip: IOU 60 distinct IDs / switch-proxy 30; reconciled NvDCF 410 / 368 — higher, but this is the expected effect of the sample's low `minDetectorConfidence` (0.043) keeping many flickering distant-car detections, and the crude switch-proxy is dominated by detection churn on dense scenes. Not a person-tracking verdict.
+
+### A3. Representative person A/B — RUN (operator-supplied clip)
+Live capture was initially blocked (no eligible upstream session; mediamtx ready-paths flapped 15→0; camera-code paths 400 on read — readable paths are dynamic `sess_…` keys). The operator then supplied a **45-second clip of people crossing the mid-frame** (`Test_vid_copy.mp4`), which was run through both packages' trackers via `probe_tracker_ab_clip.sh` (`CLIP_HOST` + `EXTRA_MOUNT`).
+
+Detector choice mattered: the DS sample **TrafficCamNet** detected people only sparsely (~177 person-lines / 681 frames) — a traffic detector, not representative — so the verdict run used **YOLOX-S** (the package's real detector, conf 0.25), which detected people densely (peak 5–6 concurrent). Identical input both passes; tracker-fragmentation only (no analytics events in this path).
+
+**Result (YOLOX detector, 681 frames / ~45s):**
+
+| metric | IOU | reconciled NvDCF |
+|---|---|---|
+| distinct track IDs | **18** | **33** |
+| peak concurrent people | 6 | 5 |
+| longest track persistence (frames) | **323** | 245 |
+| switch-proxy (lower = less fragmentation) | **12** | 28 |
+| substantial tracks (≥15 frames) | 16 | 17 |
+| FPS | fast | ~134 (avg 154) |
+
+NvDCF produced **~83% more distinct track IDs** than IOU (33 vs 18) and shorter max persistence — i.e. ~16 short-lived spurious tracks that IOU's stickier IOU-association absorbs into fewer, longer tracks. NvDCF ran cleanly and fast (no perf/stability issue).
+
+### A4. Decision — **Outcome B: stay `experimental` (do NOT promote)**
+On representative people content the reconciled NvDCF (NVIDIA's own perf preset) did **not** improve track continuity over IOU — it **fragmented more**. So the P5-E hypothesis ("NvDCF reduces IOU fragmentation, which should unblock the weak per-track events") is **not supported** by this test. `deepstream_nvdcf_balanced_v1` and `deepstream.yolox_analytics_nvdcf_probe.v0` remain `experimental` / `production_ready: false`.
+
+Caveats: one 45s clip; tracker-fragmentation only (the zone/line/dwell **events** were not exercised — that needs the analytics pipeline + geometry); "more IDs" is a fragmentation proxy (without ground truth it could partly reflect NvDCF refusing to merge distinct people that IOU over-merges into one 323-frame track). But the direction is clear and repeatable.
+
+**Implication (Outcome C signal):** since a stickier tracker did not obviously help, the weak `zone_exited` / `line_crossing` / `dwell_exceeded` events are plausibly capped by the deliberate P4-D/P4-E "disappearance ≠ exit/close" lifecycle policies rather than by the tracker. Recommend a follow-up **P5-Gap — Analytics Lifecycle Policy Fixes** investigation before further tracker-swap effort; NvDCF would need people-specific tuning (the perf preset is generic) to be worth revisiting, or explore NvSORT.
