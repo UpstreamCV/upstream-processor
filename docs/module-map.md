@@ -41,19 +41,24 @@ What each file owns.
   enforces the three mock types; stamps tz-aware `observed_at`.
 
 ### `app/packages/`
-- `package_registry.json` — the eight probe packages (`mock.detect.v0`, the
-  five TrafficCamNet DeepStream probes, P5-B's `deepstream.yolox_probe.v0`,
-  and P5-D's `deepstream.yolox_analytics_probe.v0`), each referencing
-  model/tracker/analytics registry ids plus compute/pricing placeholders and
-  P5-D package-readiness metadata (category/triggers/complexity/
-  production_ready honesty gate).
+- `package_registry.json` — the nine packages (`mock.detect.v0`, the five
+  TrafficCamNet DeepStream probes, P5-B's `deepstream.yolox_probe.v0`, P5-D's
+  `deepstream.yolox_analytics_probe.v0`, and P5-E's experimental
+  `deepstream.yolox_analytics_nvdcf_probe.v0` — same YOLOX+analytics chain,
+  NvDCF tracker), each referencing model/tracker/analytics registry ids plus
+  compute/pricing placeholders and P5-D package-readiness metadata
+  (category/triggers/complexity/production_ready honesty gate).
 - `model_registry.json` / `tracker_registry.json` / `analytics_registry.json`
   — curated lower-level components (Processing P5): the live-verified
   TrafficCamNet model + planned YOLO placeholders, the live-verified IOU
-  tracker profile + planned NvDCF/NvSORT, and the nvdsanalytics probe profile.
+  tracker profile + P5-E's authored-but-unverified `experimental` NvDCF
+  profile (ReID-free perf config) + still-planned NvSORT, and the
+  nvdsanalytics probe profile.
 - `registries.py` — strict typed loaders/validators for the three component
   registries (`RegistryValidationError` on duplicates / missing fields / bad
-  enums) + runnable-entry lookup helpers used by the DeepStream config hooks.
+  enums) + runnable-entry lookup helpers used by the DeepStream config hooks
+  (`find_runnable_deepstream_tracker_by_algorithm` and P5-E's by-profile-id
+  variant that backs package-driven tracker selection in the worker).
 - `compatibility.py` — `validate_package_compatibility`: package ↔ registry
   cross-checks (unknown ids, runtime support, class subsets, tracker-requiring
   outputs, status gating; planned/deprecated components never resolvable).

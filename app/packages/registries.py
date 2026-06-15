@@ -446,6 +446,28 @@ def runnable_deepstream_tracker_algorithms() -> list[str]:
     )
 
 
+def find_runnable_deepstream_tracker_by_profile_id(
+    profile_id: str,
+) -> TrackerProfileSpec | None:
+    """The runnable DeepStream tracker profile for a registry
+    ``tracker_profile_id`` (e.g. a package's ``tracker_profile_id``).
+
+    Mirrors :func:`find_runnable_deepstream_tracker_by_algorithm` but keys on
+    the profile id so a package can drive the running tracker (P5-E). Planned/
+    deprecated profiles and profiles without authored ``settings`` never match,
+    so a not-yet-authored profile returns ``None`` and the caller fails closed
+    rather than silently selecting a different tracker."""
+    spec = load_tracker_registry().get(profile_id)
+    if (
+        spec is not None
+        and spec.runtime == "deepstream"
+        and spec.status in RUNNABLE_COMPONENT_STATUSES
+        and spec.settings
+    ):
+        return spec
+    return None
+
+
 # --- analytics profile registry ----------------------------------------------
 
 

@@ -145,6 +145,7 @@ def test_all_packages_still_resolve() -> None:
         "deepstream.analytics_probe.v0",
         "deepstream.yolox_probe.v0",
         _PKG,
+        "deepstream.yolox_analytics_nvdcf_probe.v0",  # P5-E
     ):
         assert resolve(package_id).package_id == package_id
 

@@ -190,6 +190,65 @@
       "observation_policy": "debounced_events_plus_interval_heartbeats",
       "test_mode_safe": true,
       "production_ready": false
+    },
+    {
+      "package_id": "deepstream.yolox_analytics_nvdcf_probe.v0",
+      "display_name": "People Analytics — YOLOX + NvDCF Probe v0",
+      "runtime": "deepstream",
+      "description": "People-analytics probe variant of deepstream.yolox_analytics_probe.v0 with the IOU tracker swapped for the NvDCF tracker profile (deepstream_nvdcf_balanced_v1). Same YOLOX-S (COCO-80) detector + nvdsanalytics chain and the same line/ROI/zone/dwell observation adapters — only the tracker changes. Exists for the P5-E IOU-vs-NvDCF A/B comparison: NvDCF visual correlation tracking is expected to reduce track-ID fragmentation during walking motion, which P5-D analysis flagged as the cause of the unproven zone_exited / line_crossing / line_crossing_object events. EXPERIMENTAL: the NvDCF ll-config is authored but NOT yet live-verified on the Blackwell/DS8 GPU host — do not treat as probe-grade until the live A/B passes (see docs/local-dev.md P5-E runbook). Requires operator-prepared YOLOX artifacts (scripts/prepare_yolox_model.sh). Internal probe only; not customer-facing.",
+      "outputs": [
+        "processor.line_crossing",
+        "processor.line_crossing_object",
+        "processor.roi_occupancy",
+        "processor.zone_entered",
+        "processor.zone_exited",
+        "processor.dwell_started",
+        "processor.dwell_updated",
+        "processor.dwell_exceeded"
+      ],
+      "supports": {
+        "analytics_probe": true
+      },
+      "status": "experimental",
+      "model_id": "yolox_s_v1",
+      "tracker_profile_id": "deepstream_nvdcf_balanced_v1",
+      "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
+      "supported_classes": [
+        "person"
+      ],
+      "compute_tier": "high",
+      "pricing_tier": "free_probe",
+      "category": "people_analytics",
+      "best_for": [
+        "person_entry_exit",
+        "zone_presence",
+        "line_crossing_counts",
+        "dwell_monitoring",
+        "occlusion_robustness"
+      ],
+      "not_recommended_for": [
+        "dense_crowds",
+        "non_person_classes",
+        "production_sla",
+        "unverified_until_live_ab"
+      ],
+      "setup_complexity": "medium",
+      "supported_shapes": [
+        "polygon_roi",
+        "line_segment"
+      ],
+      "supported_triggers": [
+        "line_crossing",
+        "roi_occupancy",
+        "zone_entered",
+        "zone_exited",
+        "dwell_exceeded"
+      ],
+      "default_target_fps": 30,
+      "recommended_confidence_threshold": 0.4,
+      "observation_policy": "debounced_events_plus_interval_heartbeats",
+      "test_mode_safe": true,
+      "production_ready": false
     }
   ]
 }
