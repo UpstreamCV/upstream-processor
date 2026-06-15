@@ -498,6 +498,7 @@ def test_nvdcf_is_runnable_and_renders_required_sections() -> None:
     # nvtracker requires the %YAML:1.0 marker; the NvDCF perf profile adds the
     # StateEstimator + VisualTracker sections on top of the IOU-style base.
     assert body.startswith("%YAML:1.0\n")
+    # P5-F: reconciled to the DS 8.0 config_tracker_NvDCF_perf.yml section set.
     for section in (
         "BaseConfig:",
         "TargetManagement:",
@@ -505,11 +506,12 @@ def test_nvdcf_is_runnable_and_renders_required_sections() -> None:
         "DataAssociator:",
         "StateEstimator:",
         "VisualTracker:",
-        "ReID:",
     ):
         assert section in body
-    assert "visualTrackerType: 1" in body  # NvDCF discriminative-correlation
-    assert "reidType: 0" in body  # ReID-free
+    assert "visualTrackerType: 2" in body  # NvDCF_VPI, per the DS 8.0 perf sample
+    # ReID-free: the perf sample has no ReID section / model dependency.
+    assert "ReID:" not in body
+    assert "reidType" not in body
     assert "\t" not in body  # YAML is whitespace-sensitive
 
 

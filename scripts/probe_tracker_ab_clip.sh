@@ -44,6 +44,12 @@ TRACKER_LIB="${TRACKER_LIB:-/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmult
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-300}"
 PYTHON="${PYTHON:-python3}"
 
+# EXTRA_MOUNT: an additional host dir to bind-mount into the deepstream-app
+# container (e.g. a YOLOX model store), so a custom PRIMARY_GIE can reference
+# model artifacts by absolute path. Empty => no extra mount.
+EXTRA_MOUNT_ARG=""
+if [ -n "${EXTRA_MOUNT:-}" ]; then EXTRA_MOUNT_ARG="-v ${EXTRA_MOUNT}:${EXTRA_MOUNT}"; fi
+
 # Defensive redaction helper (the clip is a local file, but keep the hygiene
 # contract: never trace, never echo a stream key if one is ever passed).
 redact() { sed -E 's#(rtsp://[^/ ]*/)[A-Za-z0-9_.:-]+#\1sess_<redacted>#g'; }
@@ -66,12 +72,29 @@ trap cleanup EXIT
 cp "$IOU_YML" "$WORKDIR/tracker_iou.yml"
 cp "$NVDCF_YML" "$WORKDIR/tracker_nvdcf.yml"
 
+# CLIP_HOST: use a host-side recorded clip (e.g. a representative person clip)
+# instead of the in-image sample. Copied into the mounted WORKDIR so the
+# deepstream-app container sees it. Never echoed beyond its basename.
+CLIP_IN_WORKDIR=0
+if [ -n "${CLIP_HOST:-}" ]; then
+  [ -f "$CLIP_HOST" ] || { echo "FAIL CLIP_HOST not found: $(basename "$CLIP_HOST")" >&2; exit 2; }
+  cp "$CLIP_HOST" "$WORKDIR/clip.mp4"
+  CLIP="$WORKDIR/clip.mp4"
+  CLIP_IN_WORKDIR=1
+fi
+
 echo "== P5-E clip tracker A/B =="
-echo "  image=$IMAGE gpu=$GPU_DEVICE clip=$CLIP"
+echo "  image=$IMAGE gpu=$GPU_DEVICE clip=$(basename "$CLIP")"
 echo "  primary_gie=$PRIMARY_GIE"
 
-# Quick in-image existence check for the clip + primary config (no GPU).
-if ! docker run --rm "$IMAGE" bash -lc "[ -f '$CLIP' ] && [ -f '$PRIMARY_GIE' ]"; then
+# Existence check (no GPU). A host clip lives in the mounted WORKDIR; the
+# in-image sample is checked inside the image.
+if [ "$CLIP_IN_WORKDIR" = "1" ]; then
+  if ! docker run --rm -v "$WORKDIR:$WORKDIR" $EXTRA_MOUNT_ARG "$IMAGE" bash -lc "[ -f '$CLIP' ] && [ -f '$PRIMARY_GIE' ]"; then
+    echo "FAIL host clip or primary-gie config not found; check CLIP_HOST / PRIMARY_GIE" >&2
+    exit 2
+  fi
+elif ! docker run --rm "$IMAGE" bash -lc "[ -f '$CLIP' ] && [ -f '$PRIMARY_GIE' ]"; then
   echo "FAIL clip or primary-gie config not found inside the image; override CLIP / PRIMARY_GIE" >&2
   exit 2
 fi
@@ -138,7 +161,7 @@ run_algo() {  # $1=algo
   # device=$GPU_DEVICE maps to in-container gpu-id 0; --rm; workdir lets the
   # sample primary-gie config resolve its relative model paths.
   docker run --rm --gpus "device=${GPU_DEVICE}" \
-    -v "$WORKDIR:$WORKDIR" \
+    -v "$WORKDIR:$WORKDIR" $EXTRA_MOUNT_ARG \
     -w /opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app \
     "$IMAGE" \
     bash -lc "timeout -s INT ${PROBE_TIMEOUT} deepstream-app -c $WORKDIR/ds_${algo}.txt" \

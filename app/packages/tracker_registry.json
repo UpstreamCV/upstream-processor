@@ -64,16 +64,16 @@
       "estimated_cost_weight": 0.6,
       "settings": {
         "BaseConfig": {
-          "minDetectorConfidence": 0.1894
+          "minDetectorConfidence": 0.043
         },
         "TargetManagement": {
           "enableBboxUnClipping": 1,
           "preserveStreamUpdateOrder": 0,
           "maxTargetsPerStream": 150,
-          "minIouDiff4NewTarget": 0.3777,
-          "minTrackerConfidence": 0.2079,
-          "probationAge": 3,
-          "maxShadowTrackingAge": 30,
+          "minIouDiff4NewTarget": 0.7418,
+          "minTrackerConfidence": 0.4009,
+          "probationAge": 2,
+          "maxShadowTrackingAge": 51,
           "earlyTerminationAge": 1
         },
         "TrajectoryManagement": {
@@ -83,24 +83,26 @@
           "dataAssociatorType": 0,
           "associationMatcherType": 1,
           "checkClassMatch": 1,
-          "minMatchingScore4Overall": 0.0,
-          "minMatchingScore4SizeSimilarity": 0.5043,
-          "minMatchingScore4Iou": 0.1219,
-          "minMatchingScore4VisualSimilarity": 0.2126,
-          "matchingScoreWeight4VisualSimilarity": 0.3631,
-          "matchingScoreWeight4SizeSimilarity": 0.5409,
-          "matchingScoreWeight4Iou": 0.4564
+          "minMatchingScore4Overall": 0.429,
+          "minMatchingScore4SizeSimilarity": 0.3627,
+          "minMatchingScore4Iou": 0.2575,
+          "minMatchingScore4VisualSimilarity": 0.5356,
+          "matchingScoreWeight4VisualSimilarity": 0.337,
+          "matchingScoreWeight4SizeSimilarity": 0.4354,
+          "matchingScoreWeight4Iou": 0.3656,
+          "tentativeDetectorConfidence": 0.2008,
+          "minMatchingScore4TentativeIou": 0.5296
         },
         "StateEstimator": {
           "stateEstimatorType": 1,
-          "processNoiseVar4Loc": 2.0,
-          "processNoiseVar4Size": 1.0,
-          "processNoiseVar4Vel": 0.1,
-          "measurementNoiseVar4Detector": 4.0,
-          "measurementNoiseVar4Tracker": 16.0
+          "processNoiseVar4Loc": 1.511,
+          "processNoiseVar4Size": 1.3159,
+          "processNoiseVar4Vel": 0.03,
+          "measurementNoiseVar4Detector": 3.0283,
+          "measurementNoiseVar4Tracker": 8.1505
         },
         "VisualTracker": {
-          "visualTrackerType": 1,
+          "visualTrackerType": 2,
           "useColorNames": 1,
           "useHog": 0,
           "featureImgSizeLevel": 2,
@@ -108,12 +110,9 @@
           "filterLr": 0.075,
           "filterChannelWeightsLr": 0.1,
           "gaussianSigma": 0.75
-        },
-        "ReID": {
-          "reidType": 0
         }
       },
-      "notes": "P5-E: ReID-free NvDCF profile authored from the DS 8.0 sample config_tracker_NvDCF_perf.yml pattern (VisualTracker correlation filter, regular Kalman state estimator, ReID disabled). EXPERIMENTAL — settings are best-effort and the exact tunables MUST be reconciled against the in-container DS 8.0 sample and LIVE-VERIFIED on the Blackwell/DS8 GPU host (crowdcountS2) before promotion to probe. Reuses the same libnvds_nvmultiobjecttracker.so as IOU; tracker_width/height are multiples of 32 as NvDCF requires."
+      "notes": "P5-F: ReID-free NvDCF profile RECONCILED to the in-container DS 8.0 sample config_tracker_NvDCF_perf.yml (2026-06-15) — values transcribed verbatim (BaseConfig/TargetManagement/TrajectoryManagement/DataAssociator/StateEstimator/VisualTracker; no ReID section, so reid-free). visualTrackerType=2 (NvDCF_VPI). EXPERIMENTAL — runtime viability proven on Blackwell/DS8 (P5-E), but NOT promoted to probe until a representative person-analytics A/B passes (see docs/p5-e-nvdcf-tracker-ab.md). Reuses the same libnvds_nvmultiobjecttracker.so as IOU; tracker_width/height are multiples of 32 as NvDCF requires."
     },
     {
       "tracker_profile_id": "deepstream_nvsort_fast_v1",
