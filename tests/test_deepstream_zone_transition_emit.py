@@ -685,3 +685,120 @@ async def test_overridden_class_ids_flows_to_status_payload(fast_settings) -> No
     await asyncio.wait_for(w.run(), timeout=3)
     stopped = next(s for s in api.statuses if s.status == "stopped")
     assert stopped.payload["analytics_class_ids"] == "2"
+
+
+# --- P5-Gap: worker-level inferred zone_exited on disappearance --------
+
+
+async def test_inferred_zone_exit_on_disappearance(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end: a committed-inside track that vanishes (absent from a
+    later frame whose zone is still configured) produces an INFERRED
+    processor.zone_exited via the worker's disappearance pass. Grace +
+    min-presence are set to 0 so the second frame triggers it
+    deterministically without frame timestamps."""
+    settings = fast_settings.model_copy(
+        update={"deepstream_lifecycle_track_missing_grace_seconds": 0.0}
+    )
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            # Frame 0: t0 stably inside (stability=1 commits immediately).
+            _frame_line(
+                frame_num=0,
+                objects=[_person(tracker_id="0", roi_labels=["entry-roi"])],
+                roi_counts={"entry-roi": 1},
+            ),
+            # Frame 1: t0 GONE; zone still configured (roi_counts present).
+            _frame_line(frame_num=1, objects=[], roi_counts={"entry-roi": 0}),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    exits = _zone_obs(api, of_type="processor.zone_exited")
+    assert len(exits) == 1
+    body = exits[0].payload
+    assert body["track_id"] == "0"
+    assert body["zone_id"] == "entry-roi"
+    assert body["inferred"] is True
+    assert body["exit_reason"] == "track_missing_timeout"
+    assert "missing_duration_seconds" in body
+    # Type stays within the API-supported set (no taxonomy change).
+    assert "processor.zone_exited" in OBSERVATION_TYPES
+
+
+async def test_inferred_zone_exit_disabled_by_policy(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """With the policy off, a disappeared committed-inside track emits no
+    inferred exit (pre-P5-Gap behavior)."""
+    settings = fast_settings.model_copy(
+        update={"deepstream_lifecycle_infer_zone_exit_on_disappearance": False}
+    )
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            _frame_line(
+                frame_num=0,
+                objects=[_person(tracker_id="0", roi_labels=["entry-roi"])],
+                roi_counts={"entry-roi": 1},
+            ),
+            _frame_line(frame_num=1, objects=[], roi_counts={"entry-roi": 0}),
+        ],
+        exit_code=124,
+    )
+    w = _analytics_worker(api, settings, pm)
+    await asyncio.wait_for(w.run(), timeout=3)
+    assert _zone_obs(api, of_type="processor.zone_exited") == []
+
+
+async def test_class_flicker_does_not_cause_false_inferred_exit(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """A committed-inside person whose class momentarily flickers to a
+    filtered-out class is still TRACKED (present in frame.objects), so the
+    disappearance detector (which uses raw tracker presence, not the
+    class-filtered set) must NOT infer a false zone_exited. grace=0 makes any
+    false-positive fire immediately if the bug were present."""
+    settings = fast_settings.model_copy(
+        update={"deepstream_lifecycle_track_missing_grace_seconds": 0.0}
+    )
+    api = FakeApi()
+    car = {
+        "class_id": 0,
+        "label": "car",
+        "confidence": 0.6,
+        "bbox_pixels": {"left": 100.0, "top": 100.0, "width": 200.0, "height": 400.0},
+        "bbox_normalized": {"x": 0.078, "y": 0.139, "w": 0.156, "h": 0.556},
+        "tracker_id": "0",
+    }
+    pm = FakeMetadataPM(
+        [
+            _frame_line(
+                frame_num=0,
+                objects=[_person(tracker_id="0", roi_labels=["entry-roi"])],
+                roi_counts={"entry-roi": 1},
+            ),
+            # Same tracker 0, class flickered to 'car' (filtered out by the
+            # person-only selection) but still physically tracked.
+            _frame_line(frame_num=1, objects=[car], roi_counts={"entry-roi": 1}),
+        ],
+        exit_code=124,
+    )
+    worker = DeepStreamWorker(
+        session=_session(
+            internal_rtsp_url=_URL,
+            processing_config={
+                "revision": 1,
+                "config": {
+                    "version": 1,
+                    "model_key": "trafficcamnet_v1",
+                    "selected_classes": ["person"],
+                },
+            },
+        ),
+        settings=settings,
+        api=api,
+        package=resolve("deepstream.analytics_probe.v0"),
+        writer=ObservationWriter(api, _PROCESSOR_ID),
+        pm_factory=lambda: pm,
+    )
+    await asyncio.wait_for(worker.run(), timeout=3)
+    assert worker._selected_classes == ("person",)  # filter is active
+    assert _zone_obs(api, of_type="processor.zone_exited") == []  # tracker present -> no false exit

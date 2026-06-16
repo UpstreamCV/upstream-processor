@@ -237,9 +237,12 @@ async def test_dwell_exceeded_carries_current_frame_confidence(fast_settings) ->
 
 
 async def test_dwell_exceeded_omits_confidence_when_track_undetected(fast_settings) -> None:  # type: ignore[no-untyped-def]
-    """Disappearance doesn't close the session (P4-E invariant), but an
-    undetected track has no current confidence — omit, never re-stamp the
-    stale entry value."""
+    """A track still PRESENT in the zone but with no detection confidence this
+    frame (undetected-confidence, not absent) keeps dwelling and exceeds — the
+    exceeded event omits confidence rather than re-stamping the stale entry
+    value. (P5-Gap note: an ABSENT track instead closes the dwell — covered by
+    test_disappearance_closes_dwell_no_false_exceeded — so the present-but-
+    unconfident case is the one that still exceeds.)"""
     settings = fast_settings.model_copy(
         update={
             "deepstream_dwell_update_interval_seconds": 600.0,
@@ -255,12 +258,12 @@ async def test_dwell_exceeded_omits_confidence_when_track_undetected(fast_settin
                 roi_counts={"dock": 1},
                 timestamp=_now_iso(0),
             ),
-            # Track 7 vanishes; the dwell session stays open and the tick
-            # still fires the exceeded event.
+            # Track 7 still inside dock (present, not disappeared) but with no
+            # confidence this frame; the tick fires the exceeded event.
             _frame_line(
                 frame_num=1,
-                objects=[],
-                roi_counts={"dock": 0},
+                objects=[_obj(tracker_id="7", conf=None, roi_labels=["dock"])],
+                roi_counts={"dock": 1},
                 timestamp=_now_iso(31),
             ),
         ],

@@ -47,6 +47,7 @@ from app.errors import (
 )
 from app.geometry.resolver import ResolvedGeometry, resolve_session_geometry
 from app.observations.bridge_queue import BoundedBridgeQueue, DropPolicy
+from app.observations.lifecycle_policy import LifecyclePolicy
 from app.observations.metadata_models import NeutralFrameMetadata
 from app.observations.observation_adapter import (
     DwellState,
@@ -1005,6 +1006,12 @@ class DeepStreamWorker(Runtime):
             "model_id": self._effective_model_id,
             "tracker_profile_id": self._package.tracker_profile_id,
             "analytics_profile_id": self._package.analytics_profile_id,
+            # P5-G: requested-vs-applied package lineage. ``requested`` is what
+            # the camera/session asked for (eligible-sessions); ``applied`` is
+            # what actually resolved + ran (== the global top-level package_id).
+            # They differ only under UPSTREAM_FORCE_PACKAGE_ID / fallback.
+            "requested_package_id": self._session.package_id,
+            "applied_package_id": self._package.package_id,
             "image": self._settings.deepstream_pyds_image,
             "frames_seen": counters.frames_seen,
             "frames_with_objects": counters.frames_with_objects,
@@ -1269,12 +1276,24 @@ class DeepStreamWorker(Runtime):
         # stability threshold from settings (default 5; tests override
         # via ``fast_settings`` to 1). Disappearance does NOT emit
         # zone_exited — see ``ZoneMembershipState``'s docstring.
+        # P5-Gap: disappearance-based inferred-exit policy from settings
+        # (conservative + ON by default; env-overridable). Fed to the zone
+        # adapter; the inferred zone_exited also closes the matching dwell.
+        lifecycle_policy = LifecyclePolicy(
+            track_missing_grace_seconds=(
+                self._settings.deepstream_lifecycle_track_missing_grace_seconds
+            ),
+            infer_zone_exit_on_disappearance=(
+                self._settings.deepstream_lifecycle_infer_zone_exit_on_disappearance
+            ),
+        )
         zone_state: ZoneMembershipState | None = (
             ZoneMembershipState(
                 stream_session_id=self._session.session_id,
                 membership_stability_frames=(
                     self._settings.deepstream_zone_membership_stability_frames
                 ),
+                lifecycle_policy=lifecycle_policy,
             )
             if observations_enabled
             else None
@@ -1298,6 +1317,7 @@ class DeepStreamWorker(Runtime):
         source_block: dict[str, Any] = (
             deepstream_source_block(
                 package_id=self._package.package_id,
+                requested_package_id=self._session.package_id,
                 tracker_algorithm=self._effective_tracker_algorithm,
                 # P6-C: stamp every emitted line-crossing / ROI observation
                 # with the geometry lineage so downstream consumers can
@@ -2108,53 +2128,99 @@ class DeepStreamWorker(Runtime):
                 },
             )
             for event in events:
-                try:
-                    await self._writer.emit(
-                        stream_session_id=self._session.session_id,
-                        obs_type=event.type,  # type: ignore[arg-type]
-                        payload=event.to_payload(),
-                        package_id=self._package.package_id,
-                        observed_at=event.occurred_at,
-                    )
-                except ApiSessionGoneError:
-                    raise
-                except ApiValidationError as exc:
-                    counters.observation_write_errors += 1
-                    _log.error(
-                        "wire contract drift on zone transition emit for %s: %s",
-                        self.session_id,
-                        exc,
-                    )
-                    continue
-                except TRANSIENT_API_ERRORS as exc:
-                    counters.observation_write_errors += 1
-                    _log.warning(
-                        "transient zone transition emit for %s: %s",
-                        self.session_id,
-                        exc,
-                    )
-                    continue
-                counters.observations_emitted += 1
-                if event.type == "processor.zone_entered":
-                    counters.zone_entered_observations_emitted += 1
-                else:
-                    counters.zone_exited_observations_emitted += 1
-                counters.last_observation_at = event.occurred_at
-                # P4-E: feed the zone event into DwellState. For
-                # zone_entered this produces a dwell_started event we
-                # emit immediately; for zone_exited it silently closes
-                # the dwell session.
-                if dwell_state is not None:
-                    dwell_events = dwell_state.absorb_zone_event(
-                        event,
-                        source=source_block,
-                        debug={
-                            "frame_num": int(frame.frame.frame_num),
-                            "geometry_source": "probe_default",
-                        },
-                    )
-                    for dev in dwell_events:
-                        await self._emit_one_dwell_event(dev, counters=counters)
+                await self._emit_one_zone_event(
+                    event,
+                    frame=frame,
+                    source_block=source_block,
+                    dwell_state=dwell_state,
+                    counters=counters,
+                )
+        # P5-Gap: after the per-object pass, infer zone_exited for any
+        # committed-inside track that has DISAPPEARED past the grace window —
+        # the inferred exit also closes the matching dwell session.
+        # ``active_track_ids`` is computed from the RAW frame objects (tracker
+        # presence), NOT the class-filtered set: a track that is still tracked
+        # but whose class momentarily flickers out of ``selected_classes`` is
+        # still present and must NOT be treated as disappeared.
+        active_track_ids: set[str] = {
+            obj.tracker_id for obj in frame.objects if obj.tracker_id is not None
+        }
+        for event in zone_state.detect_disappearances(
+            active_track_ids=active_track_ids,
+            occurred_at=occurred_at,
+            source=source_block,
+            debug={
+                "frame_num": int(frame.frame.frame_num),
+                "geometry_source": "probe_default",
+            },
+        ):
+            await self._emit_one_zone_event(
+                event,
+                frame=frame,
+                source_block=source_block,
+                dwell_state=dwell_state,
+                counters=counters,
+            )
+
+    async def _emit_one_zone_event(
+        self,
+        event: Any,  # ZoneTransitionEvent — observed OR inferred
+        *,
+        frame: NeutralFrameMetadata,
+        source_block: dict[str, Any],
+        dwell_state: DwellState | None,
+        counters: _MetadataCounters,
+    ) -> None:
+        """Emit one zone transition + feed DwellState. Shared by the per-object
+        pass and the P5-Gap disappearance detector so inferred exits carry
+        identical lineage/dedup and close dwell sessions exactly like observed
+        exits. Error handling mirrors the other emit helpers."""
+        assert self._writer is not None  # gated by the caller
+        try:
+            await self._writer.emit(
+                stream_session_id=self._session.session_id,
+                obs_type=event.type,
+                payload=event.to_payload(),
+                package_id=self._package.package_id,
+                observed_at=event.occurred_at,
+            )
+        except ApiSessionGoneError:
+            raise
+        except ApiValidationError as exc:
+            counters.observation_write_errors += 1
+            _log.error(
+                "wire contract drift on zone transition emit for %s: %s",
+                self.session_id,
+                exc,
+            )
+            return
+        except TRANSIENT_API_ERRORS as exc:
+            counters.observation_write_errors += 1
+            _log.warning(
+                "transient zone transition emit for %s: %s",
+                self.session_id,
+                exc,
+            )
+            return
+        counters.observations_emitted += 1
+        if event.type == "processor.zone_entered":
+            counters.zone_entered_observations_emitted += 1
+        else:
+            counters.zone_exited_observations_emitted += 1
+        counters.last_observation_at = event.occurred_at
+        # P4-E: feed the zone event into DwellState. zone_entered produces a
+        # dwell_started; zone_exited (observed OR inferred) closes the session.
+        if dwell_state is not None:
+            dwell_events = dwell_state.absorb_zone_event(
+                event,
+                source=source_block,
+                debug={
+                    "frame_num": int(frame.frame.frame_num),
+                    "geometry_source": "probe_default",
+                },
+            )
+            for dev in dwell_events:
+                await self._emit_one_dwell_event(dev, counters=counters)
 
     async def _emit_dwell_tick(
         self,

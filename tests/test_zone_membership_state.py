@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from app.observations.lifecycle_policy import LifecyclePolicy
 from app.observations.observation_adapter import (
     CANDIDATE_ZONE_ENTERED_TYPE,
     CANDIDATE_ZONE_EXITED_TYPE,
@@ -508,3 +509,176 @@ def test_pending_resets_when_candidate_returns_to_committed() -> None:
         s.sequence_by_track_zone_transition.get(("t0", "entry-roi", CANDIDATE_ZONE_EXITED_TYPE))
         is None
     )
+
+
+# --- P5-Gap: disappearance-based inferred zone_exited -----------------
+
+
+def _commit_inside_with_presence(
+    s: ZoneMembershipState, track: str = "t0", zone: str = "entry-roi"
+) -> None:
+    """Commit ``track`` stably inside ``zone`` with >= the default
+    min-presence (0.5s): one frame at t=0, another at t=0.6."""
+    _absorb(s, track, zone_set={zone}, roi_labels={zone}, occurred_at=_now())
+    _absorb(
+        s, track, zone_set={zone}, roi_labels={zone},
+        occurred_at=_now() + timedelta(seconds=0.6),
+    )
+    assert s.stable_membership[(track, zone)] is True
+
+
+def test_detect_disappearances_infers_exit_after_grace() -> None:
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    _commit_inside_with_presence(s)
+    # Track absent; 2.4s since last seen (>= 2.0 grace) -> inferred exit.
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=3.0)
+    )
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.type == CANDIDATE_ZONE_EXITED_TYPE
+    assert ev.inferred is True
+    assert ev.exit_reason == "track_missing_timeout"
+    assert ev.missing_duration_seconds is not None and ev.missing_duration_seconds >= 2.0
+    body = ev.to_payload()
+    assert body["inferred"] is True
+    assert body["exit_reason"] == "track_missing_timeout"
+    assert "last_seen_at" in body and "missing_duration_seconds" in body
+    # Now committed outside; a second tick does not re-emit.
+    assert s.stable_membership[("t0", "entry-roi")] is False
+    again = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=6.0)
+    )
+    assert again == []
+
+
+def test_detect_disappearances_no_exit_within_grace() -> None:
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    _commit_inside_with_presence(s)
+    # Only 1.0s missing (< 2.0 grace) -> nothing yet.
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=1.6)
+    )
+    assert events == []
+    assert s.stable_membership[("t0", "entry-roi")] is True
+
+
+def test_detect_disappearances_reappear_before_grace_no_exit() -> None:
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    _commit_inside_with_presence(s)
+    # Track present this tick (within grace) -> timer effectively resets;
+    # absorb_object would also update last_seen. No inferred exit.
+    events = s.detect_disappearances(
+        active_track_ids={"t0"}, occurred_at=_now() + timedelta(seconds=3.0)
+    )
+    assert events == []
+    assert s.stable_membership[("t0", "entry-roi")] is True
+
+
+def test_detect_disappearances_requires_committed_inside() -> None:
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    # Never observed inside -> no state -> no inferred exit.
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=10)
+    )
+    assert events == []
+
+
+def test_detect_disappearances_single_frame_commit_still_emits() -> None:
+    # A committed-inside track (even via a single stability=1 frame) is a
+    # confirmed presence; on disappearance past grace it emits an inferred exit
+    # (no min-presence suppression -> no dwell leak).
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    _absorb(s, "t0", zone_set={"entry-roi"}, roi_labels={"entry-roi"}, occurred_at=_now())
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=3.0)
+    )
+    assert len(events) == 1 and events[0].inferred is True
+    assert s.stable_membership[("t0", "entry-roi")] is False
+
+
+def test_detect_disappearances_with_production_stability_frames() -> None:
+    # Regression for the min-presence bug: with the production default of 5,
+    # commit fires on the LAST inside frame. The inferred exit must still fire
+    # on disappearance (it used to be silently dropped).
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=5)
+    for i in range(5):  # inside frames t=0..4 -> commits zone_entered at t=4
+        _absorb(
+            s, "t0", zone_set={"entry-roi"}, roi_labels={"entry-roi"},
+            occurred_at=_now() + timedelta(seconds=i),
+        )
+    assert s.stable_membership[("t0", "entry-roi")] is True
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=7.0)
+    )
+    assert len(events) == 1
+    assert events[0].inferred is True and events[0].type == CANDIDATE_ZONE_EXITED_TYPE
+
+
+def test_detect_disappearances_committed_then_outside_present_then_gone() -> None:
+    # Committed inside, then observed OUTSIDE-but-present for a few frames
+    # (below the outside-commit threshold so it stays committed), then vanishes.
+    # The inferred exit must still fire (last_seen stays at the last inside
+    # frame; the missing window is measured from there).
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=5)
+    for i in range(5):
+        _absorb(
+            s, "t0", zone_set={"entry-roi"}, roi_labels={"entry-roi"},
+            occurred_at=_now() + timedelta(seconds=i),
+        )
+    for i in range(5, 8):  # present but outside, below threshold -> stays committed
+        _absorb(
+            s, "t0", zone_set={"entry-roi"}, roi_labels=set(),
+            occurred_at=_now() + timedelta(seconds=i),
+        )
+    assert s.stable_membership[("t0", "entry-roi")] is True
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=11.0)
+    )
+    assert len(events) == 1 and events[0].inferred is True
+
+
+def test_detect_disappearances_dedup_then_real_exit_distinct() -> None:
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    _commit_inside_with_presence(s)
+    inferred = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=3.0)
+    )
+    assert len(inferred) == 1 and inferred[0].sequence == 1
+    # Track returns and is later observed exiting normally -> sequence 2.
+    _commit_inside_with_presence(s)  # re-enter (enter seq bumps, exit unaffected)
+    real_exit = _absorb(
+        s, "t0", zone_set={"entry-roi"}, roi_labels=set(),
+        occurred_at=_now() + timedelta(seconds=10),
+    )
+    assert len(real_exit) == 1
+    assert real_exit[0].type == CANDIDATE_ZONE_EXITED_TYPE
+    assert real_exit[0].sequence == 2  # distinct from the inferred exit (1)
+    assert real_exit[0].inferred is False
+    assert inferred[0].idempotency_key != real_exit[0].idempotency_key
+
+
+def test_detect_disappearances_disabled_by_policy() -> None:
+    off = LifecyclePolicy(infer_zone_exit_on_disappearance=False)
+    s = ZoneMembershipState(
+        stream_session_id=uuid4(), membership_stability_frames=1, lifecycle_policy=off
+    )
+    _commit_inside_with_presence(s)
+    events = s.detect_disappearances(
+        active_track_ids=set(), occurred_at=_now() + timedelta(seconds=30)
+    )
+    assert events == []
+    assert s.stable_membership[("t0", "entry-roi")] is True  # untouched when off
+
+
+def test_detect_disappearances_independent_per_track_and_zone() -> None:
+    s = ZoneMembershipState(stream_session_id=uuid4(), membership_stability_frames=1)
+    _commit_inside_with_presence(s, "t0", "zone-a")
+    _commit_inside_with_presence(s, "t1", "zone-a")
+    # Only t0 disappears; t1 still present.
+    events = s.detect_disappearances(
+        active_track_ids={"t1"}, occurred_at=_now() + timedelta(seconds=3.0)
+    )
+    assert len(events) == 1
+    assert events[0].track_id == "t0"
+    assert s.stable_membership[("t1", "zone-a")] is True

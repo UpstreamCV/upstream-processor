@@ -39,6 +39,15 @@ What each file owns.
   `{"sessions":[...]}` envelope).
 - `writer.py` — `ObservationWriter.emit`: the one chokepoint for observations;
   enforces the three mock types; stamps tz-aware `observed_at`.
+- `lifecycle_policy.py` (P5-Gap) — `LifecyclePolicy`: conservative,
+  env-configurable controls for disappearance-based inferred `zone_exited` /
+  dwell closure. Built per worker from `deepstream_lifecycle_*` settings; fed to
+  `ZoneMembershipState.detect_disappearances`.
+- `observation_adapter.py` — the five per-stream adapters (line / object-line /
+  ROI / zone / dwell) + `deepstream_source_block`. P5-Gap added
+  `ZoneMembershipState.detect_disappearances` (inferred exits) + inferred
+  fields on `ZoneTransitionEvent`; P5-G added `requested_package_id` to the
+  source block.
 
 ### `app/packages/`
 - `package_registry.json` — the nine packages (`mock.detect.v0`, the five
