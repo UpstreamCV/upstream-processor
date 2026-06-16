@@ -248,6 +248,14 @@ class Settings(BaseSettings):
     # emitted for that session.
     deepstream_dwell_exceeded_threshold_seconds: float = 60.0
 
+    # --- P5-Gap: analytics lifecycle policy (disappearance handling) ---
+    # When a committed-inside track DISAPPEARS (its id vanishes) for longer
+    # than the grace window, infer a ``zone_exited`` (which also closes the
+    # dwell) instead of silently losing the lifecycle. Conservative + ON by
+    # default; tune in production. See app/observations/lifecycle_policy.py.
+    deepstream_lifecycle_track_missing_grace_seconds: float = 2.0
+    deepstream_lifecycle_infer_zone_exit_on_disappearance: bool = True
+
     # --- P5-C latest perception snapshot -----------------------------
     # A low-rate (~1/s) JSON snapshot of what the analytics worker
     # currently sees — detected objects + configured ROI/line geometry —

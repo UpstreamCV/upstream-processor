@@ -1133,3 +1133,18 @@ of tracker — "track disappearance ≠ zone exit" (P4-D) and "disappearance ≠
 close dwell session" (P4-E) — so if either event stays weak after NvDCF,
 document the limitation rather than forcing a pass. Never `supported` without a
 separate license + deployment review (`production_ready` stays `false`).
+
+## P5-Gap — analytics lifecycle policy (env tuning)
+
+When a tracked person enters a zone and then disappears, the worker infers a
+`zone_exited` (and closes the dwell) after a grace window. Conservative + ON by
+default; tune via env:
+
+```sh
+UPSTREAM_DEEPSTREAM_LIFECYCLE_TRACK_MISSING_GRACE_SECONDS=2.0       # absent this long -> infer exit + close dwell
+UPSTREAM_DEEPSTREAM_LIFECYCLE_INFER_ZONE_EXIT_ON_DISAPPEARANCE=true  # master on/off
+```
+
+Inferred exits carry `inferred:true` / `exit_reason:"track_missing_timeout"` in
+the observation payload. Set `..._INFER_ZONE_EXIT_ON_DISAPPEARANCE=false` to
+restore the pre-P5-Gap "disappearance never exits" behavior.

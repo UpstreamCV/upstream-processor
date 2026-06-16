@@ -4,6 +4,39 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-15 - P5-Gap + P5-G: analytics lifecycle policy + package request/apply
+
+**Why:** P5-F showed NvDCF didn't beat IOU, so the weak per-track events are an
+analytics-lifecycle problem, not a tracker one: a track that entered a zone and
+then DISAPPEARED never emitted an exit / closed its dwell. P5-Gap makes that an
+explicit, configurable policy. P5-G surfaces a camera's requested-vs-applied
+package (the api-server side adds the endpoints).
+
+**What (P5-Gap):**
+- `app/observations/lifecycle_policy.py` — `LifecyclePolicy` (conservative,
+  ON by default; env-overridable via `deepstream_lifecycle_*` in `config.py`).
+- `ZoneMembershipState.detect_disappearances()` — infers `processor.zone_exited`
+  for a committed-inside track absent past the grace window, with guards
+  (grace 2s, min-presence 0.5s, never-without-commit, reappear resets) and the
+  existing per-(track,zone,type) sequence/idempotency key so a later real exit
+  is distinct. Payload carries `inferred:true` / `exit_reason` /
+  `last_seen_at` / `missing_duration_seconds` (open payload — no taxonomy/server
+  change). The inferred exit also CLOSES the dwell via the existing
+  `DwellState.absorb_zone_event` path (no new dwell event by default).
+- `worker.py` — computes per-frame `active_track_ids`, calls
+  `detect_disappearances` after the per-object pass, shared `_emit_one_zone_event`
+  helper so inferred + observed exits emit identically.
+- Tests: 8 adapter + 2 worker integration + 1 short-lived line-crossing; the
+  observed-path behavior is unchanged (existing tests pass).
+
+**What (P5-G processor):** status payload + observation source block now carry
+`requested_package_id` (= session.package_id) and `applied_package_id`
+(= resolved package); they differ only under FORCE/fallback. Selection priority
+(`UPSTREAM_FORCE_PACKAGE_ID` → session.package_id → default) and the fail-closed
+behavior for an explicitly-requested invalid package are unchanged.
+
+762 tests pass; mypy + ruff clean.
+
 ## 2026-06-15 - Processing P5-F (Track A): NvDCF config reconciliation + validation
 
 **Why:** P5-E's NvDCF settings were authored best-effort and over-fragmented in

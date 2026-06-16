@@ -45,6 +45,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from app.observations.lifecycle_policy import LifecyclePolicy
+
 # Candidate observation type strings the P4 adapter will emit. Defined
 # here (NOT in ``app/observations/schemas.py``) until the server-side
 # literal is widened — keeping them out of the strict-validated payload
@@ -751,6 +753,13 @@ class ZoneTransitionEvent:
     confidence: float | None = None
     source: dict[str, Any] = field(default_factory=dict)
     debug: dict[str, Any] = field(default_factory=dict)
+    # P5-Gap: set on an INFERRED zone_exited (track disappeared past the grace
+    # window). Real observed exits leave these unset. Surfaced top-level in the
+    # payload so consumers can distinguish inferred from observed lifecycle.
+    inferred: bool = False
+    exit_reason: str | None = None
+    last_seen_at: datetime | None = None
+    missing_duration_seconds: float | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Body for the ``payload`` field of ``ObservationPayload``.
@@ -773,6 +782,15 @@ class ZoneTransitionEvent:
             body["class_label"] = self.class_label
         if self.confidence is not None:
             body["confidence"] = round(float(self.confidence), 4)
+        # P5-Gap: inferred-exit metadata (only on inferred zone_exited).
+        if self.inferred:
+            body["inferred"] = True
+            if self.exit_reason is not None:
+                body["exit_reason"] = self.exit_reason
+            if self.last_seen_at is not None:
+                body["last_seen_at"] = self.last_seen_at.isoformat()
+            if self.missing_duration_seconds is not None:
+                body["missing_duration_seconds"] = round(float(self.missing_duration_seconds), 3)
         return body
 
 
@@ -861,6 +879,12 @@ class ZoneMembershipState:
     # so a re-enter is :2 and a re-exit is also :2 (distinct keys
     # because the obs_type segment of the key differs).
     sequence_by_track_zone_transition: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    # P5-Gap: disappearance-based inferred-exit policy + bookkeeping.
+    # ``last_seen_inside_at`` = last frame-time the track was observed inside the
+    # zone; the missing window is measured from here. Used only by
+    # ``detect_disappearances``.
+    lifecycle_policy: LifecyclePolicy = field(default_factory=LifecyclePolicy)
+    last_seen_inside_at: dict[tuple[str, str], datetime] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.membership_stability_frames < 1:
@@ -897,6 +921,11 @@ class ZoneMembershipState:
             key = (track_id, zone_id)
             committed = self.stable_membership.get(key)
 
+            # P5-Gap: remember the last frame-time the track was seen inside —
+            # the disappearance detector measures the missing window from here.
+            if observed:
+                self.last_seen_inside_at[key] = occurred_at
+
             # Case A: never observed inside this zone for this track,
             # and not observed inside now. No state to track.
             if committed is None and observed is False:
@@ -924,6 +953,10 @@ class ZoneMembershipState:
             self.stable_membership[key] = observed
             self.pending_membership.pop(key, None)
             self.pending_seen_frames.pop(key, None)
+            # P5-Gap: on a committed (observed) exit, clear the disappearance
+            # bookkeeping so it can't also fire an inferred exit.
+            if not observed:
+                self.last_seen_inside_at.pop(key, None)
             obs_type = CANDIDATE_ZONE_ENTERED_TYPE if observed else CANDIDATE_ZONE_EXITED_TYPE
             seq_key = (track_id, zone_id, obs_type)
             seq = self.sequence_by_track_zone_transition.get(seq_key, 0) + 1
@@ -964,6 +997,87 @@ class ZoneMembershipState:
                     confidence=confidence,
                     source=dict(source or {}),
                     debug=merged_debug,
+                )
+            )
+        return events
+
+    def detect_disappearances(
+        self,
+        *,
+        active_track_ids: set[str] | frozenset[str],
+        occurred_at: datetime,
+        source: dict[str, Any] | None = None,
+        debug: dict[str, Any] | None = None,
+    ) -> list[ZoneTransitionEvent]:
+        """P5-Gap: infer ``zone_exited`` for committed-inside tracks that have
+        DISAPPEARED (not present in the current frame's ``active_track_ids``)
+        for longer than the policy's grace window.
+
+        Conservative: only a track that COMMITTED inside (``stable_membership``
+        True — i.e. already a confirmed presence via
+        ``membership_stability_frames``) can be inferred to have exited; the
+        missing window is measured from the last observed-inside frame, so a
+        track that reappears before the grace elapses resets and never produces
+        an inferred exit. The inferred exit reuses the per-(track, zone, type)
+        sequence + idempotency key, so a later real exit is a distinct event (no
+        duplicates) — and because the exit is ALWAYS emitted (no silent
+        suppression), the matching dwell session is always closed (no leak).
+        Called once per frame by the worker after the per-object pass; a no-op
+        (returns ``[]``) when the policy disables it."""
+        policy = self.lifecycle_policy
+        if not policy.infer_zone_exit_on_disappearance:
+            return []
+        events: list[ZoneTransitionEvent] = []
+        for (track_id, zone_id), committed in list(self.stable_membership.items()):
+            if committed is not True:
+                continue  # only a committed-inside track can be inferred to exit
+            if track_id in active_track_ids:
+                continue  # still present this frame
+            key = (track_id, zone_id)
+            last_seen = self.last_seen_inside_at.get(key)
+            if last_seen is None:
+                continue  # defensive: no sighting recorded
+            missing = (occurred_at - last_seen).total_seconds()
+            if missing < policy.track_missing_grace_seconds:
+                continue  # within grace — a dropped frame, not (yet) an exit
+            obs_type = CANDIDATE_ZONE_EXITED_TYPE
+            seq_key = (track_id, zone_id, obs_type)
+            seq = self.sequence_by_track_zone_transition.get(seq_key, 0) + 1
+            self.sequence_by_track_zone_transition[seq_key] = seq
+            idem = build_zone_exited_idempotency_key(
+                stream_session_id=self.stream_session_id,
+                zone_id=zone_id,
+                track_id=track_id,
+                sequence=seq,
+            )
+            # Commit outside + clear bookkeeping so this fires exactly once.
+            self.stable_membership[key] = False
+            self.pending_membership.pop(key, None)
+            self.pending_seen_frames.pop(key, None)
+            self.last_seen_inside_at.pop(key, None)
+            events.append(
+                ZoneTransitionEvent(
+                    type=obs_type,
+                    stream_session_id=self.stream_session_id,
+                    occurred_at=occurred_at,
+                    zone_id=zone_id,
+                    zone_label=zone_id,
+                    track_id=track_id,
+                    sequence=seq,
+                    idempotency_key=idem,
+                    class_id=None,
+                    class_label=None,
+                    confidence=None,
+                    source=dict(source or {}),
+                    debug={
+                        "transition": "inside_to_outside",
+                        "grace_seconds": policy.track_missing_grace_seconds,
+                        **(debug or {}),
+                    },
+                    inferred=True,
+                    exit_reason="track_missing_timeout",
+                    last_seen_at=last_seen,
+                    missing_duration_seconds=missing,
                 )
             )
         return events
@@ -1347,6 +1461,7 @@ class DwellState:
 def deepstream_source_block(
     *,
     package_id: str,
+    requested_package_id: str | None = None,
     tracker_algorithm: str | None = None,
     geometry_source: str | None = None,
     geometry_revision: int | None = None,
@@ -1371,10 +1486,15 @@ def deepstream_source_block(
     """
     src: dict[str, Any] = {
         "runtime": "deepstream",
+        # ``package_id`` is the APPLIED (resolved) package — what produced this
+        # observation. P5-G adds ``requested_package_id`` (what the camera asked
+        # for) when it differs, so consumers can see requested-vs-applied.
         "package_id": package_id,
         "metadata_source": "pyds_pad_probe",
         "analytics_plugin": "nvdsanalytics",
     }
+    if requested_package_id is not None and requested_package_id != package_id:
+        src["requested_package_id"] = requested_package_id
     if tracker_algorithm is not None:
         src["tracker_algorithm"] = tracker_algorithm
     if geometry_source is not None:

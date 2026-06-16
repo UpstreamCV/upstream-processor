@@ -554,3 +554,41 @@ async def test_background_objects_do_not_emit_zone_or_dwell(fast_settings) -> No
     assert "7" in zone_tracks  # the person enters
     assert "42" not in zone_tracks  # the book never does
     assert "42" not in dwell_tracks
+
+
+# --- P5-G: requested vs applied package lineage -----------------------
+
+
+def test_status_payload_carries_requested_and_applied_package(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """The metadata status payload reports both the camera's requested
+    package (session.package_id) and the applied/resolved package."""
+    worker = DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL, package_id=_PKG),
+        settings=fast_settings,
+        api=FakeApi(),
+        package=resolve(_PKG),
+        pm_factory=lambda: FakeMetadataPM([]),
+    )
+    payload = worker._metadata_payload(
+        counters=_MetadataCounters(), queue_stats={}, last_app_summary=None
+    )
+    assert payload["requested_package_id"] == _PKG
+    assert payload["applied_package_id"] == _PKG
+
+
+def test_source_block_marks_requested_when_it_differs_from_applied(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """When the session requested a different package than what ran (e.g.
+    UPSTREAM_FORCE_PACKAGE_ID / fallback), the observation source block
+    surfaces requested_package_id; when they match it is omitted."""
+    # Differ: session asked for mock.detect.v0 but the worker runs the YOLOX
+    # analytics package (mirrors a FORCE override).
+    forced = DeepStreamWorker(
+        session=_session(internal_rtsp_url=_URL, package_id="mock.detect.v0"),
+        settings=fast_settings,
+        api=FakeApi(),
+        package=resolve(_PKG),
+        writer=ObservationWriter(FakeApi(), "proc_test_001"),
+        pm_factory=lambda: FakeMetadataPM([]),
+    )
+    assert forced._session.package_id == "mock.detect.v0"
+    assert forced._package.package_id == _PKG  # applied differs from requested

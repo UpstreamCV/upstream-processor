@@ -345,3 +345,39 @@ def test_state_prunes_stale_entries_beyond_max() -> None:
     )
     assert len(state.active_by_track_line) == 1
     assert ("fresh", "line-1") in state.active_by_track_line
+
+
+# --- P5-Gap: short-lived / fragmented tracks crossing a line ----------
+
+
+async def test_short_lived_track_crossing_still_emits(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """A track that crosses the line in ONE frame and then disappears
+    still emits the per-object line_crossing_object (rising edge fires on
+    the first sighting with the line label) AND the aggregate counter.
+    Confirms object line crossing is not lost for short-lived tracks; the
+    aggregate counter is the track-independent backstop either way."""
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            # Frame 0: track 9 crosses (seen once with the line label).
+            _frame_line(
+                frame_num=0,
+                objects=[_obj(tracker_id="9", line_labels=["line-1"])],
+                line_crossing_cumulative={"line-1": 1},
+                timestamp=_now_iso(0),
+            ),
+            # Frame 1: track 9 is GONE; the crossing was already emitted.
+            _frame_line(
+                frame_num=1,
+                objects=[],
+                line_crossing_cumulative={"line-1": 1},
+                timestamp=_now_iso(1),
+            ),
+        ],
+        exit_code=124,
+    )
+    await asyncio.wait_for(_analytics_worker(api, fast_settings, pm).run(), timeout=3)
+    per_object = _obs_of(api, "processor.line_crossing_object")
+    assert len(per_object) == 1
+    assert per_object[0].payload["track_id"] == "9"
+    assert len(_obs_of(api, "processor.line_crossing")) == 1  # aggregate backstop

@@ -552,3 +552,47 @@ async def test_status_payload_distinguishes_dwell_types_after_full_cycle(  # typ
     assert p["dwell_started_observations_emitted"] == 1
     assert p["dwell_updated_observations_emitted"] >= 1
     assert p["dwell_exceeded_observations_emitted"] == 1
+
+
+# --- P5-Gap: disappearance closes the dwell (no leak / no false exceeded) ----
+
+
+async def test_disappearance_closes_dwell_no_false_exceeded(fast_settings) -> None:  # type: ignore[no-untyped-def]
+    """A person commits inside (dwell_started) then VANISHES. The inferred
+    zone_exited must CLOSE the dwell so no dwell_exceeded / dwell_updated fires
+    for the gone track — the leak the P5-Gap audit caught. grace=0 so the
+    inferred exit fires on the first absent frame."""
+    settings = fast_settings.model_copy(
+        update={
+            "deepstream_lifecycle_track_missing_grace_seconds": 0.0,
+            "deepstream_dwell_update_interval_seconds": 2.0,
+            "deepstream_dwell_exceeded_threshold_seconds": 5.0,
+        }
+    )
+    api = FakeApi()
+    pm = FakeMetadataPM(
+        [
+            # t=0: person inside -> zone_entered + dwell_started.
+            _frame_line(
+                frame_num=0,
+                objects=[_person(tracker_id="0", roi_labels=["entry-roi"])],
+                roi_counts={"entry-roi": 1},
+                timestamp=_now_iso(0),
+            ),
+            # t=1: person GONE -> inferred zone_exited closes the dwell.
+            _frame_line(
+                frame_num=1, objects=[], roi_counts={"entry-roi": 0}, timestamp=_now_iso(1)
+            ),
+            # t=10: well past the 5s exceeded threshold; dwell is closed.
+            _frame_line(
+                frame_num=2, objects=[], roi_counts={"entry-roi": 0}, timestamp=_now_iso(10)
+            ),
+        ],
+        exit_code=124,
+    )
+    await asyncio.wait_for(_analytics_worker(api, settings, pm).run(), timeout=5)
+    assert len(_obs_of(api, "processor.dwell_started")) == 1
+    assert _obs_of(api, "processor.dwell_exceeded") == []  # gone track must not exceed
+    assert _obs_of(api, "processor.dwell_updated") == []
+    exits = _obs_of(api, "processor.zone_exited")
+    assert len(exits) == 1 and exits[0].payload["inferred"] is True

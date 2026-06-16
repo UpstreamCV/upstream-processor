@@ -2335,3 +2335,50 @@ boxes with steady geometry on the dashboard WS hot path. Known finding:
 hot rate measured ~6 Hz (target 12) because observation emits are
 awaited inline in the frame loop — moving emits to a background sender
 is the follow-up that unlocks the full rate.
+
+## P5-Gap — Analytics Lifecycle Policy (disappearance handling)
+
+Pre-P5-Gap the zone/dwell adapters never acted on a track DISAPPEARING (a
+dropped frame couldn't be told from a real exit), so a person who entered a
+zone and was then lost never produced `zone_exited` and never closed their
+dwell — the root cause of the unproven exit/dwell events (P5-F showed it was
+not a tracker problem).
+
+`LifecyclePolicy` (`app/observations/lifecycle_policy.py`, conservative + ON by
+default, two env knobs: `deepstream_lifecycle_track_missing_grace_seconds` and
+`deepstream_lifecycle_infer_zone_exit_on_disappearance`) drives
+`ZoneMembershipState.detect_disappearances()`: each frame the worker computes
+the set of active track ids — from the **raw** frame objects (tracker presence),
+so a track whose class flickers out of `selected_classes` is not mistaken for
+gone — and for any **committed-inside** track absent longer than
+`track_missing_grace_seconds`, emits an **inferred** `processor.zone_exited`.
+There is intentionally no separate minimum-presence knob: a committed-inside
+track has already cleared `membership_stability_frames` of presence, and an
+extra presence gate was both redundant and leak-prone (it could suppress the
+exit while leaving the dwell open). Guards: only committed-inside tracks
+qualify; a reappearance resets the missing timer (a brief drop never fires); the
+existing per-(track, zone, type) sequence + idempotency key make a later real
+exit a distinct event (no duplicates). The payload adds `inferred: true` /
+`exit_reason: "track_missing_timeout"` / `last_seen_at` /
+`missing_duration_seconds` — open payload, no taxonomy or server change. The
+inferred exit is fed into `DwellState` exactly like a real exit, so it **closes
+the dwell session** (and because the exit is ALWAYS emitted, the dwell never
+leaks). A track that disappears therefore stops accruing dwell and does NOT emit
+a further `dwell_exceeded`. The whole behavior is disabled by setting
+`UPSTREAM_DEEPSTREAM_LIFECYCLE_INFER_ZONE_EXIT_ON_DISAPPEARANCE=false`.
+
+Short-lived line crossings already work (object line-crossing fires on the
+first sighting's rising edge; the aggregate counter is the track-independent
+backstop) — P5-Gap adds a regression test, no adapter change.
+
+## P5-G — Camera Package Request/Apply (processor side)
+
+Selection priority is unchanged: `UPSTREAM_FORCE_PACKAGE_ID` (test/probe) →
+the session's `package_id` (the camera's requested package, served by
+eligible-sessions) → default. An explicitly-requested package that fails to
+resolve fails closed (`failed` / `package_resolution` + quarantine) — it never
+silently falls back. The status payload and every observation's source block
+now carry `requested_package_id` (= session.package_id) and `applied_package_id`
+(= the resolved package); they differ only under FORCE / fallback. A package
+change takes effect on the camera's **next session** (no live worker restart).
+The requested/applied/state API lives in the api-server.
