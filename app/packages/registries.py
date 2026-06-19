@@ -62,6 +62,14 @@ COMPUTE_TIERS = frozenset({"low", "medium", "high", "very_high"})
 PRICING_TIERS = frozenset({"free_probe", "lite", "balanced", "accurate", "custom"})
 OBSERVATION_VOLUME_RISKS = frozenset({"low", "medium", "high"})
 ANALYTICS_CONFIG_MODES = frozenset({"generated_ini"})
+# P5-K licensing/provenance axis (orthogonal to ``status``). Drives whether
+# Upstream may auto-provide a model as a FIRST-PARTY hosted package:
+# - ``permissive``          — permissive OSS (e.g. Apache-2.0 YOLOX); auto-providable.
+# - ``commercial_agreement``— covered by a commercial agreement (e.g. NVIDIA TAO
+#                             EULA); auto-providable, re-review gated to ``supported``.
+# - ``restrictive``         — AGPL/GPL/non-commercial (e.g. Ultralytics); BYOM-only,
+#                             NOT auto-provided first-party until legal approval.
+LICENSE_CLASSES = frozenset({"permissive", "commercial_agreement", "restrictive"})
 
 # --- specs ----------------------------------------------------------------
 
@@ -87,6 +95,11 @@ class ModelDeepStreamSpec:
     # ``None`` = artifacts are baked into the image at ``model_artifact_path``
     # (the TrafficCamNet sample case).
     artifact_subdir: str | None = None
+    # P5-K: per-model ONNX filename inside the artifact dir, for model families
+    # whose runtime plan is otherwise size-agnostic (YOLOX nano/tiny/s/m share a
+    # parser; Ultralytics sizes share a parser). ``None`` = the family default
+    # (e.g. ``yolox_s.onnx`` for the original YOLOX-S entry — byte-identical).
+    onnx_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +112,11 @@ class ModelSpec:
     status: str
     license: str
     license_notes: str
+    # P5-K licensing/provenance (see ``LICENSE_CLASSES``). ``first_party`` =
+    # may Upstream auto-provide this as a first-party hosted package? False for
+    # restrictive (AGPL) models that are BYOM-only until legal approval.
+    license_class: str
+    first_party: bool
     source: str
     supported_classes: tuple[str, ...]
     class_id_map: dict[str, int]
@@ -265,6 +283,7 @@ def _parse_model_deepstream(raw: Any, ctx: str) -> ModelDeepStreamSpec | None:
         known_working_image=_opt_str(raw, "known_working_image", ctx),
         blackwell_supported=_opt_bool(raw, "blackwell_supported", ctx),
         artifact_subdir=_opt_str(raw, "artifact_subdir", ctx),
+        onnx_file=_opt_str(raw, "onnx_file", ctx),
     )
 
 
@@ -302,6 +321,13 @@ def parse_model_registry(data: dict[str, Any]) -> dict[str, ModelSpec]:
             status=_enum(_req_str(entry, "status", ctx), COMPONENT_STATUSES, "status", ctx),
             license=_req_str(entry, "license", ctx),
             license_notes=_req_str(entry, "license_notes", ctx),
+            license_class=_enum(
+                _req_str(entry, "license_class", ctx),
+                LICENSE_CLASSES,
+                "license_class",
+                ctx,
+            ),
+            first_party=_req_bool(entry, "first_party", ctx),
             source=_req_str(entry, "source", ctx),
             supported_classes=_str_tuple(entry, "supported_classes", ctx),
             class_id_map=dict(class_id_map_raw),

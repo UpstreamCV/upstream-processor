@@ -4,6 +4,84 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-18 - Processing P5-K: Curated Model + Package Catalog Expansion (in-repo prep)
+
+**Why:** the catalog was one live-verified detector (`yolox_s_v1`) + one
+people-analytics package, with `trafficcamnet_v1` as the only other usable
+model. P5-K broadens the curated catalog so a future package-assignment flow
+has real model/size/license choices to pick from — and records a provenance
+axis (licensing + first-party hosting) so legal/commercial constraints are
+visible at the registry level. This is **curated package + model expansion
+(BYOM-first)** — NOT BYOM upload, NOT a marketplace.
+
+**Honesty contract (read first):** there is **no prod-GPU access this
+milestone**, so NO new model or package ships as `probe`. Everything new is
+`status: experimental` — the operator's prep+verify run on the GPU host is the
+promotion gate to `probe`. The new Ultralytics decode parser is
+**authored-but-not-GPU-validated**. Prep is in-repo only.
+
+**Models (`app/packages/model_registry.json`, 3 → 10):** every model now
+carries two provenance fields — `license_class` ∈ {permissive,
+commercial_agreement, restrictive} and `first_party` (bool) — plus an optional
+`deepstream.onnx_file` (per-model ONNX filename).
+- `yolox_nano_v1` / `yolox_tiny_v1` (416 input) / `yolox_m_v1` (640) — Apache-2.0,
+  permissive, first_party=true; **reuse the existing live-verified
+  `NvDsInferParseYolox` grid-decode parser** (only the ONNX + input res differ).
+- `yolo11n_v1` / `yolo11s_v1` / `yolo11m_v1` — Ultralytics AGPL-3.0,
+  license_class=restrictive, **first_party=false** (BYOM — Upstream holds an
+  Ultralytics Enterprise license for dev, but first-party hosting awaits legal
+  sign-off); use the NEW `NvDsInferParseUltralytics` parser.
+- `yolov8n_v1` — flipped `planned` → `experimental` (license now held);
+  completed to full COCO-80; restrictive/first_party=false; Ultralytics parser.
+- `peoplenet_v1` — NVIDIA TAO/NGC EULA, license_class=commercial_agreement,
+  first_party=true; reuses the BUILT-IN DetectNet_v2 parser (same path as
+  TrafficCamNet); classes person/bag/face.
+- `yolox_s_v1` (permissive/first_party) and `trafficcamnet_v1`
+  (commercial_agreement/first_party) keep `status: probe` unchanged.
+
+**Parser (NEW):**
+`app/runtimes/deepstream_runtime/ultralytics_parser/nvdsparsebbox_ultralytics.cpp`
+— custom decode for the Ultralytics (YOLO11/YOLOv8) objectness-free transposed
+output ([1,84,8400], no grid/stride decode, sigmoid scores). Authored from the
+published output contract; **NOT yet GPU-validated**.
+
+**Runtime (`app/runtimes/deepstream_runtime/inference.py`):** generalized the
+YOLOX plan to use per-model `onnx_file` (`yolox_s` stays byte-identical when
+`onnx_file` is unset); added `build_ultralytics_pgie_config` +
+`build_detectnet_pgie_config` and plan handlers for the
+`ultralytics_onnx_fp16_v1` and `builtin_detectnet_peoplenet_v1` templates. A
+package's `outputs` / `supported_triggers` / `supported_shapes` are
+**catalog/UX declarations, NOT a runtime emission filter** — the emission mode
+is chosen by the package `supports` block (worker `_mode`); all YOLOX+IOU
+analytics packages run the byte-identical pipeline.
+
+**Prep scripts (operator GPU scripts, never run by tests/worker):**
+- `scripts/prepare_yolox_model.sh` — parameterized with `YOLOX_SIZE=s|m|nano|tiny`
+  (default `s` = byte-identical to the P5-B path).
+- `scripts/prepare_ultralytics_model.sh` (NEW) — exports ONNX via the
+  `ultralytics` image, compiles the custom parser; gated on
+  `ACK_ULTRALYTICS_LICENSE=1` (AGPL/Enterprise ack) + `CONFIRM_DOWNLOAD=1`.
+- `scripts/prepare_peoplenet_model.sh` (NEW) — NGC pull + labels; no custom
+  parser to compile.
+
+**Packages (`app/packages/package_registry.json`, +14):**
+- 5 YOLOX-S + IOU people variants
+  `deepstream.yolox_people_{fast,high_recall,line_crossing,occupancy,dwell}_probe.v0`
+  — fast/high_recall/occupancy/dwell are `probe` (same live-verified YOLOX-S+IOU
+  chain), `line_crossing` is `experimental` (IOU line-crossing not live-confirmed).
+- 1 TrafficCamNet vehicle package `deepstream.trafficcamnet_vehicle_probe.v0`
+  (`experimental`).
+- 8 per-new-model people packages
+  `deepstream.{yolox_nano,yolox_tiny,yolox_m,yolo11n,yolo11s,yolo11m,yolov8n,peoplenet}_people_probe.v0`
+  (all `experimental`, gated on the operator prep+verify run).
+- `deepstream.yolox_analytics_probe.v0` (the generic/balanced default) is
+  unchanged.
+
+All tests pass; mypy + ruff clean. Docs: `docs/local-dev.md` (per-model prep
+runbooks + env gates + a model-readiness/licensing table),
+`docs/architecture.md` + `docs/module-map.md` (catalog inventory + the
+`license_class`/`first_party` provenance axis + the new parser/templates).
+
 ## 2026-06-15 - P5-Gap + P5-G: analytics lifecycle policy + package request/apply
 
 **Why:** P5-F showed NvDCF didn't beat IOU, so the weak per-track events are an

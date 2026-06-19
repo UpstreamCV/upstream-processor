@@ -146,6 +146,21 @@ def test_all_packages_still_resolve() -> None:
         "deepstream.yolox_probe.v0",
         _PKG,
         "deepstream.yolox_analytics_nvdcf_probe.v0",  # P5-E
+        # P5-K — variants + vehicle + one people package per new model.
+        "deepstream.yolox_people_fast_probe.v0",
+        "deepstream.yolox_people_high_recall_probe.v0",
+        "deepstream.yolox_people_line_crossing_probe.v0",
+        "deepstream.yolox_people_occupancy_probe.v0",
+        "deepstream.yolox_people_dwell_probe.v0",
+        "deepstream.trafficcamnet_vehicle_probe.v0",
+        "deepstream.yolox_nano_people_probe.v0",
+        "deepstream.yolox_tiny_people_probe.v0",
+        "deepstream.yolox_m_people_probe.v0",
+        "deepstream.yolo11n_people_probe.v0",
+        "deepstream.yolo11s_people_probe.v0",
+        "deepstream.yolo11m_people_probe.v0",
+        "deepstream.yolov8n_people_probe.v0",
+        "deepstream.peoplenet_people_probe.v0",
     ):
         assert resolve(package_id).package_id == package_id
 
@@ -229,7 +244,7 @@ def test_model_key_runtime_map_derived_from_registry() -> None:
     assert mapping["sample_trafficcamnet"] == "deepstream"
     assert mapping["yolox_s_v1"] == "deepstream"
     assert mapping["yolox_s"] == "deepstream"
-    assert mapping["yolov8n_v1"] == "deepstream"  # planned still known
+    assert mapping["yolov8n_v1"] == "deepstream"  # P5-K: experimental, still known
     # Static supplement: the mock model has no registry entry.
     assert mapping["mock_detect_v0"] == "mock"
     assert "definitely_unknown_v9" not in mapping

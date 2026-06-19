@@ -50,19 +50,29 @@ What each file owns.
   source block.
 
 ### `app/packages/`
-- `package_registry.json` — the nine packages (`mock.detect.v0`, the five
+- `package_registry.json` — the catalog of packages (`mock.detect.v0`, the five
   TrafficCamNet DeepStream probes, P5-B's `deepstream.yolox_probe.v0`, P5-D's
-  `deepstream.yolox_analytics_probe.v0`, and P5-E's experimental
-  `deepstream.yolox_analytics_nvdcf_probe.v0` — same YOLOX+analytics chain,
-  NvDCF tracker), each referencing model/tracker/analytics registry ids plus
-  compute/pricing placeholders and P5-D package-readiness metadata
-  (category/triggers/complexity/production_ready honesty gate).
+  `deepstream.yolox_analytics_probe.v0` (the generic/balanced default), P5-E's
+  experimental `deepstream.yolox_analytics_nvdcf_probe.v0`, and P5-K's curated
+  expansion — 5 YOLOX-S+IOU people variants
+  (`deepstream.yolox_people_{fast,high_recall,line_crossing,occupancy,dwell}_probe.v0`),
+  a TrafficCamNet vehicle package, and 8 per-new-model people packages
+  (yolox_nano/tiny/m, yolo11n/s/m, yolov8n, peoplenet)). Each references
+  model/tracker/analytics registry ids plus compute/pricing placeholders and
+  P5-D package-readiness metadata (category/triggers/complexity/production_ready
+  honesty gate). `outputs`/`supported_triggers`/`supported_shapes` are
+  catalog/UX declarations, NOT a runtime emission filter — the worker `_mode`
+  (from the package `supports` block) picks the pipeline.
 - `model_registry.json` / `tracker_registry.json` / `analytics_registry.json`
-  — curated lower-level components (Processing P5): the live-verified
-  TrafficCamNet model + planned YOLO placeholders, the live-verified IOU
-  tracker profile + P5-E's authored-but-unverified `experimental` NvDCF
-  profile (ReID-free perf config) + still-planned NvSORT, and the
-  nvdsanalytics probe profile.
+  — curated lower-level components (Processing P5..P5-K): 10 detection models
+  (TrafficCamNet + YOLOX-S/Nano/Tiny/M + YOLO11-N/S/M + YOLOv8-N + PeopleNet),
+  each carrying a `license_class` (permissive/commercial_agreement/restrictive)
+  + `first_party` provenance axis and an optional `deepstream.onnx_file`; only
+  `yolox_s_v1`/`trafficcamnet_v1` are live-verified `probe`, the eight P5-K
+  models are `experimental` (in-repo prep, no GPU verification yet). Plus the
+  live-verified IOU tracker profile + P5-E's authored-but-unverified
+  `experimental` NvDCF profile (ReID-free perf config) + still-planned NvSORT,
+  and the nvdsanalytics probe profile.
 - `registries.py` — strict typed loaders/validators for the three component
   registries (`RegistryValidationError` on duplicates / missing fields / bad
   enums) + runnable-entry lookup helpers used by the DeepStream config hooks
