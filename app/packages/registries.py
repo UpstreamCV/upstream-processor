@@ -103,6 +103,31 @@ class ModelDeepStreamSpec:
 
 
 @dataclass(frozen=True)
+class ModelMetricsSpec:
+    """P5-L — curated, PUBLISHED reference benchmarks for operator model
+    comparison (mAP / params / etc.). These are NOT measured by Upstream on
+    customer hardware — ``upstream_measured`` is always False today and
+    ``metric_source``/``metric_dataset`` record where each number came from.
+
+    COCO fields apply to the COCO-trained detectors (YOLOX/Ultralytics); the
+    NVIDIA TAO models (TrafficCamNet/PeopleNet) have no COCO mAP, so their COCO
+    fields are None and their vendor-reported KPI rides in ``vendor_kpi_*``
+    (clearly labelled, NOT comparable to COCO mAP)."""
+
+    metric_source: str  # required: where the numbers came from (provenance/honesty)
+    upstream_measured: bool  # required: always False today (published reference, not ours)
+    metric_dataset: str | None = None
+    coco_map50_95: float | None = None
+    coco_map50: float | None = None
+    params_m: float | None = None
+    input_size: int | None = None
+    backbone: str | None = None
+    vendor_kpi_label: str | None = None
+    vendor_kpi_value: float | None = None
+    vendor_kpi_note: str | None = None
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     model_id: str
     display_name: str
@@ -136,6 +161,9 @@ class ModelSpec:
     estimated_cost_weight: float
     observation_volume_risk: str
     notes: str
+    # P5-L: published reference benchmarks for the model-comparison UI. None
+    # for models with no curated stats (e.g. the mock detector).
+    metrics: ModelMetricsSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -287,6 +315,26 @@ def _parse_model_deepstream(raw: Any, ctx: str) -> ModelDeepStreamSpec | None:
     )
 
 
+def _parse_model_metrics(raw: Any, ctx: str) -> ModelMetricsSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RegistryValidationError(f"{ctx}: 'metrics' must be an object or null")
+    return ModelMetricsSpec(
+        metric_source=_req_str(raw, "metric_source", ctx),
+        upstream_measured=_req_bool(raw, "upstream_measured", ctx),
+        metric_dataset=_opt_str(raw, "metric_dataset", ctx),
+        coco_map50_95=_opt_number(raw, "coco_map50_95", ctx),
+        coco_map50=_opt_number(raw, "coco_map50", ctx),
+        params_m=_opt_number(raw, "params_m", ctx),
+        input_size=_opt_int(raw, "input_size", ctx),
+        backbone=_opt_str(raw, "backbone", ctx),
+        vendor_kpi_label=_opt_str(raw, "vendor_kpi_label", ctx),
+        vendor_kpi_value=_opt_number(raw, "vendor_kpi_value", ctx),
+        vendor_kpi_note=_opt_str(raw, "vendor_kpi_note", ctx),
+    )
+
+
 def parse_model_registry(data: dict[str, Any]) -> dict[str, ModelSpec]:
     """Pure parser/validator for model-registry JSON. Raises
     ``RegistryValidationError`` on duplicate ids / missing fields / bad
@@ -361,6 +409,7 @@ def parse_model_registry(data: dict[str, Any]) -> dict[str, ModelSpec]:
                 ctx,
             ),
             notes=_req_str(entry, "notes", ctx),
+            metrics=_parse_model_metrics(entry.get("metrics"), ctx),
         )
         for alias in spec.aliases:
             key = alias.strip().lower()
