@@ -69,7 +69,11 @@ What each file owns.
   each carrying a `license_class` (permissive/commercial_agreement/restrictive)
   + `first_party` provenance axis and an optional `deepstream.onnx_file`; only
   `yolox_s_v1`/`trafficcamnet_v1` are live-verified `probe`, the eight P5-K
-  models are `experimental` (in-repo prep, no GPU verification yet). Plus the
+  models are `experimental` (in-repo prep, no GPU verification yet). P5-L added a
+  `metrics` block to all 10 models — PUBLISHED reference benchmarks (mAP / params /
+  input or, for the TAO models, a labelled vendor KPI), surfaced for an operator
+  model-comparison UI; `upstream_measured` is always false (NOT measured by
+  Upstream). Plus the
   live-verified IOU tracker profile + P5-E's authored-but-unverified
   `experimental` NvDCF profile (ReID-free perf config) + still-planned NvSORT,
   and the nvdsanalytics probe profile.
@@ -77,7 +81,11 @@ What each file owns.
   registries (`RegistryValidationError` on duplicates / missing fields / bad
   enums) + runnable-entry lookup helpers used by the DeepStream config hooks
   (`find_runnable_deepstream_tracker_by_algorithm` and P5-E's by-profile-id
-  variant that backs package-driven tracker selection in the worker).
+  variant that backs package-driven tracker selection in the worker). P5-L added
+  the frozen `ModelMetricsSpec` dataclass + an optional `metrics` field on
+  `ModelSpec` (parsed by `_parse_model_metrics`; `metric_source` +
+  `upstream_measured` required, the rest nullable) — published-reference model
+  benchmarks, never Upstream-measured.
 - `compatibility.py` — `validate_package_compatibility`: package ↔ registry
   cross-checks (unknown ids, runtime support, class subsets, tracker-requiring
   outputs, status gating; planned/deprecated components never resolvable).

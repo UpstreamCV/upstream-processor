@@ -2488,3 +2488,38 @@ DetectNet_v2) from registry data alone. Does NOT prove: any new model's live
 detection quality, the Ultralytics parser's correctness on a GPU, IOU
 line-crossing recall, or first-party hosting clearance for the AGPL models — all
 explicitly deferred to the operator prep + verify run and legal sign-off.
+
+## Processing P5-L — Published-reference model metrics
+
+### Why this exists
+
+P5-K grew the catalog to 10 models but left no way to compare them — no mAP /
+params / input-size anywhere in the registry. P5-L adds a small
+**published-reference model-metrics** layer to back an operator model-comparison
+UI. It is descriptive only — no runtime or resolution behavior changes.
+
+### Honesty contract
+
+These are **published reference benchmarks** taken from each model's paper /
+release / NGC model card — surfaced so operators can compare models. They are
+**NOT measured by Upstream on customer hardware**: `upstream_measured` is always
+`false` and `metric_source` records each number's provenance. The NVIDIA TAO
+vendor KPI is **NOT comparable to COCO mAP**.
+
+### Spec + data
+
+`registries.py` adds a frozen `ModelMetricsSpec` dataclass and an optional
+`metrics: ModelMetricsSpec | None` field on `ModelSpec` (`None` for models with no
+curated stats), parsed by `_parse_model_metrics` (mirrors `_parse_model_deepstream`)
+— `metric_source` + `upstream_measured` required, everything else nullable
+(`metric_dataset`, `coco_map50_95`, `coco_map50`, `params_m`, `input_size`,
+`backbone`, `vendor_kpi_label`, `vendor_kpi_value`, `vendor_kpi_note`).
+
+`model_registry.json` carries a `metrics` block on all 10 models. The COCO-trained
+detectors (YOLOX / Ultralytics) record COCO mAP50-95 + params + input resolution.
+The NVIDIA TAO models (TrafficCamNet / PeopleNet) have **no COCO mAP**, so their
+COCO fields are `null` and a clearly-labelled vendor KPI rides in `vendor_kpi_*`
+(PeopleNet: person mAP 94.19 on NVIDIA's proprietary eval; TrafficCamNet: a null
+value plus a "see the NGC model card; not comparable to COCO" note). Two tests in
+`tests/test_registries.py` assert the metrics are published-reference / never
+`upstream_measured` and that the field is optional-but-strict.

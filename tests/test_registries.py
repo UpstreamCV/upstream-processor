@@ -171,6 +171,41 @@ def test_model_registry_loads_with_expected_entries() -> None:
     assert registry["peoplenet_v1"].first_party is True
 
 
+def test_p5l_model_metrics_are_published_reference() -> None:
+    reg = load_model_registry()
+    # Every detector carries curated published-reference metrics; none claim to
+    # be Upstream-measured (no GPU benchmarking).
+    for mid, m in reg.items():
+        assert m.metrics is not None, mid
+        assert m.metrics.upstream_measured is False, mid
+        assert m.metrics.metric_source  # provenance is required
+    # COCO-trained YOLO detectors carry COCO mAP + params.
+    yolox_s = reg["yolox_s_v1"].metrics
+    assert yolox_s is not None
+    assert yolox_s.coco_map50_95 == 40.5
+    assert yolox_s.params_m == 9.0
+    assert reg["yolo11s_v1"].metrics.coco_map50_95 == 47.0  # type: ignore[union-attr]
+    # NVIDIA TAO models have NO COCO mAP; their vendor KPI is separate + labelled.
+    pn = reg["peoplenet_v1"].metrics
+    assert pn is not None
+    assert pn.coco_map50_95 is None
+    assert pn.vendor_kpi_value == 94.19
+    assert pn.vendor_kpi_label and "not comparable" in (pn.vendor_kpi_note or "")
+    assert reg["trafficcamnet_v1"].metrics.coco_map50_95 is None  # type: ignore[union-attr]
+
+
+def test_model_metrics_optional_and_strict() -> None:
+    # metrics is optional (None when absent) but, when present, requires
+    # metric_source + upstream_measured.
+    assert parse_model_registry({"models": [_model_entry()]})["test_model_v1"].metrics is None
+    with_metrics = _model_entry(metrics={"metric_source": "x", "upstream_measured": False})
+    spec = parse_model_registry({"models": [with_metrics]})["test_model_v1"]
+    assert spec.metrics is not None and spec.metrics.coco_map50_95 is None
+    bad = _model_entry(metrics={"coco_map50_95": 40.0})  # missing required metric_source
+    with pytest.raises(RegistryValidationError, match="metric_source"):
+        parse_model_registry({"models": [bad]})
+
+
 def test_tracker_registry_loads_with_expected_entries() -> None:
     registry = load_tracker_registry()
     iou = registry["deepstream_iou_fast_v1"]

@@ -4,6 +4,47 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-19 - Processing P5-L: Published-reference model metrics (operator comparison)
+
+**Why:** the curated catalog now has 10 models (P5-K) but no way for an operator
+to compare them — there were no mAP / params / input-size numbers anywhere in the
+registry. P5-L adds a small **published-reference model-metrics** layer that backs
+an operator model-comparison UI.
+
+**Honesty contract (read first):** these are **published reference benchmarks**
+(each model's paper / release / NGC model card), surfaced so operators can compare
+models. They are **NOT measured by Upstream on customer hardware** —
+`upstream_measured` is always `false` and `metric_source` records where each
+number came from. The NVIDIA TAO vendor KPI is **NOT comparable to COCO mAP**.
+
+**Spec (`app/packages/registries.py`):**
+- New frozen `ModelMetricsSpec` dataclass + an optional
+  `metrics: ModelMetricsSpec | None` field on `ModelSpec` (`None` for models with
+  no curated stats, e.g. the mock detector).
+- Parsed by a new `_parse_model_metrics` (mirrors `_parse_model_deepstream`):
+  `metric_source` + `upstream_measured` are required; everything else is nullable.
+- Fields: `metric_source`, `upstream_measured`, `metric_dataset`, `coco_map50_95`,
+  `coco_map50`, `params_m`, `input_size`, `backbone`, `vendor_kpi_label`,
+  `vendor_kpi_value`, `vendor_kpi_note`.
+
+**Data (`app/packages/model_registry.json`):** a `metrics` block on all 10 models
+(`upstream_measured: false` throughout).
+- COCO-trained detectors carry COCO mAP50-95 + params + input (verified against
+  sources): YOLOX nano 25.8 / 0.91M / 416, tiny 32.8 / 5.06M / 416, s 40.5 / 9.0M
+  / 640, m 46.9 / 25.3M / 640; YOLOv8-N 37.3 / 3.2M / 640; YOLO11-N 39.5 / 2.6M /
+  640, S 47.0 / 9.4M / 640, M 51.5 / 20.1M / 640.
+- NVIDIA TAO models have **no COCO mAP** — their COCO fields are `null` and a
+  clearly-labelled vendor KPI rides in `vendor_kpi_*`: PeopleNet person mAP 94.19
+  on NVIDIA's proprietary eval (IoU>0.5); TrafficCamNet `vendor_kpi_value: null`
+  with a "see the NGC model card; not comparable to COCO" note.
+
+**Tests (`tests/test_registries.py`, +2):** metrics are published-reference and
+never `upstream_measured`; the field is optional (`None` when absent) but strict
+when present (requires `metric_source` + `upstream_measured`).
+
+No code-behavior or runtime change — metrics are descriptive only. 789 tests pass.
+Docs: `docs/commit-log.md` + `docs/module-map.md` + `docs/architecture.md`.
+
 ## 2026-06-18 - Processing P5-K: Curated Model + Package Catalog Expansion (in-repo prep)
 
 **Why:** the catalog was one live-verified detector (`yolox_s_v1`) + one

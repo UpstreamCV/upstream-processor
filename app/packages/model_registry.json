@@ -57,7 +57,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 1.0,
       "observation_volume_risk": "medium",
-      "notes": "The live-verified probe baseline (M8.2C1 inference, P2 pyds metadata, P3 tracker, P3.5/P4 analytics + observations). Traffic-camera domain; known to misclassify people as cars in non-traffic scenes (P4-D live run). Detection quality is the known blocker for zone-observation quality."
+      "notes": "The live-verified probe baseline (M8.2C1 inference, P2 pyds metadata, P3 tracker, P3.5/P4 analytics + observations). Traffic-camera domain; known to misclassify people as cars in non-traffic scenes (P4-D live run). Detection quality is the known blocker for zone-observation quality.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 NVIDIA TAO TrafficCamNet model card (NGC)",
+        "upstream_measured": false,
+        "metric_dataset": "NVIDIA proprietary eval (IoU>0.5)",
+        "coco_map50_95": null,
+        "coco_map50": null,
+        "params_m": null,
+        "input_size": null,
+        "backbone": "ResNet-18",
+        "vendor_kpi_label": "NVIDIA TAO KPI",
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": "NVIDIA reports precision/recall on a proprietary eval (IoU>0.5) \u2014 see the NGC model card; not comparable to COCO mAP."
+      }
     },
     {
       "model_id": "yolox_s_v1",
@@ -268,7 +281,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 2.0,
       "observation_volume_risk": "high",
-      "notes": "LIVE-VERIFIED probe (P5-B, 2026-06-11, crowdcountS2 RTX 5070 Ti): official raw ONNX (sha256 c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063) + Upstream custom grid-decode parser through the pyds metadata path on a live h264 1280x720@30 stream \u2014 person detected in 1300/1300 frames (conf ~0.93) where TrafficCamNet was unreliable. FP16 TensorRT engine (TRT 10.9) builds in ~222s and is cached in the host model store. Artifacts operator-prepared (scripts/prepare_yolox_model.sh), never committed. Tracker/analytics with YOLOX not yet verified; compute/pricing values remain placeholders."
+      "notes": "LIVE-VERIFIED probe (P5-B, 2026-06-11, crowdcountS2 RTX 5070 Ti): official raw ONNX (sha256 c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063) + Upstream custom grid-decode parser through the pyds metadata path on a live h264 1280x720@30 stream \u2014 person detected in 1300/1300 frames (conf ~0.93) where TrafficCamNet was unreliable. FP16 TensorRT engine (TRT 10.9) builds in ~222s and is cached in the host model store. Artifacts operator-prepared (scripts/prepare_yolox_model.sh), never committed. Tracker/analytics with YOLOX not yet verified; compute/pricing values remain placeholders.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 YOLOX repo (Megvii, Apache-2.0)",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 40.5,
+        "coco_map50": null,
+        "params_m": 9.0,
+        "input_size": 640,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolov8n_v1",
@@ -480,7 +506,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 1.0,
       "observation_volume_risk": "high",
-      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLOv8-Nano, COCO-80. Flipped from planned->experimental now that the Ultralytics license is held. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run."
+      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLOv8-Nano, COCO-80. Flipped from planned->experimental now that the Ultralytics license is held. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 Ultralytics docs",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 37.3,
+        "coco_map50": null,
+        "params_m": 3.2,
+        "input_size": 640,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolox_nano_v1",
@@ -692,7 +731,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 1.0,
       "observation_volume_risk": "high",
-      "notes": "P5-K NEW (in-repo prep, 2026-06-18). YOLOX-Nano (COCO-80, raw ONNX + custom parser): COCO-80. Smallest/fastest YOLOX size. Reuses the live-verified yolox_s custom grid-decode parser (same family); only the ONNX artifact + input resolution differ. Artifacts operator-prepared; NO live verification yet \u2014 experimental until an operator prep+verify run."
+      "notes": "P5-K NEW (in-repo prep, 2026-06-18). YOLOX-Nano (COCO-80, raw ONNX + custom parser): COCO-80. Smallest/fastest YOLOX size. Reuses the live-verified yolox_s custom grid-decode parser (same family); only the ONNX artifact + input resolution differ. Artifacts operator-prepared; NO live verification yet \u2014 experimental until an operator prep+verify run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 YOLOX repo (Megvii, Apache-2.0)",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 25.8,
+        "coco_map50": null,
+        "params_m": 0.91,
+        "input_size": 416,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolox_tiny_v1",
@@ -904,7 +956,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 1.2,
       "observation_volume_risk": "high",
-      "notes": "P5-K NEW (in-repo prep, 2026-06-18). YOLOX-Tiny (COCO-80, raw ONNX + custom parser): COCO-80. Small/fast YOLOX size. Reuses the live-verified yolox_s custom grid-decode parser (same family); only the ONNX artifact + input resolution differ. Artifacts operator-prepared; NO live verification yet \u2014 experimental until an operator prep+verify run."
+      "notes": "P5-K NEW (in-repo prep, 2026-06-18). YOLOX-Tiny (COCO-80, raw ONNX + custom parser): COCO-80. Small/fast YOLOX size. Reuses the live-verified yolox_s custom grid-decode parser (same family); only the ONNX artifact + input resolution differ. Artifacts operator-prepared; NO live verification yet \u2014 experimental until an operator prep+verify run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 YOLOX repo (Megvii, Apache-2.0)",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 32.8,
+        "coco_map50": null,
+        "params_m": 5.06,
+        "input_size": 416,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolox_m_v1",
@@ -1116,7 +1181,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 3.0,
       "observation_volume_risk": "high",
-      "notes": "P5-K NEW (in-repo prep, 2026-06-18). YOLOX-M (COCO-80, raw ONNX + custom parser): COCO-80. Larger/more-accurate YOLOX size. Reuses the live-verified yolox_s custom grid-decode parser (same family); only the ONNX artifact + input resolution differ. Artifacts operator-prepared; NO live verification yet \u2014 experimental until an operator prep+verify run."
+      "notes": "P5-K NEW (in-repo prep, 2026-06-18). YOLOX-M (COCO-80, raw ONNX + custom parser): COCO-80. Larger/more-accurate YOLOX size. Reuses the live-verified yolox_s custom grid-decode parser (same family); only the ONNX artifact + input resolution differ. Artifacts operator-prepared; NO live verification yet \u2014 experimental until an operator prep+verify run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 YOLOX repo (Megvii, Apache-2.0)",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 46.9,
+        "coco_map50": null,
+        "params_m": 25.3,
+        "input_size": 640,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolo11n_v1",
@@ -1328,7 +1406,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 1.0,
       "observation_volume_risk": "high",
-      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLO11-Nano, COCO-80. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run."
+      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLO11-Nano, COCO-80. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 Ultralytics docs",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 39.5,
+        "coco_map50": null,
+        "params_m": 2.6,
+        "input_size": 640,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolo11s_v1",
@@ -1540,7 +1631,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 2.0,
       "observation_volume_risk": "high",
-      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLO11-Small, COCO-80. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run."
+      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLO11-Small, COCO-80. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 Ultralytics docs",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 47.0,
+        "coco_map50": null,
+        "params_m": 9.4,
+        "input_size": 640,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "yolo11m_v1",
@@ -1752,7 +1856,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 3.5,
       "observation_volume_risk": "high",
-      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLO11-Medium, COCO-80. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run."
+      "notes": "P5-K (in-repo prep, 2026-06-18). Ultralytics YOLO11-Medium, COCO-80. BYOM/restrictive (AGPL); first_party=false \u2014 supported as a capability + for BYOM, NOT auto-provided first-party until legal approval. Parser authored but unvalidated on GPU; experimental until a verification run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 Ultralytics docs",
+        "upstream_measured": false,
+        "metric_dataset": "COCO val2017",
+        "coco_map50_95": 51.5,
+        "coco_map50": null,
+        "params_m": 20.1,
+        "input_size": 640,
+        "backbone": null,
+        "vendor_kpi_label": null,
+        "vendor_kpi_value": null,
+        "vendor_kpi_note": null
+      }
     },
     {
       "model_id": "peoplenet_v1",
@@ -1810,7 +1927,20 @@
       "gpu_required": true,
       "estimated_cost_weight": 1.5,
       "observation_volume_risk": "medium",
-      "notes": "P5-K NEW (in-repo prep, 2026-06-18). NVIDIA PeopleNet (DetectNet_v2) \u2014 purpose-built person/bag/face detector. Reuses the built-in DetectNet_v2 parser (same path as TrafficCamNet); artifact from NGC. first_party (NVIDIA model license) but experimental until an operator prep+verify run."
+      "notes": "P5-K NEW (in-repo prep, 2026-06-18). NVIDIA PeopleNet (DetectNet_v2) \u2014 purpose-built person/bag/face detector. Reuses the built-in DetectNet_v2 parser (same path as TrafficCamNet); artifact from NGC. first_party (NVIDIA model license) but experimental until an operator prep+verify run.",
+      "metrics": {
+        "metric_source": "Published reference \u2014 NVIDIA TAO PeopleNet model card (NGC)",
+        "upstream_measured": false,
+        "metric_dataset": "NVIDIA proprietary eval (IoU>0.5)",
+        "coco_map50_95": null,
+        "coco_map50": null,
+        "params_m": null,
+        "input_size": null,
+        "backbone": "ResNet-34",
+        "vendor_kpi_label": "NVIDIA mAP \u2014 person (proprietary eval)",
+        "vendor_kpi_value": 94.19,
+        "vendor_kpi_note": "NVIDIA-reported on 90k+ proprietary images (IoU>0.5); not comparable to COCO mAP."
+      }
     }
   ]
 }
