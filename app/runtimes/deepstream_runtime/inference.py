@@ -145,11 +145,24 @@ def build_pgie_config(
 _YOLOX_ONNX_FILENAME = "yolox_s.onnx"
 _YOLOX_PARSER_LIB_FILENAME = "libnvdsparsebbox_yolox.so"
 _YOLOX_ENGINE_FILENAME = "yolox_s_b1_gpu0_fp16.engine"
+# P5-K: the Ultralytics (YOLO11 / YOLOv8) family shares one custom decode
+# parser, compiled by scripts/prepare_ultralytics_model.sh into the model dir.
+_ULTRALYTICS_PARSER_LIB_FILENAME = "libnvdsparsebbox_ultralytics.so"
 
 # Registry ``deepstream.config_template`` values this runtime knows how to
 # render. Anything else fails loudly at plan time.
 _TRAFFICCAMNET_TEMPLATE = "builtin_trafficcamnet_int8_v1"
 _YOLOX_TEMPLATE = "yolox_onnx_fp16_v1"
+# P5-K templates (in-repo prep; not yet GPU-verified):
+_ULTRALYTICS_TEMPLATE = "ultralytics_onnx_fp16_v1"  # YOLO11 / YOLOv8 (custom parser)
+_PEOPLENET_TEMPLATE = "builtin_detectnet_peoplenet_v1"  # NGC PeopleNet (builtin detectnet parser)
+
+
+def _fp16_engine_filename(onnx_file: str) -> str:
+    """``<stem>_b1_gpu0_fp16.engine`` for an ONNX filename. For the original
+    ``yolox_s.onnx`` this reproduces ``_YOLOX_ENGINE_FILENAME`` exactly."""
+    stem = onnx_file[:-5] if onnx_file.endswith(".onnx") else onnx_file
+    return f"{stem}_b1_gpu0_fp16.engine"
 
 
 def build_yolox_pgie_config(
@@ -159,6 +172,7 @@ def build_yolox_pgie_config(
     labels_path: str,
     num_classes: int,
     confidence_threshold: float | None = None,
+    onnx_file: str = _YOLOX_ONNX_FILENAME,
 ) -> str:
     """PGIE config for the official (raw, undecoded) YOLOX ONNX export.
 
@@ -181,7 +195,7 @@ def build_yolox_pgie_config(
         "gpu-id=0\n"
         "net-scale-factor=1.0\n"
         "model-color-format=1\n"
-        f"onnx-file={model_dir}/{_YOLOX_ONNX_FILENAME}\n"
+        f"onnx-file={model_dir}/{onnx_file}\n"
         f"model-engine-file={engine_path}\n"
         f"labelfile-path={labels_path}\n"
         "batch-size=1\n"
@@ -198,6 +212,95 @@ def build_yolox_pgie_config(
         "[class-attrs-all]\n"
         "topk=300\n"
         "nms-iou-threshold=0.45\n"
+        f"pre-cluster-threshold={thr}\n"
+    )
+
+
+def build_ultralytics_pgie_config(
+    *,
+    model_dir: str,
+    engine_path: str,
+    labels_path: str,
+    num_classes: int,
+    onnx_file: str,
+    confidence_threshold: float | None = None,
+) -> str:
+    """PGIE config for an Ultralytics (YOLO11 / YOLOv8) ONNX export.
+
+    P5-K, IN-REPO PREP — NOT yet GPU-validated. Preprocessing mirrors
+    Ultralytics: RGB (``model-color-format=0``), 1/255 normalization
+    (``net-scale-factor``), letterbox (``maintain-aspect-ratio=1``). FP16
+    (``network-mode=2``). The custom parser ``NvDsInferParseUltralytics``
+    (app/runtimes/deepstream_runtime/ultralytics_parser) decodes the
+    ``[1, 4+num_classes, num_anchors]`` transposed, objectness-free output;
+    per-class NMS is nvinfer's ``cluster-mode=2`` clustering.
+
+    The parser is authored from the published Ultralytics output contract but
+    has NOT been compiled/run on a GPU in this milestone — the package that
+    references this model is ``experimental`` and warns accordingly.
+    """
+    thr = "0.25" if confidence_threshold is None else f"{confidence_threshold}"
+    return (
+        "[property]\n"
+        "gpu-id=0\n"
+        "net-scale-factor=0.00392156862745098\n"
+        "model-color-format=0\n"
+        f"onnx-file={model_dir}/{onnx_file}\n"
+        f"model-engine-file={engine_path}\n"
+        f"labelfile-path={labels_path}\n"
+        "batch-size=1\n"
+        "process-mode=1\n"
+        "network-mode=2\n"
+        f"num-detected-classes={num_classes}\n"
+        "interval=0\n"
+        "gie-unique-id=1\n"
+        "cluster-mode=2\n"
+        "maintain-aspect-ratio=1\n"
+        "symmetric-padding=0\n"
+        "parse-bbox-func-name=NvDsInferParseUltralytics\n"
+        f"custom-lib-path={model_dir}/{_ULTRALYTICS_PARSER_LIB_FILENAME}\n"
+        "[class-attrs-all]\n"
+        "topk=300\n"
+        "nms-iou-threshold=0.45\n"
+        f"pre-cluster-threshold={thr}\n"
+    )
+
+
+def build_detectnet_pgie_config(
+    *,
+    model_dir: str,
+    engine_path: str,
+    labels_path: str,
+    num_classes: int,
+    onnx_file: str,
+    confidence_threshold: float | None = None,
+) -> str:
+    """PGIE config for a host-mounted DetectNet_v2 ONNX (NGC PeopleNet).
+
+    P5-K, IN-REPO PREP — NOT yet GPU-validated. Uses the BUILT-IN
+    DetectNet_v2 bbox parser (``requires_custom_parser=false``, same family as
+    the bundled TrafficCamNet) — no custom-lib-path. RGB, 1/255 scale, FP16
+    (``network-mode=2``; PeopleNet's INT8 calibration cache is optional and
+    not assumed here). Labels are registry-generated (person/bag/face)."""
+    thr = "0.2" if confidence_threshold is None else f"{confidence_threshold}"
+    return (
+        "[property]\n"
+        "gpu-id=0\n"
+        "net-scale-factor=0.00392156862745098\n"
+        "model-color-format=0\n"
+        f"onnx-file={model_dir}/{onnx_file}\n"
+        f"model-engine-file={engine_path}\n"
+        f"labelfile-path={labels_path}\n"
+        "batch-size=1\n"
+        "process-mode=1\n"
+        "network-mode=2\n"
+        f"num-detected-classes={num_classes}\n"
+        "interval=0\n"
+        "gie-unique-id=1\n"
+        "cluster-mode=2\n"
+        "[class-attrs-all]\n"
+        "topk=20\n"
+        "nms-iou-threshold=0.5\n"
         f"pre-cluster-threshold={thr}\n"
     )
 
@@ -275,15 +378,52 @@ def build_model_runtime_plan(
         subdir = ds.artifact_subdir or spec.model_id
         model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
         labels_path = f"{work_dir}/labels.txt"
+        # P5-K: YOLOX sizes share this template + the grid-decode parser; only
+        # the ONNX/engine filename differs (``onnx_file``). For yolox_s_v1
+        # (onnx_file unset) this is byte-identical to the pre-P5-K plan.
+        onnx_file = ds.onnx_file or _YOLOX_ONNX_FILENAME
+        engine_file = _fp16_engine_filename(onnx_file)
         return ModelRuntimePlan(
             model_id=spec.model_id,
             model_family=spec.family,
             model_dir=model_dir,
             pgie_config=build_yolox_pgie_config(
                 model_dir=model_dir,
-                engine_path=f"{model_dir}/{_YOLOX_ENGINE_FILENAME}",
+                engine_path=f"{model_dir}/{engine_file}",
                 labels_path=labels_path,
                 num_classes=len(spec.supported_classes),
+                confidence_threshold=confidence_threshold,
+                onnx_file=onnx_file,
+            ),
+            parser=ds.parser,
+            inference_backend="tensorrt_fp16",
+            labels_body="\n".join(spec.supported_classes) + "\n",
+            extra_mount_dirs=(model_dir,),
+            required_files=(
+                f"{model_dir}/{onnx_file}",
+                f"{model_dir}/{_YOLOX_PARSER_LIB_FILENAME}",
+            ),
+            image_builtin=False,
+        )
+
+    if ds.config_template == _ULTRALYTICS_TEMPLATE:
+        # P5-K (in-repo prep; parser NOT yet GPU-validated). Host-mounted
+        # Ultralytics ONNX + the shared custom decode parser.
+        subdir = ds.artifact_subdir or spec.model_id
+        model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
+        labels_path = f"{work_dir}/labels.txt"
+        onnx_file = ds.onnx_file or f"{spec.model_id}.onnx"
+        engine_file = _fp16_engine_filename(onnx_file)
+        return ModelRuntimePlan(
+            model_id=spec.model_id,
+            model_family=spec.family,
+            model_dir=model_dir,
+            pgie_config=build_ultralytics_pgie_config(
+                model_dir=model_dir,
+                engine_path=f"{model_dir}/{engine_file}",
+                labels_path=labels_path,
+                num_classes=len(spec.supported_classes),
+                onnx_file=onnx_file,
                 confidence_threshold=confidence_threshold,
             ),
             parser=ds.parser,
@@ -291,9 +431,37 @@ def build_model_runtime_plan(
             labels_body="\n".join(spec.supported_classes) + "\n",
             extra_mount_dirs=(model_dir,),
             required_files=(
-                f"{model_dir}/{_YOLOX_ONNX_FILENAME}",
-                f"{model_dir}/{_YOLOX_PARSER_LIB_FILENAME}",
+                f"{model_dir}/{onnx_file}",
+                f"{model_dir}/{_ULTRALYTICS_PARSER_LIB_FILENAME}",
             ),
+            image_builtin=False,
+        )
+
+    if ds.config_template == _PEOPLENET_TEMPLATE:
+        # P5-K (in-repo prep; NOT yet GPU-verified). Host-mounted NGC PeopleNet
+        # ONNX through the built-in DetectNet_v2 parser (no custom lib).
+        subdir = ds.artifact_subdir or spec.model_id
+        model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
+        labels_path = f"{work_dir}/labels.txt"
+        onnx_file = ds.onnx_file or f"{spec.model_id}.onnx"
+        engine_file = _fp16_engine_filename(onnx_file)
+        return ModelRuntimePlan(
+            model_id=spec.model_id,
+            model_family=spec.family,
+            model_dir=model_dir,
+            pgie_config=build_detectnet_pgie_config(
+                model_dir=model_dir,
+                engine_path=f"{model_dir}/{engine_file}",
+                labels_path=labels_path,
+                num_classes=len(spec.supported_classes),
+                onnx_file=onnx_file,
+                confidence_threshold=confidence_threshold,
+            ),
+            parser=ds.parser,
+            inference_backend="tensorrt_fp16",
+            labels_body="\n".join(spec.supported_classes) + "\n",
+            extra_mount_dirs=(model_dir,),
+            required_files=(f"{model_dir}/{onnx_file}",),
             image_builtin=False,
         )
 

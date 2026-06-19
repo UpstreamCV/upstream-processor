@@ -17,11 +17,14 @@
 # secrets anywhere in this script.
 #
 # Usage (on crowdcountS2, from the repo root):
-#   CONFIRM_DOWNLOAD=1 scripts/prepare_yolox_model.sh
+#   CONFIRM_DOWNLOAD=1 scripts/prepare_yolox_model.sh            # YOLOX-S (default)
+#   CONFIRM_DOWNLOAD=1 YOLOX_SIZE=nano scripts/prepare_yolox_model.sh  # P5-K sizes
 # Env:
-#   MODEL_DIR              (default /opt/upstream/models/yolox_s_v1 — must be
-#                           writable; override to e.g. ~/upstream-models/yolox_s_v1
-#                           together with UPSTREAM_DEEPSTREAM_MODEL_STORE_DIR)
+#   YOLOX_SIZE             (default s; one of s|m|nano|tiny — P5-K added the
+#                           nano/tiny/m sizes, all Apache-2.0, same parser)
+#   MODEL_DIR              (default /opt/upstream/models/yolox_<size>_v1 — must be
+#                           writable; override together with
+#                           UPSTREAM_DEEPSTREAM_MODEL_STORE_DIR)
 #   ONNX_URL               (default: official 0.1.1rc0 yolox_s.onnx release asset)
 #   EXPECTED_SHA256        (optional; enforce a pinned digest)
 #   DEEPSTREAM_PYDS_IMAGE  (default upstream-deepstream:8.0-pyds-v1.2.2)
@@ -32,10 +35,22 @@
 
 set -uo pipefail
 
-MODEL_DIR="${MODEL_DIR:-/opt/upstream/models/yolox_s_v1}"
-ONNX_URL="${ONNX_URL:-https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx}"
+# P5-K: size-parameterized via YOLOX_SIZE (s|m|nano|tiny). Default 's' is the
+# original P5-B live-verified path — byte-identical when YOLOX_SIZE is unset.
+# nano/tiny use 416x416 input; s/m use 640x640. All four share the same
+# Apache-2.0 custom grid-decode parser; only the ONNX artifact differs.
+YOLOX_SIZE="${YOLOX_SIZE:-s}"
+case "$YOLOX_SIZE" in
+  s)    MODEL_ID="yolox_s_v1" ;;
+  m)    MODEL_ID="yolox_m_v1" ;;
+  nano) MODEL_ID="yolox_nano_v1" ;;
+  tiny) MODEL_ID="yolox_tiny_v1" ;;
+  *) echo "FAIL unknown YOLOX_SIZE=$YOLOX_SIZE (use s|m|nano|tiny)" >&2; exit 2 ;;
+esac
+MODEL_DIR="${MODEL_DIR:-/opt/upstream/models/$MODEL_ID}"
+ONNX_URL="${ONNX_URL:-https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_${YOLOX_SIZE}.onnx}"
 DEEPSTREAM_PYDS_IMAGE="${DEEPSTREAM_PYDS_IMAGE:-upstream-deepstream:8.0-pyds-v1.2.2}"
-ONNX_PATH="$MODEL_DIR/yolox_s.onnx"
+ONNX_PATH="$MODEL_DIR/yolox_${YOLOX_SIZE}.onnx"
 LIB_PATH="$MODEL_DIR/libnvdsparsebbox_yolox.so"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -46,7 +61,7 @@ command -v docker >/dev/null 2>&1 || { echo "FAIL docker missing" >&2; exit 2; }
 docker image inspect "$DEEPSTREAM_PYDS_IMAGE" >/dev/null 2>&1 \
   || { echo "FAIL image $DEEPSTREAM_PYDS_IMAGE not present (build it first; see docs/local-dev.md)" >&2; exit 2; }
 
-echo "== prepare yolox_s_v1 artifacts =="
+echo "== prepare $MODEL_ID artifacts (YOLOX_SIZE=$YOLOX_SIZE) =="
 echo "  model_dir=$MODEL_DIR"
 echo "  image=$DEEPSTREAM_PYDS_IMAGE"
 
@@ -63,7 +78,7 @@ else
     echo "     $ONNX_URL" >&2
     exit 2
   fi
-  echo "  downloading official YOLOX-S ONNX (Apache-2.0) ..."
+  echo "  downloading official YOLOX-$YOLOX_SIZE ONNX (Apache-2.0) ..."
   curl -fL --retry 3 --max-time 300 -o "$ONNX_PATH.tmp" "$ONNX_URL" \
     || { echo "FAIL download failed" >&2; rm -f "$ONNX_PATH.tmp"; exit 1; }
   mv "$ONNX_PATH.tmp" "$ONNX_PATH"

@@ -156,11 +156,41 @@ def test_yolox_plan_contains_no_rtsp_or_secrets() -> None:
         assert needle not in blob
 
 
-def test_plan_rejects_planned_and_unknown_models() -> None:
-    with pytest.raises(ValueError, match="not runnable"):
-        build_model_runtime_plan(model="yolov8n_v1", work_dir="/w", model_store_dir="/m")
+def test_plan_builds_for_flipped_yolov8n_and_rejects_unknown() -> None:
+    # P5-K: yolov8n flipped planned -> experimental (Ultralytics license held),
+    # so it now builds a runtime plan via the Ultralytics template + custom
+    # parser. Unknown models still raise.
+    plan = build_model_runtime_plan(model="yolov8n_v1", work_dir="/w", model_store_dir="/m")
+    assert plan.model_id == "yolov8n_v1"
+    assert "NvDsInferParseUltralytics" in plan.pgie_config
     with pytest.raises(ValueError, match="unknown deepstream inference model"):
         build_model_runtime_plan(model="nope", work_dir="/w", model_store_dir="/m")
+
+
+def test_p5k_yolox_size_plan_uses_per_model_onnx_and_shared_parser() -> None:
+    # YOLOX sizes reuse the grid-decode parser; only the ONNX/engine filename
+    # differs (driven by the registry ``onnx_file``).
+    plan = build_model_runtime_plan(model="yolox_nano_v1", work_dir="/w", model_store_dir="/m")
+    assert "onnx-file=/m/yolox_nano_v1/yolox_nano.onnx" in plan.pgie_config
+    assert "model-engine-file=/m/yolox_nano_v1/yolox_nano_b1_gpu0_fp16.engine" in plan.pgie_config
+    assert "parse-bbox-func-name=NvDsInferParseYolox" in plan.pgie_config
+    assert plan.required_files[0].endswith("/yolox_nano.onnx")
+
+
+def test_p5k_ultralytics_plan_uses_custom_decode_parser() -> None:
+    plan = build_model_runtime_plan(model="yolo11s_v1", work_dir="/w", model_store_dir="/m")
+    assert "onnx-file=/m/yolo11s_v1/yolo11s.onnx" in plan.pgie_config
+    assert "parse-bbox-func-name=NvDsInferParseUltralytics" in plan.pgie_config
+    assert "libnvdsparsebbox_ultralytics.so" in plan.pgie_config
+    assert "num-detected-classes=80" in plan.pgie_config
+
+
+def test_p5k_peoplenet_plan_uses_builtin_detectnet_parser() -> None:
+    plan = build_model_runtime_plan(model="peoplenet_v1", work_dir="/w", model_store_dir="/m")
+    assert "onnx-file=/m/peoplenet_v1/resnet34_peoplenet.onnx" in plan.pgie_config
+    assert "num-detected-classes=3" in plan.pgie_config
+    assert "custom-lib-path" not in plan.pgie_config  # built-in parser, no custom lib
+    assert plan.labels_body == "person\nbag\nface\n"
 
 
 # --- metadata process manager -------------------------------------------------

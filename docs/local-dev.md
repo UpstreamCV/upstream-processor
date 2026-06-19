@@ -1148,3 +1148,81 @@ UPSTREAM_DEEPSTREAM_LIFECYCLE_INFER_ZONE_EXIT_ON_DISAPPEARANCE=true  # master on
 Inferred exits carry `inferred:true` / `exit_reason:"track_missing_timeout"` in
 the observation payload. Set `..._INFER_ZONE_EXIT_ON_DISAPPEARANCE=false` to
 restore the pre-P5-Gap "disappearance never exits" behavior.
+
+## P5-K — curated model catalog: per-model prep + readiness (GPU host)
+
+P5-K grew the model registry to 10 detectors and added 14 packages, but with
+**no prod-GPU access this milestone**: everything new is `status: experimental`
+(in-repo prep only). The prep scripts below run on the GPU host; the
+**operator's prep + verify run is the promotion gate to `probe`**. Nothing is
+committed (`.gitignore` covers `*.onnx` / `*.so` / `*.engine` / `models/`).
+
+`outputs` / `supported_triggers` / `supported_shapes` on a package are
+**catalog/UX declarations, NOT a runtime emission filter** — the worker `_mode`
+(from the package `supports` block) picks the pipeline, so every YOLOX + IOU
+analytics package runs the byte-identical chain. The P5-Gap `zone_exited`-
+inferred caveat (above) applies to `deepstream.yolox_people_occupancy_probe.v0`:
+its `roi_occupancy` is live-verified, but `zone_exited` is **inferred** when a
+track disappears past the grace window, not a true geometric exit.
+
+### YOLOX sizes (Apache-2.0, permissive, reuse the live-verified parser)
+
+`prepare_yolox_model.sh` is now size-parameterized via `YOLOX_SIZE`. Default `s`
+is byte-identical to the P5-B path; `nano`/`tiny` use 416×416 input, `s`/`m` use
+640×640. All four share the same Apache-2.0 grid-decode parser.
+
+```sh
+CONFIRM_DOWNLOAD=1 scripts/prepare_yolox_model.sh                 # s (default, = P5-B)
+CONFIRM_DOWNLOAD=1 YOLOX_SIZE=nano scripts/prepare_yolox_model.sh # P5-K nano (416)
+CONFIRM_DOWNLOAD=1 YOLOX_SIZE=tiny scripts/prepare_yolox_model.sh # P5-K tiny (416)
+CONFIRM_DOWNLOAD=1 YOLOX_SIZE=m    scripts/prepare_yolox_model.sh # P5-K m   (640)
+```
+
+### Ultralytics (YOLO11 / YOLOv8 — AGPL-3.0, BYOM, NEW unvalidated parser)
+
+`prepare_ultralytics_model.sh` exports the ONNX via the `ultralytics` image and
+compiles the **new `NvDsInferParseUltralytics` parser** (authored, NOT yet
+GPU-validated). Gated on `ACK_ULTRALYTICS_LICENSE=1` (confirms the AGPL /
+Enterprise posture; these models are `first_party=false` / BYOM) **and**
+`CONFIRM_DOWNLOAD=1`:
+
+```sh
+CONFIRM_DOWNLOAD=1 ACK_ULTRALYTICS_LICENSE=1 \
+  ULTRA_MODEL=yolo11n scripts/prepare_ultralytics_model.sh   # or yolo11s|yolo11m|yolov8n
+```
+
+Validate detections on a real stream before promoting any Ultralytics model
+past `experimental` — the parser is authored from the published output contract
+but has never run on a GPU.
+
+### PeopleNet (NVIDIA TAO / NGC EULA — built-in parser)
+
+`prepare_peoplenet_model.sh` pulls the deployable ONNX from NGC and writes the
+person/bag/face labels. PeopleNet reuses the **built-in DetectNet_v2 parser**
+(same path as TrafficCamNet) — no custom parser to compile:
+
+```sh
+CONFIRM_DOWNLOAD=1 scripts/prepare_peoplenet_model.sh   # NGC may require auth/login
+```
+
+### Model-readiness + licensing table
+
+| model | license_class | first_party | parser | status | verified | promotion criteria |
+|---|---|---|---|---|---|---|
+| `trafficcamnet_v1` | commercial_agreement | yes | built-in DetectNet_v2 | probe | ✅ live (M8.2C1..P4) | re-review license/deploy path before `supported` |
+| `yolox_s_v1` | permissive | yes | `NvDsInferParseYolox` | probe | ✅ live (P5-B, crowdcountS2) | already at `probe`; license review before `supported` |
+| `yolox_nano_v1` | permissive | yes | `NvDsInferParseYolox` (reused) | experimental | ⏳ pending | operator prep (`YOLOX_SIZE=nano`) + live person-detection verify |
+| `yolox_tiny_v1` | permissive | yes | `NvDsInferParseYolox` (reused) | experimental | ⏳ pending | operator prep (`YOLOX_SIZE=tiny`) + live person-detection verify |
+| `yolox_m_v1` | permissive | yes | `NvDsInferParseYolox` (reused) | experimental | ⏳ pending | operator prep (`YOLOX_SIZE=m`) + live person-detection verify |
+| `yolo11n_v1` | restrictive (AGPL) | **no (BYOM)** | `NvDsInferParseUltralytics` (new, unvalidated) | experimental | ⏳ pending | prep + GPU-validate the parser; legal sign-off before first-party hosting |
+| `yolo11s_v1` | restrictive (AGPL) | **no (BYOM)** | `NvDsInferParseUltralytics` (new, unvalidated) | experimental | ⏳ pending | prep + GPU-validate the parser; legal sign-off before first-party hosting |
+| `yolo11m_v1` | restrictive (AGPL) | **no (BYOM)** | `NvDsInferParseUltralytics` (new, unvalidated) | experimental | ⏳ pending | prep + GPU-validate the parser; legal sign-off before first-party hosting |
+| `yolov8n_v1` | restrictive (AGPL) | **no (BYOM)** | `NvDsInferParseUltralytics` (new, unvalidated) | experimental | ⏳ pending | prep + GPU-validate the parser; legal sign-off before first-party hosting |
+| `peoplenet_v1` | commercial_agreement | yes | built-in DetectNet_v2 | experimental | ⏳ pending | NGC pull + live person/bag/face verify; license re-review before `supported` |
+
+"verified" = whether the model has been live-verified on a GPU host. ⏳ pending
+= in-repo prep only; promote to `probe` **only** after the matching prep script
+runs and detections are confirmed on a real stream. The Ultralytics models
+additionally require the new parser to be GPU-validated **and** legal/commercial
+sign-off before Upstream hosts them first-party (until then they stay
+`first_party=false` / BYOM).

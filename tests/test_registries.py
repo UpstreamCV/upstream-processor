@@ -54,6 +54,8 @@ def _model_entry(**overrides: Any) -> dict[str, Any]:
         "status": "probe",
         "license": "Apache-2.0",
         "license_notes": "test",
+        "license_class": "permissive",
+        "first_party": True,
         "source": "test",
         "supported_classes": ["person", "car"],
         "class_id_map": {"person": 0, "car": 1},
@@ -145,8 +147,28 @@ def test_model_registry_loads_with_expected_entries() -> None:
     assert yolox.deepstream.artifact_subdir == "yolox_s_v1"
     assert len(yolox.supported_classes) == 80  # full COCO-80, in id order
     assert yolox.class_id_map["person"] == 0
-    assert registry["yolov8n_v1"].status == "planned"
-    assert "REVIEW REQUIRED" in registry["yolov8n_v1"].license_notes
+    # P5-K licensing/provenance axis: YOLOX is permissive + first-party.
+    assert yolox.license_class == "permissive"
+    assert yolox.first_party is True
+    assert tcn.license_class == "commercial_agreement" and tcn.first_party is True
+    # P5-K: YOLOv8n flipped planned -> experimental now that the Ultralytics
+    # license is held; it stays restrictive / BYOM-only (first_party=false).
+    yolov8n = registry["yolov8n_v1"]
+    assert yolov8n.status == "experimental"
+    assert yolov8n.license_class == "restrictive"
+    assert yolov8n.first_party is False
+    assert "AGPL" in yolov8n.license_notes
+    assert len(yolov8n.supported_classes) == 80  # completed to full COCO-80
+    # P5-K new model families (in-repo prep, all experimental, none probe yet).
+    for mid in ("yolox_nano_v1", "yolox_tiny_v1", "yolox_m_v1"):
+        assert registry[mid].status == "experimental"
+        assert registry[mid].license_class == "permissive"
+        assert registry[mid].first_party is True
+    for mid in ("yolo11n_v1", "yolo11s_v1", "yolo11m_v1"):
+        assert registry[mid].license_class == "restrictive"
+        assert registry[mid].first_party is False  # AGPL -> BYOM-only
+    assert registry["peoplenet_v1"].license_class == "commercial_agreement"
+    assert registry["peoplenet_v1"].first_party is True
 
 
 def test_tracker_registry_loads_with_expected_entries() -> None:
@@ -250,11 +272,30 @@ _ALL_PACKAGES = (
     "deepstream.analytics_probe.v0",
     "deepstream.yolox_probe.v0",
     "deepstream.yolox_analytics_probe.v0",
+    # P5-K: YOLOX-S + IOU people variants reuse the live-verified pipeline.
+    "deepstream.yolox_people_fast_probe.v0",
+    "deepstream.yolox_people_high_recall_probe.v0",
+    "deepstream.yolox_people_occupancy_probe.v0",
+    "deepstream.yolox_people_dwell_probe.v0",
 )
 
-# P5-E: experimental packages resolve too, but carry a non-probe status (they
-# are runnable-but-unverified until live A/B promotes them).
-_EXPERIMENTAL_PACKAGES = ("deepstream.yolox_analytics_nvdcf_probe.v0",)
+# P5-E/P5-K: experimental packages resolve too, but carry a non-probe status
+# (runnable-but-unverified). P5-K adds the line-crossing variant (line crossing
+# not live-confirmed), the TrafficCamNet vehicle package, and one
+# people-analytics package per new model (all experimental — no GPU verify).
+_EXPERIMENTAL_PACKAGES = (
+    "deepstream.yolox_analytics_nvdcf_probe.v0",
+    "deepstream.yolox_people_line_crossing_probe.v0",
+    "deepstream.trafficcamnet_vehicle_probe.v0",
+    "deepstream.yolox_nano_people_probe.v0",
+    "deepstream.yolox_tiny_people_probe.v0",
+    "deepstream.yolox_m_people_probe.v0",
+    "deepstream.yolo11n_people_probe.v0",
+    "deepstream.yolo11s_people_probe.v0",
+    "deepstream.yolo11m_people_probe.v0",
+    "deepstream.yolov8n_people_probe.v0",
+    "deepstream.peoplenet_people_probe.v0",
+)
 
 
 @pytest.mark.parametrize("package_id", _ALL_PACKAGES)
@@ -295,6 +336,46 @@ def test_shipped_package_registry_references() -> None:
     assert nvdcf_yolox.analytics_profile_id == iou_yolox.analytics_profile_id
     assert nvdcf_yolox.outputs == iou_yolox.outputs
     assert nvdcf_yolox.supported_classes == ("person",)
+
+
+def test_p5k_variant_packages_reference_yolox_s_and_narrow_honestly() -> None:
+    profile = load_analytics_registry()["deepstream_nvdsanalytics_probe_v1"]
+    # The 5 use-case variants all run the verified YOLOX-S + IOU pipeline.
+    for pid in (
+        "deepstream.yolox_people_fast_probe.v0",
+        "deepstream.yolox_people_high_recall_probe.v0",
+        "deepstream.yolox_people_line_crossing_probe.v0",
+        "deepstream.yolox_people_occupancy_probe.v0",
+        "deepstream.yolox_people_dwell_probe.v0",
+    ):
+        spec = resolve(pid)
+        assert spec.model_id == "yolox_s_v1"
+        assert spec.tracker_profile_id == "deepstream_iou_fast_v1"
+        # Narrowed outputs stay a subset of the analytics profile.
+        assert set(spec.outputs) <= set(profile.supported_outputs)
+    # Line crossing is the one variant whose primary trigger is unverified.
+    assert resolve("deepstream.yolox_people_line_crossing_probe.v0").status == "experimental"
+    assert resolve("deepstream.yolox_people_line_crossing_probe.v0").supported_shapes == (
+        "line_segment",
+    )
+    assert resolve("deepstream.yolox_people_occupancy_probe.v0").status == "probe"
+
+
+def test_p5k_per_model_packages_are_experimental_and_match_provenance() -> None:
+    models = load_model_registry()
+    # package_id -> (model_id, expected first_party of the backing model)
+    cases = {
+        "deepstream.yolox_nano_people_probe.v0": ("yolox_nano_v1", True),
+        "deepstream.yolo11s_people_probe.v0": ("yolo11s_v1", False),
+        "deepstream.yolov8n_people_probe.v0": ("yolov8n_v1", False),
+        "deepstream.peoplenet_people_probe.v0": ("peoplenet_v1", True),
+        "deepstream.trafficcamnet_vehicle_probe.v0": ("trafficcamnet_v1", True),
+    }
+    for pid, (model_id, first_party) in cases.items():
+        spec = resolve(pid)
+        assert spec.status == "experimental"  # no GPU verification this milestone
+        assert spec.model_id == model_id
+        assert models[model_id].first_party is first_party
 
 
 def _pkg(**overrides: Any) -> PackageSpec:
@@ -416,10 +497,17 @@ def test_probe_package_may_use_probe_components() -> None:
 
 
 def test_planned_components_are_never_referencable() -> None:
-    # Even a probe package cannot bundle a planned (artifact-less) model
-    # or a planned tracker profile.
+    # Even a probe package cannot bundle a planned (artifact-less) model. P5-K
+    # flipped the last shipped 'planned' model (yolov8n) to experimental, so
+    # inject a planned model to exercise the gate.
+    planned_models = dict(load_model_registry())
+    planned_models["planned_only_v1"] = dataclasses.replace(
+        planned_models["yolox_s_v1"], model_id="planned_only_v1", status="planned"
+    )
     with pytest.raises(RegistryValidationError, match="status 'planned'"):
-        validate_package_compatibility(_pkg(model_id="yolov8n_v1"))
+        validate_package_compatibility(
+            _pkg(model_id="planned_only_v1"), models=planned_models
+        )
     # P5-E: NvDCF is no longer planned (it is referencable); NvSORT is still
     # the planned, artifact-less tracker that must never be bundled.
     with pytest.raises(RegistryValidationError, match="status 'planned'"):
@@ -540,9 +628,11 @@ def test_model_dir_resolution_identical_to_pre_p5() -> None:
     assert resolve_model_dir("trafficcamnet_v1") == _PRE_P5_MODEL_DIR  # registry id also maps
 
 
-def test_planned_model_is_not_runnable() -> None:
-    with pytest.raises(ValueError, match="not runnable"):
-        resolve_model_dir("yolov8n_v1")
+def test_flipped_yolov8n_is_runnable_unknown_still_rejected() -> None:
+    # P5-K: yolov8n flipped planned -> experimental (Ultralytics license held),
+    # so it now resolves to its host-mounted artifact dir; unknown models still
+    # raise. (No shipped model is 'planned' after P5-K.)
+    assert resolve_model_dir("yolov8n_v1") == "/opt/upstream/models/yolov8n_v1"
     with pytest.raises(ValueError, match="unknown deepstream inference model"):
         resolve_model_dir("yolo-custom")
 

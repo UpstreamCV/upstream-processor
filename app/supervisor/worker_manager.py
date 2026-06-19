@@ -263,6 +263,11 @@ class WorkerManager:
         task.add_done_callback(self._bg.discard)
 
     async def _post_failed(self, session: EligibleSession, code: str, message: str) -> None:
+        # The status ``error_message`` is capped at 512 chars; resolution /
+        # compatibility errors can be longer (they enumerate known ids), so
+        # bound it here — the full message is already in the log above.
+        if len(message) > 512:
+            message = message[:509] + "..."
         try:
             await self._api.post_processor_status(
                 build_status_request(
