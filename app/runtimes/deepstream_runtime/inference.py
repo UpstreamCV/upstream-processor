@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.packages.model_descriptor import descriptor_from_spec
 from app.packages.registries import (
     RUNNABLE_COMPONENT_STATUSES,
     ModelSpec,
@@ -41,6 +42,27 @@ from app.packages.registries import (
     runnable_deepstream_tracker_algorithms,
 )
 from app.redact import redact_rtsp
+
+# The PGIE byte-templates moved to ``decoders.py``; ``build_model_runtime_plan``
+# now routes through the descriptor + decoder registry instead of four
+# hard-coded ``config_template`` branches. The three otherwise-unused builders
+# are re-exported (redundant alias) so call sites / tests that import them from
+# this module keep working unchanged.
+from app.runtimes.deepstream_runtime.decoders import (
+    PgieRenderContext,
+    build_pgie_config,
+    engine_filename_for,
+    get_decoder,
+)
+from app.runtimes.deepstream_runtime.decoders import (
+    build_detectnet_pgie_config as build_detectnet_pgie_config,
+)
+from app.runtimes.deepstream_runtime.decoders import (
+    build_ultralytics_pgie_config as build_ultralytics_pgie_config,
+)
+from app.runtimes.deepstream_runtime.decoders import (
+    build_yolox_pgie_config as build_yolox_pgie_config,
+)
 
 _log = logging.getLogger("upstream_processor.deepstream.infer")
 
@@ -97,214 +119,6 @@ def resolve_model_dir(model: str) -> str:
     return spec.deepstream.model_artifact_path
 
 
-def build_pgie_config(
-    *, model_dir: str, engine_path: str, confidence_threshold: float | None = None
-) -> str:
-    """PGIE config: bundled TrafficCamNet ONNX, INT8, batch 1. The
-    ``model-engine-file`` points at a not-yet-existing path so nvinfer must
-    BUILD the TensorRT engine (the SM-arch test). Mirrors M8.2C1-A.
-
-    M7C: when ``confidence_threshold`` is supplied (the resolved per-camera
-    operator value), it overrides BOTH ``pre-cluster-threshold`` entries
-    (``class-attrs-all`` and ``class-attrs-0``) so detection filtering is
-    uniform across classes. When ``None`` (no operator override) the output
-    is byte-identical to the previous hard-coded 0.2 / 0.4 defaults."""
-    all_thr = "0.2" if confidence_threshold is None else f"{confidence_threshold}"
-    cls0_thr = "0.4" if confidence_threshold is None else f"{confidence_threshold}"
-    return (
-        "[property]\n"
-        "gpu-id=0\n"
-        "net-scale-factor=0.00392156862745098\n"
-        f"onnx-file={model_dir}/resnet18_trafficcamnet_pruned.onnx\n"
-        f"model-engine-file={engine_path}\n"
-        f"labelfile-path={model_dir}/labels.txt\n"
-        f"int8-calib-file={model_dir}/cal_trt.bin\n"
-        "batch-size=1\n"
-        "process-mode=1\n"
-        "model-color-format=0\n"
-        "network-mode=1\n"
-        "num-detected-classes=4\n"
-        "interval=0\n"
-        "gie-unique-id=1\n"
-        "cluster-mode=2\n"
-        "[class-attrs-all]\n"
-        "topk=20\n"
-        "nms-iou-threshold=0.5\n"
-        f"pre-cluster-threshold={all_thr}\n"
-        "[class-attrs-0]\n"
-        "topk=20\n"
-        "nms-iou-threshold=0.5\n"
-        f"pre-cluster-threshold={cls0_thr}\n"
-    )
-
-
-# --- P5-B YOLOX model runtime plan --------------------------------------
-
-# Filename conventions inside a YOLOX model store dir (created by the
-# operator-run scripts/prepare_yolox_model.sh; never committed).
-_YOLOX_ONNX_FILENAME = "yolox_s.onnx"
-_YOLOX_PARSER_LIB_FILENAME = "libnvdsparsebbox_yolox.so"
-_YOLOX_ENGINE_FILENAME = "yolox_s_b1_gpu0_fp16.engine"
-# P5-K: the Ultralytics (YOLO11 / YOLOv8) family shares one custom decode
-# parser, compiled by scripts/prepare_ultralytics_model.sh into the model dir.
-_ULTRALYTICS_PARSER_LIB_FILENAME = "libnvdsparsebbox_ultralytics.so"
-
-# Registry ``deepstream.config_template`` values this runtime knows how to
-# render. Anything else fails loudly at plan time.
-_TRAFFICCAMNET_TEMPLATE = "builtin_trafficcamnet_int8_v1"
-_YOLOX_TEMPLATE = "yolox_onnx_fp16_v1"
-# P5-K templates (in-repo prep; not yet GPU-verified):
-_ULTRALYTICS_TEMPLATE = "ultralytics_onnx_fp16_v1"  # YOLO11 / YOLOv8 (custom parser)
-_PEOPLENET_TEMPLATE = "builtin_detectnet_peoplenet_v1"  # NGC PeopleNet (builtin detectnet parser)
-
-
-def _fp16_engine_filename(onnx_file: str) -> str:
-    """``<stem>_b1_gpu0_fp16.engine`` for an ONNX filename. For the original
-    ``yolox_s.onnx`` this reproduces ``_YOLOX_ENGINE_FILENAME`` exactly."""
-    stem = onnx_file[:-5] if onnx_file.endswith(".onnx") else onnx_file
-    return f"{stem}_b1_gpu0_fp16.engine"
-
-
-def build_yolox_pgie_config(
-    *,
-    model_dir: str,
-    engine_path: str,
-    labels_path: str,
-    num_classes: int,
-    confidence_threshold: float | None = None,
-    onnx_file: str = _YOLOX_ONNX_FILENAME,
-) -> str:
-    """PGIE config for the official (raw, undecoded) YOLOX ONNX export.
-
-    Preprocessing mirrors YOLOX's own demo: NO normalization
-    (``net-scale-factor=1.0``, no offsets) and BGR channel order
-    (``model-color-format=1``) — YOLOX removed input normalization in
-    v0.1.1+. ``maintain-aspect-ratio=1`` letterboxes like the YOLOX demo
-    (which pads bottom/right; padding VALUE differs — 0 vs 114 — an accepted
-    probe-level approximation). FP16 (``network-mode=2``); INT8 needs a
-    calibration cache we don't have. NMS is nvinfer's per-class
-    ``cluster-mode=2`` clustering; the custom parser
-    (``NvDsInferParseYolox``) only decodes grids + thresholds.
-
-    M7C parity: ``confidence_threshold`` overrides ``pre-cluster-threshold``
-    when an operator value is applied; default 0.25 (YOLOX demo default).
-    """
-    thr = "0.25" if confidence_threshold is None else f"{confidence_threshold}"
-    return (
-        "[property]\n"
-        "gpu-id=0\n"
-        "net-scale-factor=1.0\n"
-        "model-color-format=1\n"
-        f"onnx-file={model_dir}/{onnx_file}\n"
-        f"model-engine-file={engine_path}\n"
-        f"labelfile-path={labels_path}\n"
-        "batch-size=1\n"
-        "process-mode=1\n"
-        "network-mode=2\n"
-        f"num-detected-classes={num_classes}\n"
-        "interval=0\n"
-        "gie-unique-id=1\n"
-        "cluster-mode=2\n"
-        "maintain-aspect-ratio=1\n"
-        "symmetric-padding=0\n"
-        "parse-bbox-func-name=NvDsInferParseYolox\n"
-        f"custom-lib-path={model_dir}/{_YOLOX_PARSER_LIB_FILENAME}\n"
-        "[class-attrs-all]\n"
-        "topk=300\n"
-        "nms-iou-threshold=0.45\n"
-        f"pre-cluster-threshold={thr}\n"
-    )
-
-
-def build_ultralytics_pgie_config(
-    *,
-    model_dir: str,
-    engine_path: str,
-    labels_path: str,
-    num_classes: int,
-    onnx_file: str,
-    confidence_threshold: float | None = None,
-) -> str:
-    """PGIE config for an Ultralytics (YOLO11 / YOLOv8) ONNX export.
-
-    P5-K, IN-REPO PREP — NOT yet GPU-validated. Preprocessing mirrors
-    Ultralytics: RGB (``model-color-format=0``), 1/255 normalization
-    (``net-scale-factor``), letterbox (``maintain-aspect-ratio=1``). FP16
-    (``network-mode=2``). The custom parser ``NvDsInferParseUltralytics``
-    (app/runtimes/deepstream_runtime/ultralytics_parser) decodes the
-    ``[1, 4+num_classes, num_anchors]`` transposed, objectness-free output;
-    per-class NMS is nvinfer's ``cluster-mode=2`` clustering.
-
-    The parser is authored from the published Ultralytics output contract but
-    has NOT been compiled/run on a GPU in this milestone — the package that
-    references this model is ``experimental`` and warns accordingly.
-    """
-    thr = "0.25" if confidence_threshold is None else f"{confidence_threshold}"
-    return (
-        "[property]\n"
-        "gpu-id=0\n"
-        "net-scale-factor=0.00392156862745098\n"
-        "model-color-format=0\n"
-        f"onnx-file={model_dir}/{onnx_file}\n"
-        f"model-engine-file={engine_path}\n"
-        f"labelfile-path={labels_path}\n"
-        "batch-size=1\n"
-        "process-mode=1\n"
-        "network-mode=2\n"
-        f"num-detected-classes={num_classes}\n"
-        "interval=0\n"
-        "gie-unique-id=1\n"
-        "cluster-mode=2\n"
-        "maintain-aspect-ratio=1\n"
-        "symmetric-padding=0\n"
-        "parse-bbox-func-name=NvDsInferParseUltralytics\n"
-        f"custom-lib-path={model_dir}/{_ULTRALYTICS_PARSER_LIB_FILENAME}\n"
-        "[class-attrs-all]\n"
-        "topk=300\n"
-        "nms-iou-threshold=0.45\n"
-        f"pre-cluster-threshold={thr}\n"
-    )
-
-
-def build_detectnet_pgie_config(
-    *,
-    model_dir: str,
-    engine_path: str,
-    labels_path: str,
-    num_classes: int,
-    onnx_file: str,
-    confidence_threshold: float | None = None,
-) -> str:
-    """PGIE config for a host-mounted DetectNet_v2 ONNX (NGC PeopleNet).
-
-    P5-K, IN-REPO PREP — NOT yet GPU-validated. Uses the BUILT-IN
-    DetectNet_v2 bbox parser (``requires_custom_parser=false``, same family as
-    the bundled TrafficCamNet) — no custom-lib-path. RGB, 1/255 scale, FP16
-    (``network-mode=2``; PeopleNet's INT8 calibration cache is optional and
-    not assumed here). Labels are registry-generated (person/bag/face)."""
-    thr = "0.2" if confidence_threshold is None else f"{confidence_threshold}"
-    return (
-        "[property]\n"
-        "gpu-id=0\n"
-        "net-scale-factor=0.00392156862745098\n"
-        "model-color-format=0\n"
-        f"onnx-file={model_dir}/{onnx_file}\n"
-        f"model-engine-file={engine_path}\n"
-        f"labelfile-path={labels_path}\n"
-        "batch-size=1\n"
-        "process-mode=1\n"
-        "network-mode=2\n"
-        f"num-detected-classes={num_classes}\n"
-        "interval=0\n"
-        "gie-unique-id=1\n"
-        "cluster-mode=2\n"
-        "[class-attrs-all]\n"
-        "topk=20\n"
-        "nms-iou-threshold=0.5\n"
-        f"pre-cluster-threshold={thr}\n"
-    )
-
-
 @dataclass(frozen=True)
 class ModelRuntimePlan:
     """Everything the metadata process manager needs to run one registry
@@ -333,141 +147,85 @@ def build_model_runtime_plan(
     confidence_threshold: float | None = None,
 ) -> ModelRuntimePlan:
     """Resolve a registry model into a concrete runtime plan for the pyds
-    metadata pipeline. Dispatches on the registry entry's
-    ``deepstream.config_template``:
+    metadata pipeline.
 
-    - ``builtin_trafficcamnet_int8_v1`` — byte-identical to the pre-P5-B
-      behavior: image-builtin sample model, INT8 engine built per-run into
-      the temp work dir, no extra mounts, labels from the image.
-    - ``yolox_onnx_fp16_v1`` — host-mounted artifacts under
-      ``<model_store_dir>/<artifact_subdir>`` (official raw ONNX + the
-      compiled custom parser, both prepared by the operator script); the
-      TensorRT FP16 engine is CACHED in that dir across runs; labels are
-      generated from the registry's ``supported_classes`` (COCO order) into
-      the work dir.
+    BYOM Phase 0: this is now *data-driven* — the model is normalized into a
+    :class:`~app.packages.model_descriptor.ModelDescriptor` and its
+    ``decoder`` selects a :class:`~app.runtimes.deepstream_runtime.decoders.DecoderSpec`
+    from the finite decoder registry. The descriptor supplies the per-model
+    values (ONNX filename, class count, artifact layout, provenance); the
+    decoder owns the family's exact PGIE byte-template and the engine / mount /
+    labels assembly rules. Output is byte-identical to the pre-Phase-0
+    per-template branches for every current model (proven by the golden tests
+    in ``tests/test_config_parity.py``); adding a model is descriptor data and
+    adding a family is one decoder entry — never a new branch here.
+
+    Engine placement: ``work_dir`` (built per-run, e.g. the TrafficCamNet INT8
+    engine) or ``model_dir`` (cached across runs in the host store). Labels are
+    baked into the image or generated from the registry's ``supported_classes``
+    per the decoder's ``labels_source``.
 
     Raises ``ValueError`` (worker posts ``failed``) for unknown/not-runnable
-    models or unsupported templates. Missing-artifact checks are left to the
-    process manager (host I/O) using ``required_files``.
+    models, models with no descriptor profile, or unknown decoder keys.
+    Missing-artifact checks are left to the process manager (host I/O) using
+    ``required_files``.
     """
     spec = _resolve_runnable_model_spec(model)
-    ds = spec.deepstream
-    assert ds is not None  # guaranteed by the resolver
+    assert spec.deepstream is not None  # guaranteed by the resolver
+    descriptor = descriptor_from_spec(spec)
+    decoder = get_decoder(descriptor.decoder)
 
-    if ds.config_template == _TRAFFICCAMNET_TEMPLATE:
-        model_dir = ds.model_artifact_path
-        engine_path = f"{work_dir}/trafficcamnet_b1_gpu0_int8.engine"
-        return ModelRuntimePlan(
-            model_id=spec.model_id,
-            model_family=spec.family,
-            model_dir=model_dir,
-            pgie_config=build_pgie_config(
-                model_dir=model_dir,
-                engine_path=engine_path,
-                confidence_threshold=confidence_threshold,
-            ),
-            parser=ds.parser,
-            inference_backend="tensorrt_int8",
-            labels_body=None,
-            extra_mount_dirs=(),
-            required_files=(),
-            image_builtin=True,
-        )
-
-    if ds.config_template == _YOLOX_TEMPLATE:
-        subdir = ds.artifact_subdir or spec.model_id
+    onnx_file = descriptor.artifact.onnx_filename
+    if decoder.artifact_layout == "image_builtin":
+        model_dir = descriptor.artifact.model_artifact_path
+    else:
+        subdir = descriptor.artifact.artifact_subdir or descriptor.model_id
         model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
-        labels_path = f"{work_dir}/labels.txt"
-        # P5-K: YOLOX sizes share this template + the grid-decode parser; only
-        # the ONNX/engine filename differs (``onnx_file``). For yolox_s_v1
-        # (onnx_file unset) this is byte-identical to the pre-P5-K plan.
-        onnx_file = ds.onnx_file or _YOLOX_ONNX_FILENAME
-        engine_file = _fp16_engine_filename(onnx_file)
-        return ModelRuntimePlan(
-            model_id=spec.model_id,
-            model_family=spec.family,
-            model_dir=model_dir,
-            pgie_config=build_yolox_pgie_config(
-                model_dir=model_dir,
-                engine_path=f"{model_dir}/{engine_file}",
-                labels_path=labels_path,
-                num_classes=len(spec.supported_classes),
-                confidence_threshold=confidence_threshold,
-                onnx_file=onnx_file,
-            ),
-            parser=ds.parser,
-            inference_backend="tensorrt_fp16",
-            labels_body="\n".join(spec.supported_classes) + "\n",
-            extra_mount_dirs=(model_dir,),
-            required_files=(
-                f"{model_dir}/{onnx_file}",
-                f"{model_dir}/{_YOLOX_PARSER_LIB_FILENAME}",
-            ),
-            image_builtin=False,
-        )
 
-    if ds.config_template == _ULTRALYTICS_TEMPLATE:
-        # P5-K (in-repo prep; parser NOT yet GPU-validated). Host-mounted
-        # Ultralytics ONNX + the shared custom decode parser.
-        subdir = ds.artifact_subdir or spec.model_id
-        model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
-        labels_path = f"{work_dir}/labels.txt"
-        onnx_file = ds.onnx_file or f"{spec.model_id}.onnx"
-        engine_file = _fp16_engine_filename(onnx_file)
-        return ModelRuntimePlan(
-            model_id=spec.model_id,
-            model_family=spec.family,
-            model_dir=model_dir,
-            pgie_config=build_ultralytics_pgie_config(
-                model_dir=model_dir,
-                engine_path=f"{model_dir}/{engine_file}",
-                labels_path=labels_path,
-                num_classes=len(spec.supported_classes),
-                onnx_file=onnx_file,
-                confidence_threshold=confidence_threshold,
-            ),
-            parser=ds.parser,
-            inference_backend="tensorrt_fp16",
-            labels_body="\n".join(spec.supported_classes) + "\n",
-            extra_mount_dirs=(model_dir,),
-            required_files=(
-                f"{model_dir}/{onnx_file}",
-                f"{model_dir}/{_ULTRALYTICS_PARSER_LIB_FILENAME}",
-            ),
-            image_builtin=False,
-        )
+    engine_name = engine_filename_for(decoder, onnx_file)
+    if decoder.engine_location == "work_dir":
+        engine_path = f"{work_dir}/{engine_name}"
+    else:
+        engine_path = f"{model_dir}/{engine_name}"
 
-    if ds.config_template == _PEOPLENET_TEMPLATE:
-        # P5-K (in-repo prep; NOT yet GPU-verified). Host-mounted NGC PeopleNet
-        # ONNX through the built-in DetectNet_v2 parser (no custom lib).
-        subdir = ds.artifact_subdir or spec.model_id
-        model_dir = f"{model_store_dir.rstrip('/')}/{subdir}"
-        labels_path = f"{work_dir}/labels.txt"
-        onnx_file = ds.onnx_file or f"{spec.model_id}.onnx"
-        engine_file = _fp16_engine_filename(onnx_file)
-        return ModelRuntimePlan(
-            model_id=spec.model_id,
-            model_family=spec.family,
+    labels_path = f"{work_dir}/labels.txt"
+    pgie_config = decoder.render(
+        PgieRenderContext(
             model_dir=model_dir,
-            pgie_config=build_detectnet_pgie_config(
-                model_dir=model_dir,
-                engine_path=f"{model_dir}/{engine_file}",
-                labels_path=labels_path,
-                num_classes=len(spec.supported_classes),
-                onnx_file=onnx_file,
-                confidence_threshold=confidence_threshold,
-            ),
-            parser=ds.parser,
-            inference_backend="tensorrt_fp16",
-            labels_body="\n".join(spec.supported_classes) + "\n",
-            extra_mount_dirs=(model_dir,),
-            required_files=(f"{model_dir}/{onnx_file}",),
-            image_builtin=False,
+            engine_path=engine_path,
+            labels_path=labels_path,
+            num_classes=len(spec.supported_classes),
+            onnx_file=onnx_file,
+            confidence_threshold=confidence_threshold,
         )
+    )
 
-    raise ValueError(
-        f"deepstream inference model {model!r}: registry config_template "
-        f"{ds.config_template!r} is not supported by this runtime"
+    if decoder.labels_source == "image":
+        labels_body: str | None = None
+    else:
+        labels_body = "\n".join(spec.supported_classes) + "\n"
+
+    if decoder.artifact_layout == "image_builtin":
+        extra_mount_dirs: tuple[str, ...] = ()
+        required_files: tuple[str, ...] = ()
+    else:
+        extra_mount_dirs = (model_dir,)
+        required = [f"{model_dir}/{onnx_file}"]
+        if decoder.custom_parser_lib is not None:
+            required.append(f"{model_dir}/{decoder.custom_parser_lib}")
+        required_files = tuple(required)
+
+    return ModelRuntimePlan(
+        model_id=spec.model_id,
+        model_family=spec.family,
+        model_dir=model_dir,
+        pgie_config=pgie_config,
+        parser=spec.deepstream.parser,
+        inference_backend=decoder.inference_backend,
+        labels_body=labels_body,
+        extra_mount_dirs=extra_mount_dirs,
+        required_files=required_files,
+        image_builtin=decoder.artifact_layout == "image_builtin",
     )
 
 

@@ -4,6 +4,45 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-06-20 - BYOM Phase 0: Model Descriptor + Decoder Registry refactor (no behavior change)
+
+**Why:** foundation for the BYOM plan (`docs/byom-architecture.md`). Make the
+curated model runtime **data-driven** so later phases (automated prepare,
+validation gate, per-account registry, distribution, Triton) become "add
+descriptor data + maybe one decoder," not "add another `config_template`
+branch." Phase 0 is a pure **no-behavior-change** refactor — processor only.
+
+**What changed:**
+- New `app/packages/model_descriptor.py` — declarative `ModelDescriptor`
+  (`DescriptorInput`/`Output`/`Artifact`/`Provenance`) + `descriptor_from_spec(spec)`.
+  Generated from the existing registry; no JSON/DB change. Strict validation.
+- New `app/runtimes/deepstream_runtime/decoders.py` — finite `DECODER_REGISTRY`
+  (4 entries) + `get_decoder()` (clear `DecoderRegistryError(ValueError)` for
+  unknown keys). The four `build_*_pgie_config` byte-templates moved here
+  **verbatim**; each `DecoderSpec` wraps one + its assembly facts (backend,
+  engine location, artifact layout, custom parser lib, labels source).
+- `inference.py::build_model_runtime_plan` — the four `if config_template == …`
+  branches collapse to one descriptor-driven body (`spec → descriptor → decoder
+  → plan`). Builders re-exported from `inference.py`; `ModelRuntimePlan`
+  unchanged.
+
+**What did NOT change:** runtime bytes, model outputs, model/package IDs,
+recommendations, package catalog, api-server/dashboard. PGIE config + every
+`ModelRuntimePlan` field are **byte-identical** for all 10 models.
+
+**Design call:** the four families differ in nvinfer **key order/set**, not just
+values, so a single generic renderer can't be byte-identical. The decoder keeps
+each family's exact byte-template; the descriptor supplies + declares the values
+(consistency test guards against drift). Generic renderer deferred to a later
+phase.
+
+**Tests:** `tests/test_config_parity.py` (per-model byte-identical PGIE goldens +
+full plan-field parity + explicit `yolox_s` golden), `tests/test_model_descriptor.py`,
+`tests/test_decoder_registry.py`. **847 passed**, `mypy app` clean, ruff clean.
+Dev notes: `docs/byom-descriptors.md`.
+
+---
+
 ## 2026-06-19 - Processing P5-L: Published-reference model metrics (operator comparison)
 
 **Why:** the curated catalog now has 10 models (P5-K) but no way for an operator
