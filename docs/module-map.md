@@ -86,6 +86,14 @@ What each file owns.
   `ModelSpec` (parsed by `_parse_model_metrics`; `metric_source` +
   `upstream_measured` required, the rest nullable) — published-reference model
   benchmarks, never Upstream-measured.
+- `model_descriptor.py` — BYOM Phase 0. Declarative `ModelDescriptor`
+  (`DescriptorInput`/`Output`/`Artifact`/`Provenance`) + `descriptor_from_spec(spec)`,
+  a normalized view over a registry `ModelSpec` (input geometry + preprocessing,
+  output/NMS decoding, class map, precision, artifacts, license provenance). No
+  JSON/DB — generated from the registry; `DescriptorValidationError` on bad
+  shape. The `decoder` field selects a `DecoderSpec` (see
+  `runtimes/deepstream_runtime/decoders.py`). Consumed by
+  `build_model_runtime_plan`. Dev notes: `docs/byom-descriptors.md`.
 - `compatibility.py` — `validate_package_compatibility`: package ↔ registry
   cross-checks (unknown ids, runtime support, class subsets, tracker-requiring
   outputs, status gating; planned/deprecated components never resolvable).
