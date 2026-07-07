@@ -256,6 +256,36 @@ class Settings(BaseSettings):
     deepstream_lifecycle_track_missing_grace_seconds: float = 2.0
     deepstream_lifecycle_infer_zone_exit_on_disappearance: bool = True
 
+    # --- CrowdCount runtime (container-per-session counting worker) ------
+    # The crowdcount runtime supervises the existing CrowdCount counting
+    # pipeline (built from crowdcount-counter-server ``prod``) as one
+    # container per eligible session, mirroring the DeepStream docker
+    # lifecycle. The container owns counting, tracking, and the
+    # counts-of-record posts to crowdcount-server; Upstream owns only the
+    # lifecycle + processor status (v1 is status-only).
+    #
+    # Image fallback when the package registry entry declares no
+    # ``container_image``. The real image is built from the CrowdCount repo
+    # (single-session entrypoint milestone) and referenced by the
+    # ``overhead_people_counter.v1`` registry entry.
+    crowdcount_image: str = "crowdcount-counter:dev"
+    crowdcount_docker_network: str = "host"
+    # Literal ``docker run --gpus`` value, same semantics as deepstream_gpus.
+    # During DeepStream co-residency pin the two runtimes to different cards
+    # (e.g. UPSTREAM_CROWDCOUNT_GPUS="device=0" with
+    # UPSTREAM_DEEPSTREAM_GPUS="device=1") BEFORE any parallel run.
+    crowdcount_gpus: str = "all"
+    # ``docker stop --time`` grace for the counting container. Its SIGTERM
+    # handler must flush pending count posts to crowdcount-server and post
+    # device offline within this window. Sized so grace + the wait slack
+    # (+5s) + the terminal status post fit final_status_timeout_seconds+1
+    # (16s) and overall_shutdown_timeout_seconds (25s).
+    crowdcount_process_stop_timeout_seconds: float = 8.0
+    # Base URL the container's CrowdCountAPIClient posts counts-of-record
+    # and device status to. Forwarded into the container env; never called
+    # from this process.
+    crowdcount_api_base_url: str = "https://api.crowdcount.tech"
+
     # --- P5-C latest perception snapshot -----------------------------
     # A low-rate (~1/s) JSON snapshot of what the analytics worker
     # currently sees — detected objects + configured ROI/line geometry —

@@ -27,6 +27,7 @@ from app.observations.schemas import EligibleSession
 from app.observations.writer import ObservationWriter
 from app.packages.resolver import PackageSpec, resolve
 from app.runtimes.base import Runtime
+from app.runtimes.crowdcount_runtime.worker import CrowdCountWorker
 from app.runtimes.deepstream_runtime.worker import DeepStreamWorker
 from app.runtimes.mock_runtime.worker import MockWorker
 from app.supervisor.processor_status import build_status_request
@@ -53,6 +54,17 @@ def build_worker(
     """Pick the runtime worker from the resolved package's runtime. Pure +
     side-effect free (constructing a DeepStreamWorker does NOT touch Docker —
     the subprocess starts in ``run()``), so this is unit-testable."""
+    if spec.runtime == "crowdcount":
+        # Container-per-session CrowdCount counting worker (status-only v1).
+        # The writer is threaded now so the seam doesn't change when
+        # alongside processor.line_crossing emission lands.
+        return CrowdCountWorker(
+            session=session,
+            settings=settings,
+            api=api,
+            package=spec,
+            writer=writer,
+        )
     if spec.runtime == "deepstream":
         # P4-B threads the same ObservationWriter used by MockWorker so the
         # analytics mode can emit ``processor.line_crossing`` observations.

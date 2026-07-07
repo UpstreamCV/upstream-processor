@@ -29,7 +29,7 @@ from importlib import resources
 from app.errors import PackageResolutionError
 from app.packages.compatibility import validate_package_compatibility
 
-SUPPORTED_RUNTIMES: frozenset[str] = frozenset({"mock", "deepstream"})
+SUPPORTED_RUNTIMES: frozenset[str] = frozenset({"mock", "deepstream", "crowdcount"})
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,9 @@ class PackageSpec:
     # Placeholder usage/cost metadata — NOT billed, NOT final pricing.
     compute_tier: str | None = None
     pricing_tier: str | None = None
+    # Container image for runtimes whose worker is a shipped image (the
+    # crowdcount runtime). None => the runtime's Settings default applies.
+    container_image: str | None = None
     # --- P5-D: package-readiness metadata --------------------------------
     # Internal product-facing candidate fields for the future package
     # assignment API. NOT a package catalog, NOT exposed through api-server
@@ -95,6 +98,7 @@ def load_registry() -> dict[str, PackageSpec]:
             supported_classes=tuple(entry.get("supported_classes", [])),
             compute_tier=entry.get("compute_tier"),
             pricing_tier=entry.get("pricing_tier"),
+            container_image=entry.get("container_image"),
             category=entry.get("category"),
             best_for=tuple(entry.get("best_for", [])),
             not_recommended_for=tuple(entry.get("not_recommended_for", [])),
