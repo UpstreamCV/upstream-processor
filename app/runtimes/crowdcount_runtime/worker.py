@@ -121,6 +121,17 @@ class CrowdCountWorker(Runtime):
             height=self._session.approved.height,
             fps=self._session.approved.fps,
             gpus=self._settings.crowdcount_gpus,
+            # Perception overlay: the worker publishes live detection boxes to
+            # the perception-fanout sidecar, keyed by this camera. Reuses the
+            # platform fanout settings (same sidecar DeepStream publishes to).
+            camera_id=str(self._session.camera_id),
+            session_id=str(self._session.session_id),
+            fanout_url=self._settings.fanout_publish_url,
+            fanout_secret=(
+                self._settings.fanout_publish_secret.get_secret_value()
+                if self._settings.fanout_publish_secret
+                else ""
+            ),
         )
 
     async def run(self) -> None:

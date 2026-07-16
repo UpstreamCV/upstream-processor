@@ -714,6 +714,12 @@ class PeopleCounterProcessor(BaseStreamProcessor):
         self.direction_refresh_timer = None
         self.logger.info(f"Direction flipped setting initialized: {self.direction_flipped}")
 
+        # Optional perception hook: a callable(frame, detections, frame_number)
+        # invoked once per frame with the tracked detections, used to publish
+        # live boxes to the dashboard overlay. Never counting-critical — the
+        # process_frame call site swallows any error it raises.
+        self.perception_hook = None
+
     def on_start(self):
         """Initialize models or connect to centralized inference server when processor starts"""
         # Start periodic refresh of direction_flipped setting (every 60 seconds)
@@ -2174,6 +2180,14 @@ class PeopleCounterProcessor(BaseStreamProcessor):
 
         # Extract detections using YOLO
         detections = self.extract_detections(frame)
+
+        # Publish live boxes to the perception overlay (best-effort; must never
+        # break counting).
+        if self.perception_hook is not None:
+            try:
+                self.perception_hook(frame, detections, frame_number)
+            except Exception:
+                pass
 
         # Update trackers and check for crossings
         self.update_trackers(frame, detections)
