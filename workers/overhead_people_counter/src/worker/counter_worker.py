@@ -14,24 +14,47 @@ This module only wires a single instance to a single stream and manages the
 process lifecycle around it.
 
 Environment contract (keep in lock-step with upstream-processor's
-app/runtimes/crowdcount_runtime/process_manager.py):
+app/runtimes/crowdcount_runtime/process_manager.py, which writes every
+variable marked [upstream] below into the container's --env-file):
 
-    CC_RTSP_URL          required  Stream source. Upstream passes the session's
-                                   internal RTSP URL; a local video file path
-                                   also works for smoke tests.
-    CC_DEVICE_ID         optional  CrowdCount device id (e.g. "C4804"). Both
-                                   credentials empty => PROBE MODE: counting
-                                   runs but nothing is posted (the API client
-                                   disables itself without credentials).
-    CC_DEVICE_PASSWORD   optional  Device password. Setting exactly one of
-                                   id/password is a misconfiguration (exit 3).
-    CC_API_BASE_URL      optional  Default https://api.crowdcount.tech
+    CC_RTSP_URL          required  [upstream] Stream source. Upstream passes
+                                   the session's internal RTSP URL; a local
+                                   video file path also works for smoke tests.
+    CC_DEVICE_ID         optional  [upstream] CrowdCount device id (e.g.
+                                   "C4804") — the camera's Upstream
+                                   external_id. The device counts post FOR.
+    CC_SERVICE_SECRET    optional  [upstream] Shared trusted-backend
+                                   credential (from Upstream's
+                                   UPSTREAM_CROWDCOUNT_SERVICE_SECRET). With
+                                   CC_DEVICE_ID => SERVICE MODE: post on
+                                   behalf of that device with no per-device
+                                   password. Requires CC_DEVICE_ID (exit 3).
+                                   Rejected by the server => exit 3.
+    CC_DEVICE_PASSWORD   optional  Per-device password (the on-device path;
+                                   Upstream does not hold these). Setting
+                                   exactly one of id/password is a
+                                   misconfiguration (exit 3). No service
+                                   secret and no id+password => PROBE MODE:
+                                   counting runs but nothing is posted.
+    CC_API_BASE_URL      optional  [upstream] Default https://api.crowdcount.tech
+    CC_FRAME_WIDTH       optional  [upstream] Informational only (logged); the
+    CC_FRAME_HEIGHT      optional  [upstream] capture reads actual stream
+    CC_FRAME_FPS         optional  [upstream] properties itself.
     CC_STREAM_NAME       optional  Log prefix / stream name. Defaults to the
                                    device id, else "camera0".
     CC_MODEL_PATH        optional  Override the model weights path (testing).
-    CC_FRAME_WIDTH       optional  Informational only (logged); the capture
-    CC_FRAME_HEIGHT      optional  reads actual stream properties itself.
-    CC_FRAME_FPS         optional
+
+    Perception overlay (all best-effort; never affects counting). The boxes
+    + counting line are published to Upstream's perception-fanout sidecar for
+    the dashboard overlay. Needs URL + secret + camera id, else it stays off:
+
+    CC_FANOUT_URL        optional  [upstream] Sidecar publish endpoint.
+    CC_FANOUT_SECRET     optional  [upstream] Sidecar publish secret.
+    CC_CAMERA_ID         optional  [upstream] Upstream camera uuid; keys the
+                                   overlay.
+    CC_SESSION_ID        optional  [upstream] Upstream stream-session uuid.
+    CC_PROCESSOR_ID      optional  [upstream] Stamped on the envelope.
+    CC_PACKAGE_ID        optional  [upstream] Stamped on the envelope.
 
 Lifecycle:
     - Posts device "online" to crowdcount-server before the loop and "offline"
