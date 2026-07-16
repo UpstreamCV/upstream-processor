@@ -42,6 +42,7 @@ ENV_API_BASE_URL = "CC_API_BASE_URL"
 ENV_FRAME_WIDTH = "CC_FRAME_WIDTH"
 ENV_FRAME_HEIGHT = "CC_FRAME_HEIGHT"
 ENV_FRAME_FPS = "CC_FRAME_FPS"
+ENV_SERVICE_SECRET = "CC_SERVICE_SECRET"
 
 
 def build_docker_command(
@@ -79,6 +80,7 @@ class CrowdCountProcessManager:
         height: int | None = None,
         fps: int | None = None,
         gpus: str = "all",
+        service_secret: str = "",
     ) -> None:
         self._rtsp_url = rtsp_url
         self._image = image
@@ -90,6 +92,7 @@ class CrowdCountProcessManager:
         self._height = height
         self._fps = fps
         self._gpus = gpus
+        self._service_secret = service_secret
         self._container = f"upstream-cc-{uuid4().hex[:12]}"
         self._env_file: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -112,6 +115,8 @@ class CrowdCountProcessManager:
             lines.append(f"{ENV_FRAME_HEIGHT}={self._height}")
         if self._fps is not None:
             lines.append(f"{ENV_FRAME_FPS}={self._fps}")
+        if self._service_secret:
+            lines.append(f"{ENV_SERVICE_SECRET}={self._service_secret}")
         fd, path = tempfile.mkstemp(prefix="upstream-cc-env-", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")

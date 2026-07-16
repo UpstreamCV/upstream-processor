@@ -274,7 +274,7 @@ class Settings(BaseSettings):
     # During DeepStream co-residency pin the two runtimes to different cards
     # (e.g. UPSTREAM_CROWDCOUNT_GPUS="device=0" with
     # UPSTREAM_DEEPSTREAM_GPUS="device=1") BEFORE any parallel run.
-    crowdcount_gpus: str = "all"
+    crowdcount_gpus: str = "device=0"
     # ``docker stop --time`` grace for the counting container. Its SIGTERM
     # handler must flush pending count posts to crowdcount-server and post
     # device offline within this window. Sized so grace + the wait slack
@@ -285,6 +285,10 @@ class Settings(BaseSettings):
     # and device status to. Forwarded into the container env; never called
     # from this process.
     crowdcount_api_base_url: str = "https://api.crowdcount.tech"
+    # Shared service credential the container uses to post counts on behalf of
+    # any device (env UPSTREAM_CROWDCOUNT_SERVICE_SECRET). Forwarded into the
+    # container's per-run env-file; empty => the container runs probe-only.
+    crowdcount_service_secret: SecretStr | None = None
 
     # --- P5-C latest perception snapshot -----------------------------
     # A low-rate (~1/s) JSON snapshot of what the analytics worker
