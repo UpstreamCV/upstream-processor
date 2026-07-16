@@ -260,9 +260,9 @@ class Settings(BaseSettings):
     # The crowdcount runtime supervises the existing CrowdCount counting
     # pipeline (built from crowdcount-counter-server ``prod``) as one
     # container per eligible session, mirroring the DeepStream docker
-    # lifecycle. The container owns counting, tracking, and the
-    # counts-of-record posts to crowdcount-server; Upstream owns only the
-    # lifecycle + processor status (v1 is status-only).
+    # lifecycle. The container owns counting, tracking, the counts-of-record
+    # posts to crowdcount-server and the fanout overlay; Upstream owns only
+    # the lifecycle + processor status. No Upstream observations are emitted.
     #
     # Image fallback when the package registry entry declares no
     # ``container_image``. The real image is built from the CrowdCount repo
@@ -289,6 +289,12 @@ class Settings(BaseSettings):
     # any device (env UPSTREAM_CROWDCOUNT_SERVICE_SECRET). Forwarded into the
     # container's per-run env-file; empty => the container runs probe-only.
     crowdcount_service_secret: SecretStr | None = None
+    # How long to wait for the container's ready marker before giving up on
+    # it. A container that wedges before printing CROWDCOUNT_READY (e.g. a
+    # stalled model load) otherwise sits in ``starting`` forever, holding the
+    # session with no counting and no failure. Generous: a cold start pulls
+    # weights onto the GPU. Exceeding it stops the container and posts failed.
+    crowdcount_attach_timeout_seconds: float = 120.0
 
     # --- P5-C latest perception snapshot -----------------------------
     # A low-rate (~1/s) JSON snapshot of what the analytics worker

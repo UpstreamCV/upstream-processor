@@ -14,40 +14,65 @@ This module only wires a single instance to a single stream and manages the
 process lifecycle around it.
 
 Environment contract (keep in lock-step with upstream-processor's
-app/runtimes/crowdcount_runtime/process_manager.py):
+app/runtimes/crowdcount_runtime/process_manager.py, which writes every
+variable marked [upstream] below into the container's --env-file):
 
-    CC_RTSP_URL          required  Stream source. Upstream passes the session's
-                                   internal RTSP URL; a local video file path
-                                   also works for smoke tests.
-    CC_DEVICE_ID         optional  CrowdCount device id (e.g. "C4804"). Both
-                                   credentials empty => PROBE MODE: counting
-                                   runs but nothing is posted (the API client
-                                   disables itself without credentials).
-    CC_DEVICE_PASSWORD   optional  Device password. Setting exactly one of
-                                   id/password is a misconfiguration (exit 3).
-    CC_API_BASE_URL      optional  Default https://api.crowdcount.tech
+    CC_RTSP_URL          required  [upstream] Stream source. Upstream passes
+                                   the session's internal RTSP URL; a local
+                                   video file path also works for smoke tests.
+    CC_DEVICE_ID         optional  [upstream] CrowdCount device id (e.g.
+                                   "C4804") — the camera's Upstream
+                                   external_id. The device counts post FOR.
+    CC_SERVICE_SECRET    optional  [upstream] Shared trusted-backend
+                                   credential (from Upstream's
+                                   UPSTREAM_CROWDCOUNT_SERVICE_SECRET). With
+                                   CC_DEVICE_ID => SERVICE MODE: post on
+                                   behalf of that device with no per-device
+                                   password. Requires CC_DEVICE_ID (exit 3).
+                                   Rejected by the server => exit 3.
+    CC_DEVICE_PASSWORD   optional  Per-device password (the on-device path;
+                                   Upstream does not hold these). Setting
+                                   exactly one of id/password is a
+                                   misconfiguration (exit 3). No service
+                                   secret and no id+password => PROBE MODE:
+                                   counting runs but nothing is posted.
+    CC_API_BASE_URL      optional  [upstream] Default https://api.crowdcount.tech
+    CC_FRAME_WIDTH       optional  [upstream] Informational only (logged); the
+    CC_FRAME_HEIGHT      optional  [upstream] capture reads actual stream
+    CC_FRAME_FPS         optional  [upstream] properties itself.
     CC_STREAM_NAME       optional  Log prefix / stream name. Defaults to the
                                    device id, else "camera0".
     CC_MODEL_PATH        optional  Override the model weights path (testing).
-    CC_FRAME_WIDTH       optional  Informational only (logged); the capture
-    CC_FRAME_HEIGHT      optional  reads actual stream properties itself.
-    CC_FRAME_FPS         optional
+
+    Perception overlay (all best-effort; never affects counting). The boxes
+    + counting line are published to Upstream's perception-fanout sidecar for
+    the dashboard overlay. Needs URL + secret + camera id, else it stays off:
+
+    CC_FANOUT_URL        optional  [upstream] Sidecar publish endpoint.
+    CC_FANOUT_SECRET     optional  [upstream] Sidecar publish secret.
+    CC_CAMERA_ID         optional  [upstream] Upstream camera uuid; keys the
+                                   overlay.
+    CC_SESSION_ID        optional  [upstream] Upstream stream-session uuid.
+    CC_PROCESSOR_ID      optional  [upstream] Stamped on the envelope.
+    CC_PACKAGE_ID        optional  [upstream] Stamped on the envelope.
 
 Lifecycle:
     - Posts device "online" to crowdcount-server before the loop and "offline"
-      after it (best-effort), replacing the old orchestrator's status pushes.
+      after it (single-shot, best-effort), replacing the old orchestrator's
+      status pushes. In service mode a REJECTED online post is fatal (exit 3):
+      it means every count post would 401 into the void.
     - Prints CROWDCOUNT_READY on stdout once the processor is initialized —
       the marker the Upstream CrowdCountWorker attaches on.
-    - SIGTERM/SIGINT request a cooperative stop; total shutdown (stop -> count
-      thread grace -> offline post) fits inside Upstream's 8s docker stop
-      grace.
+    - SIGTERM/SIGINT request a cooperative stop, honored during startup as
+      well as during the frame loop; total shutdown (stop -> count thread
+      grace -> offline post) fits inside Upstream's 8s docker stop grace.
 
 Exit codes:
     0  stop was requested (SIGTERM/SIGINT) or the processor reached ready and
        ended naturally (e.g. stream loss -> supervisor/Docker restarts it)
     1  never reached ready (stream connect or model init failure)
     2  missing CC_RTSP_URL
-    3  credential misconfiguration or rejected credentials
+    3  credentials misconfigured, rejected, or unverifiable (API unreachable)
 
 NOTE: env validation must stay importable/runnable without the CV stack, so
 the heavy imports (cv2/ultralytics via the processors package) happen lazily
@@ -57,6 +82,7 @@ inside main() after validation.
 import os
 import sys
 import signal
+import threading
 import time
 import logging
 import multiprocessing
@@ -159,16 +185,61 @@ def _build_processor(config):
 
     class SingleSessionPeopleCounter(PeopleCounterProcessor):
         """
-        The production people counter, unmodified, plus the two things a
-        supervised single-session worker needs: an attach marker on stdout
-        and an optional weights override for testing.
+        The production people counter, unmodified, plus what a supervised
+        single-session worker needs: an attach marker on stdout, an optional
+        weights override for testing, and a stop request that is honored
+        during startup as well as during the frame loop.
         """
 
         def __init__(self, *args, model_path_override='', **kwargs):
             super().__init__(*args, **kwargs)
             self.ready_emitted = False
+            # base_processor.stop() only clears self.running, and
+            # base_processor.run() assigns self.running = True on entry — so a
+            # stop requested before/during startup is erased. Latch it here
+            # instead; an Event also makes the connect backoff interruptible.
+            self._stop_event = threading.Event()
             if model_path_override:
                 self.model_path = model_path_override
+
+        @property
+        def stop_requested(self):
+            return self._stop_event.is_set()
+
+        def stop(self):
+            self._stop_event.set()
+            super().stop()
+
+        def run(self):
+            if self.stop_requested:
+                # SIGTERM landed during credential checks / model import.
+                self.logger.info("Stop requested before startup; not running")
+                return
+            super().run()
+
+        def connect_stream(self, max_retries=10, initial_delay=0.5):
+            """Connect, honoring a stop requested while we retry.
+
+            The base retry loop runs minutes in the worst case (10 attempts,
+            each up to a 10s socket timeout, plus a 1.5x backoff between) and
+            never re-checks the stop flag, so a docker stop during connect
+            used to wait out the grace and get SIGKILLed — skipping the
+            "offline" post and leaving the device ghost-online. Drive the base
+            one attempt at a time so a stop lands within one attempt instead.
+            """
+            delay = initial_delay
+            for attempt in range(1, max_retries + 1):
+                if self.stop_requested:
+                    self.logger.info("Stop requested; abandoning stream connect")
+                    return False
+                if super().connect_stream(max_retries=1, initial_delay=delay):
+                    return True
+                if attempt < max_retries and self._stop_event.wait(delay):
+                    self.logger.info("Stop requested; abandoning stream connect")
+                    return False
+                delay *= 1.5  # same backoff the base loop applies
+            self.logger.error(f"Failed to connect to stream after {max_retries} attempts")
+            return False
 
         def on_start(self):
             try:
@@ -215,6 +286,7 @@ def main():
               f'{config.frame_width}x{config.frame_height}@{config.frame_fps}', flush=True)
 
     # Credential gate: fail fast on bad credentials; warn loudly in probe mode.
+    import requests
     from api.crowdcount_api_client import CrowdCountAPIClient
 
     if config.probe_mode:
@@ -225,12 +297,18 @@ def main():
                        'locally but never posted')
     elif config.service_mode:
         # Trusted-backend service auth: no per-device password to verify here.
-        # A bad secret surfaces as a 401 on the first post.
+        # The online post below is the verification (a bad secret 401s).
         print(f'[{config.stream_name}] SERVICE AUTH for device '
               f'{config.device_id} (counts post via CC_SERVICE_SECRET)', flush=True)
     else:
-        if not CrowdCountAPIClient.check_password(
-                config.device_id, config.password, base_url=config.api_base_url):
+        try:
+            verified = CrowdCountAPIClient.check_password(
+                config.device_id, config.password, base_url=config.api_base_url)
+        except requests.ConnectionError as e:
+            print(f'ERROR: cannot reach {config.api_base_url} to verify credentials '
+                  f'for device {config.device_id}: {e}', file=sys.stderr, flush=True)
+            sys.exit(3)
+        if not verified:
             print(f'ERROR: credentials rejected for device {config.device_id} '
                   f'at {config.api_base_url}', file=sys.stderr, flush=True)
             sys.exit(3)
@@ -280,12 +358,10 @@ def main():
         except Exception as e:
             logger.warning(f'perception overlay disabled: {e}')
 
-    stop_requested = {'flag': False}
-
     def _handle_signal(signum, frame):
         # Cooperative stop only — the run() loop exits within ~a frame read,
         # its finally runs on_stop() (timer cancel + summary) and disconnects.
-        stop_requested['flag'] = True
+        # Before the loop, processor.stop_requested makes startup bail out.
         print(f'[{config.stream_name}] Signal {signum} received, stopping...', flush=True)
         processor.stop()
 
@@ -293,10 +369,25 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
 
     try:
+        # max_retries=0: the whole SIGTERM path (this post + the count-thread
+        # grace + the offline post) has to fit Upstream's 8s docker stop
+        # grace, and retries here are unbounded enough to blow it (~12s) —
+        # PEP 475 resumes the retry sleep after the handler runs, so a signal
+        # cannot cut it short. Lifecycle posts are best-effort by design.
         try:
-            lifecycle_client.update_status('online')
+            lifecycle_client.update_status('online', max_retries=0)
         except Exception as e:  # best-effort — an API blip must not block counting
             logger.warning(f'online status post failed: {e}')
+
+        # A rejected credential is not a blip: in service mode every count post
+        # would 401 while the worker kept reporting itself healthy, silently
+        # losing counts-of-record. Fail fast so the supervisor surfaces it.
+        # Transient failures leave the verdict None and are tolerated.
+        if config.service_mode and lifecycle_client.last_status_auth_ok is False:
+            print(f'ERROR: CC_SERVICE_SECRET rejected for device {config.device_id} '
+                  f'at {config.api_base_url}; counts would be silently dropped',
+                  file=sys.stderr, flush=True)
+            sys.exit(3)
 
         processor.run()  # blocking until stop, stream loss, or init failure
     finally:
@@ -305,12 +396,12 @@ def main():
         # Let in-flight per-crossing count threads finish before exiting.
         time.sleep(COUNT_THREAD_GRACE_SECONDS)
         try:
-            lifecycle_client.update_status('offline')
+            lifecycle_client.update_status('offline', max_retries=0)
         except Exception as e:
             logger.warning(f'offline status post failed: {e}')
         sys.stdout.flush()
 
-    if stop_requested['flag'] or processor.ready_emitted:
+    if processor.stop_requested or processor.ready_emitted:
         # Requested stop, or ran for real and ended (e.g. stream loss —
         # the supervisor/Docker restart policy owns recovery).
         sys.exit(0)

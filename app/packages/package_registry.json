@@ -1005,14 +1005,12 @@
       "package_id": "overhead_people_counter.v1",
       "display_name": "Overhead People Counter v1",
       "runtime": "crowdcount",
-      "description": "Overhead doorway people counter (line-crossing) running the existing CrowdCount counting pipeline as a container per session. The container reuses CrowdCount prod's PeopleCounterProcessor (danger-zone crossing state machine, BoT-SORT tracking, centered counting line) unchanged and posts counts-of-record to crowdcount-server via its own signed CrowdCountAPIClient; that count path is NOT an Upstream output. Upstream supervises the container lifecycle and receives processor status; the processor.line_crossing observation output is emitted alongside for operator value only (a later milestone \u2014 v1 is status-only). Inference is internal to the CrowdCount image (per-worker for now; shared per-GPU sidecar is a later milestone), so this package references no model / tracker / analytics registry entries.",
-      "outputs": [
-        "processor.line_crossing"
-      ],
+      "description": "Overhead doorway people counter (line-crossing) running the existing CrowdCount counting pipeline as a container per session. The container reuses CrowdCount prod's PeopleCounterProcessor (danger-zone crossing state machine, BoT-SORT tracking, centered counting line) unchanged and posts counts-of-record to crowdcount-server via its own CrowdCountAPIClient, signed with the shared service credential Upstream forwards; it also publishes detection boxes + the counting line to the perception-fanout sidecar for the dashboard overlay. NEITHER is an Upstream observation, and this package declares no observation outputs: the count path is the product, and the overlay is ephemeral. Upstream supervises the container lifecycle and receives processor status. Inference is internal to the CrowdCount image (per-worker for now; shared per-GPU sidecar is a later milestone), so this package references no model / tracker / analytics registry entries.",
+      "outputs": [],
       "supports": {
         "people_counter": true
       },
-      "status": "probe",
+      "status": "supported",
       "compute_tier": "low",
       "pricing_tier": "free_probe",
       "container_image": "crowdcount-counter:dev",
@@ -1024,15 +1022,13 @@
       "supported_triggers": [
         "line_crossing"
       ],
-      "observation_policy": "debounced_events_plus_interval_heartbeats",
       "test_mode_safe": true,
-      "production_ready": false,
+      "production_ready": true,
       "best_for": [
         "overhead_doorway_people_counting"
       ],
       "not_recommended_for": [
-        "side_view_scenes",
-        "production_sla"
+        "side_view_scenes"
       ]
     }
   ]
