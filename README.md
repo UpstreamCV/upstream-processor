@@ -260,6 +260,47 @@ uv run upstream-processor
   / metadata / decode / inference modes are unchanged.
 - The pyds container still does not call the API.
 
+## CrowdCount runtime scope (container-per-session people counter)
+
+The CrowdCount→Upstream migration's processing plane. **Live end-to-end
+since 2026-07-16**: a Pi streams SRT to Upstream, this supervisor spawns a
+counting container per session, and counts land on crowdcount-server.
+
+- **The runtime** — `app/runtimes/crowdcount_runtime/`. `CrowdCountWorker`
+  mirrors `DeepStreamWorker`'s docker-backed lifecycle: guard the RTSP URL,
+  post `starting`, launch the container, attach on its `CROWDCOUNT_READY`
+  stdout marker (bounded by `UPSTREAM_CROWDCOUNT_ATTACH_TIMEOUT_SECONDS`),
+  heartbeat `processing`, map the exit to `stopped`/`failed`.
+  `CrowdCountProcessManager` runs `docker run` with session inputs in a
+  per-run 0600 `--env-file` — that keeps them out of `ps`/argv, but the
+  resolved env is still visible to `docker inspect`.
+- **The worker** — `workers/overhead_people_counter/`. The CrowdCount prod
+  counting pipeline (YOLO v6 + BoT-SORT + OSNet ReID + doorway
+  line-crossing), ported here so it no longer depends on
+  crowdcount-counter-server. One `PeopleCounterProcessor` per container,
+  inference in-process. Build:
+  `docker build -t crowdcount-counter:dev workers/overhead_people_counter`
+- **The package** — `overhead_people_counter.v1`, runtime `crowdcount`,
+  `status: supported`, `production_ready: true`. Model-less: inference is
+  internal to the image, so it references no model / tracker / analytics
+  registry entry.
+- **The CC_* env contract** — the container's entrypoint is configured
+  entirely by `CC_*` variables. Full contract:
+  `workers/overhead_people_counter/src/worker/counter_worker.py`; the
+  writer side is `crowdcount_runtime/process_manager.py`. Keep them in
+  lock-step.
+- **Counts-of-record are NOT an Upstream output.** The container posts them
+  straight to crowdcount-server with its own signed client, using the
+  shared service credential this supervisor forwards
+  (`UPSTREAM_CROWDCOUNT_SERVICE_SECRET`; unset => the container counts
+  without posting). It also publishes detection boxes + the counting line
+  to the perception-fanout sidecar for the dashboard overlay, which is
+  ephemeral. **This runtime emits no Upstream observations** — the package
+  declares none, and the `ObservationWriter` is accepted but unused.
+- **Division of labor**: the container owns counting, tracking, the count
+  posts and the device online/offline posts (all existing CrowdCount prod
+  code). Upstream owns the container lifecycle and processor status.
+
 ## What it deliberately does NOT do (yet)
 
 The P4-B/P4-C/P4-D write paths cover line crossing, ROI
@@ -316,6 +357,18 @@ make run                     # python -m app.main
 | `UPSTREAM_DEEPSTREAM_METADATA_SAMPLE_LIMIT` | no | `3` | In-container app: object samples per frame in each `UPSTREAM_METADATA=` line |
 | `UPSTREAM_FINAL_STATUS_TIMEOUT_SECONDS` | no | `15` | Per-worker budget for graceful stop + final `stopped` post (DeepStream-safe; mock exits faster) |
 | `UPSTREAM_OVERALL_SHUTDOWN_TIMEOUT_SECONDS` | no | `25` | Overall supervisor shutdown cap before workers are force-cancelled |
+| `UPSTREAM_CROWDCOUNT_IMAGE` | no | `crowdcount-counter:dev` | Counting-container image; fallback when the package declares no `container_image` |
+| `UPSTREAM_CROWDCOUNT_DOCKER_NETWORK` | no | `host` | Docker network for the counting container |
+| `UPSTREAM_CROWDCOUNT_GPUS` | no | `device=0` | Literal `docker run --gpus` value. Pin to a different card than `UPSTREAM_DEEPSTREAM_GPUS` before any parallel run |
+| `UPSTREAM_CROWDCOUNT_PROCESS_STOP_TIMEOUT_SECONDS` | no | `8` | `docker stop --time` grace. The container must flush pending count posts + post the device offline inside it, or the device is left ghost-online |
+| `UPSTREAM_CROWDCOUNT_ATTACH_TIMEOUT_SECONDS` | no | `120` | Wait for `CROWDCOUNT_READY` before stopping the container and posting `failed`. Generous: a cold start pulls weights onto the GPU |
+| `UPSTREAM_CROWDCOUNT_API_BASE_URL` | no | `https://api.crowdcount.tech` | Where the **container** posts counts-of-record + device status. Never called from this process |
+| `UPSTREAM_CROWDCOUNT_SERVICE_SECRET` | no | — | Shared trusted-backend credential letting the container post counts on behalf of a device (no per-device password). Must match crowdcount-server. Unset ⇒ the container counts without posting |
+| `UPSTREAM_FANOUT_PUBLISH_URL` | no | — | Perception-fanout sidecar publish endpoint (dashboard overlay). Both url + secret required to enable |
+| `UPSTREAM_FANOUT_PUBLISH_SECRET` | no | — | Sidecar's dedicated publish secret — **not** the api-server webhook secret |
+| `UPSTREAM_FANOUT_PUBLISH_HZ` | no | `12` | Hot cadence while the sidecar reports subscribers |
+| `UPSTREAM_FANOUT_PUBLISH_IDLE_HZ` | no | `0.5` | Idle cadence while nobody is watching |
+| `UPSTREAM_FANOUT_PUBLISH_TIMEOUT_SECONDS` | no | `2` | Per-publish HTTP timeout |
 
 The secret is a `SecretStr` and is never logged (a redaction filter on the log
 handler scrubs it, the header, and JWT-shaped strings as defence-in-depth).

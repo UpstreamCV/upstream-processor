@@ -107,12 +107,74 @@ What each file owns.
 - `mock_runtime/worker.py` — `MockWorker`: the state machine + status pulse +
   3 observation pulses; never touches `internal_rtsp_url`.
 - `mock_runtime/fake_observations.py` — pure deterministic payload builders.
+- `metadata_source.py` — metadata-source seam shared by the DeepStream modes.
+
+#### `app/runtimes/deepstream_runtime/`
+The DeepStream probe + analytics runtime: docker-backed workers for the
+decode / inference / metadata / tracker / analytics modes.
+- `worker.py` — `DeepStreamWorker`: per-mode lifecycle, the observation
+  emit paths (line crossing / ROI occupancy / zone / dwell), status payload.
+- `process_manager.py` — `ProcessManager` protocol + the docker-backed
+  managers (bounded probes run under a `timeout` wrapper).
+- `inference.py` / `decoders.py` / `*_parser/` — `build_model_runtime_plan`
+  (descriptor → decoder → PGIE config bytes), custom bbox parsers.
+- `pyds_metadata_app.py` — the in-container pyds app (bind-mounted; imports
+  gi/pyds, only resolvable inside the container; excluded from mypy).
+
+#### `app/runtimes/crowdcount_runtime/`
+The CrowdCount counting runtime: one counting container per session. The
+container owns counting + the counts-of-record posts to crowdcount-server;
+Upstream owns the lifecycle + processor status. Emits **no** Upstream
+observations (the `ObservationWriter` is accepted but unused).
+- `worker.py` — `CrowdCountWorker`: guard the RTSP URL, post `starting`,
+  launch, attach on the `CROWDCOUNT_READY` marker (bounded by
+  `crowdcount_attach_timeout_seconds`), heartbeat `processing`, map the exit
+  to `stopped`/`failed`. Withholds the service secret when a camera has no
+  `external_id` (probe mode) — a secret with an empty device id is the one
+  combination the container rejects.
+- `process_manager.py` — `CrowdCountProcessManager`: `docker run` with the
+  session inputs + credentials in a per-run 0600 `--env-file` (keeps them
+  out of `ps`/argv; the resolved env IS still visible to `docker inspect`).
+  Owns the `CC_*` env contract — keep in lock-step with the container's
+  `counter_worker.py`.
 
 ### `app/supervisor/`
 - `session_poller.py` — `SessionPoller.fetch_eligible`.
 - `worker_manager.py` — reconcile loop, spawn/stop/reap, quarantine,
   `active_count`, bounded `_shutdown_all`.
 - `processor_status.py` — `build_status_request` (tenant-free, tz-aware).
+
+## `workers/overhead_people_counter/`
+The counting container's own source tree — **not** part of the `app` package
+and not on the supervisor's import path or in its dependency set. Its deps
+(cv2/torch/ultralytics/requests) are installed in the image, built with
+`docker build -t crowdcount-counter:dev workers/overhead_people_counter`.
+Ported from crowdcount-counter-server `prod`, which it no longer depends on;
+the counting behavior is the unmodified CrowdCount prod code.
+- `Dockerfile` — CUDA 12.8 runtime + torch cu128 stable + torchreid from
+  source + baked OSNet ReID weights. Entrypoint: `run_counter_worker.py`.
+- `scripts/run_counter_worker.py` — container entrypoint; `--help` prints the
+  `CC_*` contract.
+- `src/worker/counter_worker.py` — the single-session entrypoint: parse +
+  validate the `CC_*` env (**the contract of record**), build one
+  `SingleSessionPeopleCounter`, post device online/offline, print
+  `CROWDCOUNT_READY`, own the signal/exit-code lifecycle. Honors a stop
+  requested during startup, not just in the frame loop.
+- `src/worker/perception_publisher.py` — best-effort background publisher of
+  detection boxes + the counting line to the perception-fanout sidecar
+  (dashboard overlay). Never blocks or breaks the counting loop.
+- `src/processors/people_counter_processor.py` — the counter itself: YOLO v6
+  + BoT-SORT + OSNet ReID + the doorway crossing state machine.
+- `src/processors/base_processor.py` — stream connect/retry + the frame loop;
+  `redact_stream_url` (container-side mirror of `app/redact.py`).
+- `src/api/crowdcount_api_client.py` — signed client for crowdcount-server:
+  counts-of-record, device status, `direction_flipped`. Service auth
+  (`X-CC-Service-Signature`) or per-device auth. One Idempotency-Key per
+  logical operation, reused across that operation's retries.
+- `src/config/server_config.py` — video/tracker/frame-buffer/inference tuning
+  constants (the orchestrator-era settings are gone; Upstream owns the
+  stream, the GPU and the lifecycle).
+- `models/` — `crowdcount-v6.pt` weights + `botsort.yaml`.
 
 ## `tests/`
 - `conftest.py` — `UPSTREAM_*` env defaults, settings-cache clear,
@@ -121,4 +183,14 @@ What each file owns.
   `ProcessorApi`.
 - `test_config / test_api_client / test_session_poller / test_worker_manager /
   test_mock_runtime / test_observation_writer / test_package_resolver /
-  test_shutdown / test_logging_redaction` — 39 tests.
+  test_shutdown / test_logging_redaction` — the M8.1 core.
+- `test_crowdcount_runtime.py` — package resolution + dispatch, env-file /
+  argv hygiene, credential forwarding, and the worker lifecycle against a
+  fake process manager (no Docker, no GPU, no network).
+- `test_crowdcount_worker_api_client.py` — the counting container's API
+  client (idempotency keying, the status auth verdict). Imports the
+  container tree against a faked `requests`: its real deps live in the
+  image, and adding them here would put them on the live supervisor's
+  `uv run` sync path.
+- The DeepStream suites (`test_deepstream_*`, `test_config_parity`, the
+  observation/geometry/perception suites) cover the analytics runtime.
