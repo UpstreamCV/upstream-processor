@@ -1,0 +1,26 @@
+# BoT-SORT configuration for overhead doorway counting
+# Uses XYWH Kalman filter (tracks width + height independently)
+# with_reid: false — pure IoU + fuse_score association (same as ByteTrack)
+
+tracker_type: botsort
+
+# Detection thresholds (aligned with dev)
+track_high_thresh: 0.35    # High confidence threshold for first association
+track_low_thresh: 0.15     # Low confidence threshold for second association
+new_track_thresh: 0.35     # Threshold for creating new tracks
+
+# Track buffer and matching
+track_buffer: 15           # Frames to keep lost tracks (~2 sec at ~8fps centralized rate)
+match_thresh: 0.80         # IoU threshold for matching
+
+# Motion model
+fuse_score: true           # Fuse detection score with track score
+
+# BoT-SORT specific: Global Motion Compensation
+gmc_method: none           # Fixed overhead cameras — no motion compensation needed
+
+# BoT-SORT specific: ReID appearance matching
+proximity_thresh: 0.5      # Min IoU for ReID consideration (spatial gate)
+appearance_thresh: 0.25    # Min appearance similarity for ReID match
+with_reid: false           # No ReID — pure IoU association like ByteTrack
+model: yolo11n-cls.pt      # Referenced by BOTSORT init, but won't load encoder

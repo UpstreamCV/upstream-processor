@@ -1,0 +1,290 @@
+"""
+CrowdCount Single-Session Worker Entrypoint
+
+Runs ONE camera's counting loop with no orchestrator, no MediaMTX, no Flask.
+Configuration comes entirely from environment variables so the process can run
+as a container-per-session under the Upstream processor supervisor (whose
+CrowdCountProcessManager writes these CC_* variables into the container env),
+or standalone for testing.
+
+The counting behavior is the unmodified production PeopleCounterProcessor —
+danger-zone crossing logic, BoT-SORT tracking, V6 model, the 60s
+direction_flipped poll, and signed count posting all run exactly as deployed.
+This module only wires a single instance to a single stream and manages the
+process lifecycle around it.
+
+Environment contract (keep in lock-step with upstream-processor's
+app/runtimes/crowdcount_runtime/process_manager.py):
+
+    CC_RTSP_URL          required  Stream source. Upstream passes the session's
+                                   internal RTSP URL; a local video file path
+                                   also works for smoke tests.
+    CC_DEVICE_ID         optional  CrowdCount device id (e.g. "C4804"). Both
+                                   credentials empty => PROBE MODE: counting
+                                   runs but nothing is posted (the API client
+                                   disables itself without credentials).
+    CC_DEVICE_PASSWORD   optional  Device password. Setting exactly one of
+                                   id/password is a misconfiguration (exit 3).
+    CC_API_BASE_URL      optional  Default https://api.crowdcount.tech
+    CC_STREAM_NAME       optional  Log prefix / stream name. Defaults to the
+                                   device id, else "camera0".
+    CC_MODEL_PATH        optional  Override the model weights path (testing).
+    CC_FRAME_WIDTH       optional  Informational only (logged); the capture
+    CC_FRAME_HEIGHT      optional  reads actual stream properties itself.
+    CC_FRAME_FPS         optional
+
+Lifecycle:
+    - Posts device "online" to crowdcount-server before the loop and "offline"
+      after it (best-effort), replacing the old orchestrator's status pushes.
+    - Prints CROWDCOUNT_READY on stdout once the processor is initialized —
+      the marker the Upstream CrowdCountWorker attaches on.
+    - SIGTERM/SIGINT request a cooperative stop; total shutdown (stop -> count
+      thread grace -> offline post) fits inside Upstream's 8s docker stop
+      grace.
+
+Exit codes:
+    0  stop was requested (SIGTERM/SIGINT) or the processor reached ready and
+       ended naturally (e.g. stream loss -> supervisor/Docker restarts it)
+    1  never reached ready (stream connect or model init failure)
+    2  missing CC_RTSP_URL
+    3  credential misconfiguration or rejected credentials
+
+NOTE: env validation must stay importable/runnable without the CV stack, so
+the heavy imports (cv2/ultralytics via the processors package) happen lazily
+inside main() after validation.
+"""
+
+import os
+import sys
+import signal
+import time
+import logging
+import multiprocessing
+
+DEFAULT_API_BASE_URL = 'https://api.crowdcount.tech'
+
+# Stdout marker the Upstream CrowdCountWorker attaches on. Keep in lock-step
+# with upstream-processor's app/runtimes/crowdcount_runtime/worker.py.
+READY_MARKER = 'CROWDCOUNT_READY'
+
+# Grace given to in-flight fire-and-forget count threads (spawned per crossing
+# by the existing processor code) before the process exits.
+COUNT_THREAD_GRACE_SECONDS = 1.5
+
+# Timeout for the lifecycle client's online/offline posts. Shorter than the
+# processor's own client (5s) so the SIGTERM path fits Upstream's 8s grace.
+LIFECYCLE_API_TIMEOUT_SECONDS = 3
+
+logger = logging.getLogger('CounterWorker')
+
+
+class WorkerConfig:
+    """Parsed + validated CC_* environment."""
+
+    def __init__(self, rtsp_url, device_id, password, api_base_url,
+                 stream_name, model_path, frame_width, frame_height, frame_fps,
+                 service_secret=''):
+        self.rtsp_url = rtsp_url
+        self.device_id = device_id
+        self.password = password
+        self.service_secret = service_secret
+        self.api_base_url = api_base_url
+        self.stream_name = stream_name
+        self.model_path = model_path
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.frame_fps = frame_fps
+
+    @property
+    def service_mode(self):
+        """Shared service secret + device_id => post on behalf of the device
+        without a per-device password (the Upstream worker path)."""
+        return bool(self.service_secret and self.device_id)
+
+    @property
+    def probe_mode(self):
+        """No way to authenticate => counting runs but nothing posts."""
+        return not (self.service_mode or (self.device_id and self.password))
+
+
+def parse_env(environ=None):
+    """
+    Build a WorkerConfig from the environment.
+
+    Exits the process on invalid configuration (codes 2/3) so a misconfigured
+    container fails fast and visibly instead of counting into the void.
+    """
+    env = os.environ if environ is None else environ
+
+    rtsp_url = env.get('CC_RTSP_URL', '').strip()
+    if not rtsp_url:
+        print('ERROR: CC_RTSP_URL is required (the stream to count on)',
+              file=sys.stderr, flush=True)
+        sys.exit(2)
+
+    device_id = env.get('CC_DEVICE_ID', '').strip()
+    password = env.get('CC_DEVICE_PASSWORD', '').strip()
+    service_secret = env.get('CC_SERVICE_SECRET', '').strip()
+
+    # Service auth needs the target device_id but no per-device password. The
+    # id/password "both or neither" rule only applies without a service secret.
+    if service_secret:
+        if not device_id:
+            print('ERROR: CC_SERVICE_SECRET requires CC_DEVICE_ID (the device '
+                  'to post on behalf of)', file=sys.stderr, flush=True)
+            sys.exit(3)
+    elif bool(device_id) != bool(password):
+        print('ERROR: CC_DEVICE_ID and CC_DEVICE_PASSWORD must be set together '
+              '(set both for per-device counting, neither for probe mode)',
+              file=sys.stderr, flush=True)
+        sys.exit(3)
+
+    return WorkerConfig(
+        rtsp_url=rtsp_url,
+        device_id=device_id,
+        password=password,
+        service_secret=service_secret,
+        api_base_url=env.get('CC_API_BASE_URL', '').strip() or DEFAULT_API_BASE_URL,
+        stream_name=env.get('CC_STREAM_NAME', '').strip() or device_id or 'camera0',
+        model_path=env.get('CC_MODEL_PATH', '').strip(),
+        frame_width=env.get('CC_FRAME_WIDTH', ''),
+        frame_height=env.get('CC_FRAME_HEIGHT', ''),
+        frame_fps=env.get('CC_FRAME_FPS', ''),
+    )
+
+
+def _build_processor(config):
+    """Construct the single-session processor (imports the CV stack)."""
+    from processors.people_counter_processor import PeopleCounterProcessor
+
+    class SingleSessionPeopleCounter(PeopleCounterProcessor):
+        """
+        The production people counter, unmodified, plus the two things a
+        supervised single-session worker needs: an attach marker on stdout
+        and an optional weights override for testing.
+        """
+
+        def __init__(self, *args, model_path_override='', **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_emitted = False
+            if model_path_override:
+                self.model_path = model_path_override
+
+        def on_start(self):
+            try:
+                super().on_start()
+            except Exception:
+                # The base run() loop swallows on_start errors and keeps
+                # spinning with a dead model; stop first so the loop exits
+                # immediately and the process reports failure (exit 1).
+                self.stop()
+                raise
+            print(READY_MARKER, flush=True)
+            self.ready_emitted = True
+
+    return SingleSessionPeopleCounter(
+        config.stream_name,
+        config.rtsp_url,
+        device_info={
+            'device_id': config.device_id,
+            'password': config.password,
+            'service_secret': config.service_secret or None,
+            'api_base_url': config.api_base_url,
+        },
+        frame_queue=None,                 # no orchestrator MJPEG live view
+        inference_request_queue=None,     # None => legacy per-process inference
+        inference_result_queue=None,
+        processor_heartbeat=multiprocessing.Value('d', time.time()),
+        inference_slot_name=None,
+        model_path_override=config.model_path,
+    )
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    )
+
+    config = parse_env()
+
+    print(f'[{config.stream_name}] CrowdCount single-session worker starting', flush=True)
+    print(f'[{config.stream_name}] API base: {config.api_base_url}', flush=True)
+    if config.frame_width or config.frame_height or config.frame_fps:
+        print(f'[{config.stream_name}] Upstream-approved format (informational): '
+              f'{config.frame_width}x{config.frame_height}@{config.frame_fps}', flush=True)
+
+    # Credential gate: fail fast on bad credentials; warn loudly in probe mode.
+    from api.crowdcount_api_client import CrowdCountAPIClient
+
+    if config.probe_mode:
+        print(f'[{config.stream_name}] '
+              'PROBE MODE (no credentials — counts will NOT post)', flush=True)
+        logger.warning('Running in PROBE MODE: no CC_SERVICE_SECRET and no '
+                       'CC_DEVICE_ID/CC_DEVICE_PASSWORD; crossings are counted '
+                       'locally but never posted')
+    elif config.service_mode:
+        # Trusted-backend service auth: no per-device password to verify here.
+        # A bad secret surfaces as a 401 on the first post.
+        print(f'[{config.stream_name}] SERVICE AUTH for device '
+              f'{config.device_id} (counts post via CC_SERVICE_SECRET)', flush=True)
+    else:
+        if not CrowdCountAPIClient.check_password(
+                config.device_id, config.password, base_url=config.api_base_url):
+            print(f'ERROR: credentials rejected for device {config.device_id} '
+                  f'at {config.api_base_url}', file=sys.stderr, flush=True)
+            sys.exit(3)
+        print(f'[{config.stream_name}] Credentials verified for device '
+              f'{config.device_id}', flush=True)
+
+    # Lifecycle client for online/offline — separate from the processor's own
+    # counting client, mirroring the orchestrator's pattern. Disabled (no-op)
+    # in probe mode via the client's own credential check.
+    lifecycle_client = CrowdCountAPIClient(
+        device_id=config.device_id,
+        password=config.password,
+        base_url=config.api_base_url,
+        timeout=LIFECYCLE_API_TIMEOUT_SECONDS,
+        service_secret=config.service_secret or None,
+    )
+
+    processor = _build_processor(config)
+
+    stop_requested = {'flag': False}
+
+    def _handle_signal(signum, frame):
+        # Cooperative stop only — the run() loop exits within ~a frame read,
+        # its finally runs on_stop() (timer cancel + summary) and disconnects.
+        stop_requested['flag'] = True
+        print(f'[{config.stream_name}] Signal {signum} received, stopping...', flush=True)
+        processor.stop()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        try:
+            lifecycle_client.update_status('online')
+        except Exception as e:  # best-effort — an API blip must not block counting
+            logger.warning(f'online status post failed: {e}')
+
+        processor.run()  # blocking until stop, stream loss, or init failure
+    finally:
+        # Let in-flight per-crossing count threads finish before exiting.
+        time.sleep(COUNT_THREAD_GRACE_SECONDS)
+        try:
+            lifecycle_client.update_status('offline')
+        except Exception as e:
+            logger.warning(f'offline status post failed: {e}')
+        sys.stdout.flush()
+
+    if stop_requested['flag'] or processor.ready_emitted:
+        # Requested stop, or ran for real and ended (e.g. stream loss —
+        # the supervisor/Docker restart policy owns recovery).
+        sys.exit(0)
+    print(f'[{config.stream_name}] Worker never reached ready; failing', flush=True)
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
