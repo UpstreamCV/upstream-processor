@@ -289,6 +289,12 @@ class Settings(BaseSettings):
     # any device (env UPSTREAM_CROWDCOUNT_SERVICE_SECRET). Forwarded into the
     # container's per-run env-file; empty => the container runs probe-only.
     crowdcount_service_secret: SecretStr | None = None
+    # How long to wait for the container's ready marker before giving up on
+    # it. A container that wedges before printing CROWDCOUNT_READY (e.g. a
+    # stalled model load) otherwise sits in ``starting`` forever, holding the
+    # session with no counting and no failure. Generous: a cold start pulls
+    # weights onto the GPU. Exceeding it stops the container and posts failed.
+    crowdcount_attach_timeout_seconds: float = 120.0
 
     # --- P5-C latest perception snapshot -----------------------------
     # A low-rate (~1/s) JSON snapshot of what the analytics worker

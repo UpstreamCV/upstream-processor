@@ -7,18 +7,22 @@ differences:
 - **No ``timeout`` wrapper.** The counter is a long-running worker that ends
   only on stream loss or ``docker stop`` — not a bounded probe.
 - **Session inputs travel in a per-run ``--env-file``** (0600 temp file,
-  removed on stop) instead of argv, so the internal RTSP URL never appears
-  in host ``ps`` output or ``docker inspect``.
+  removed on stop) instead of argv, so the internal RTSP URL and the
+  credentials never appear in host ``ps`` output. Note the limit of this:
+  the env-file keeps them out of argv only — the RESOLVED container env is
+  still visible to anyone who can run ``docker inspect`` on the box.
 
 The container reuses the existing CrowdCount prod counting code: its
 entrypoint reads the ``CC_*`` variables below, builds a
 ``PeopleCounterProcessor`` against ``CC_RTSP_URL``, and posts
 counts-of-record to ``CC_API_BASE_URL`` via its own ``CrowdCountAPIClient``.
-The device password is deliberately NOT forwarded from here — Upstream does
-not hold CrowdCount device credentials (credential delivery is an open
-migration decision; an empty ``CC_DEVICE_ID`` makes the prod client disable
-itself and count without posting, which is the correct status-only probe
-behavior).
+
+Credential delivery (decided 2026-07-06): Upstream does not hold per-device
+CrowdCount passwords, so ``CC_DEVICE_PASSWORD`` is never forwarded. Instead
+``CC_SERVICE_SECRET`` (from ``UPSTREAM_CROWDCOUNT_SERVICE_SECRET``) lets the
+container post on behalf of ``CC_DEVICE_ID`` — the camera's external_id —
+using trusted-backend service auth. With neither, the client disables itself
+and counts without posting (probe mode).
 """
 
 from __future__ import annotations
@@ -47,6 +51,8 @@ ENV_CAMERA_ID = "CC_CAMERA_ID"
 ENV_SESSION_ID = "CC_SESSION_ID"
 ENV_FANOUT_URL = "CC_FANOUT_URL"
 ENV_FANOUT_SECRET = "CC_FANOUT_SECRET"
+ENV_PROCESSOR_ID = "CC_PROCESSOR_ID"
+ENV_PACKAGE_ID = "CC_PACKAGE_ID"
 
 
 def build_docker_command(
@@ -89,6 +95,8 @@ class CrowdCountProcessManager:
         session_id: str = "",
         fanout_url: str = "",
         fanout_secret: str = "",
+        processor_id: str = "",
+        package_id: str = "",
     ) -> None:
         self._rtsp_url = rtsp_url
         self._image = image
@@ -105,6 +113,8 @@ class CrowdCountProcessManager:
         self._session_id = session_id
         self._fanout_url = fanout_url
         self._fanout_secret = fanout_secret
+        self._processor_id = processor_id
+        self._package_id = package_id
         self._container = f"upstream-cc-{uuid4().hex[:12]}"
         self._env_file: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -137,6 +147,12 @@ class CrowdCountProcessManager:
             lines.append(f"{ENV_FANOUT_URL}={self._fanout_url}")
         if self._fanout_secret:
             lines.append(f"{ENV_FANOUT_SECRET}={self._fanout_secret}")
+        # Stamped onto the container's fanout envelopes so an overlay frame
+        # says which processor and package produced it.
+        if self._processor_id:
+            lines.append(f"{ENV_PROCESSOR_ID}={self._processor_id}")
+        if self._package_id:
+            lines.append(f"{ENV_PACKAGE_ID}={self._package_id}")
         fd, path = tempfile.mkstemp(prefix="upstream-cc-env-", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")

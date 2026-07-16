@@ -1,4 +1,4 @@
-"""The CrowdCount per-session worker (status-only v1).
+"""The CrowdCount per-session worker.
 
 Supervises one CrowdCount counting container per eligible session,
 mirroring ``DeepStreamWorker``'s docker-backed lifecycle: guard the RTSP
@@ -7,15 +7,21 @@ ready marker, heartbeat ``processing``, and map the container's exit to a
 terminal ``stopped``/``failed``.
 
 Division of labor (migration decision 2026-07-05/06): the container owns
-counting, tracking, the counts-of-record posts to crowdcount-server, and
-the device online/offline posts — all existing CrowdCount prod code.
-Upstream owns only the container lifecycle and processor status here.
-``processor.line_crossing`` observation emission alongside the count path
-is a later milestone; the ``ObservationWriter`` is accepted now so the
-``build_worker`` seam doesn't change when it lands.
+counting, tracking, the counts-of-record posts to crowdcount-server (with
+the shared service credential this worker forwards), the device
+online/offline posts, and publishing detection boxes + the counting line
+to the perception-fanout sidecar for the dashboard overlay — all existing
+CrowdCount prod code. Upstream owns only the container lifecycle and
+processor status here.
+
+Neither the counts-of-record nor the fanout overlay is an Upstream
+observation, and this worker emits none: the ``ObservationWriter`` is
+accepted but unused, so the ``build_worker`` seam does not change if
+``processor.line_crossing`` emission alongside the count path ever lands.
 
 Status order: starting -> attached -> processing (repeated) -> stopped, or
--> failed on a contract/internal error or non-graceful container exit.
+-> failed on a contract/internal error, an attach timeout, or a container
+exit we did not ask for.
 """
 
 from __future__ import annotations
@@ -54,9 +60,6 @@ _READLINE_POLL_SECONDS = 0.5
 # counting loop is up (``people_counter_processor.py``), accepted so the
 # unmodified prod code attaches without a CrowdCount-side change.
 _READY_MARKERS = ("CROWDCOUNT_READY", "Worker ready")
-# 143 = SIGTERM (docker stop grace), 137 = SIGKILL after the grace — both
-# are ordinary endings for a stop we requested.
-_CLEAN_EXIT_CODES = frozenset({0, 137, 143})
 
 
 class CrowdCountWorker(Runtime):
@@ -107,16 +110,20 @@ class CrowdCountWorker(Runtime):
             stop_timeout_seconds=self._settings.crowdcount_process_stop_timeout_seconds,
             api_base_url=self._settings.crowdcount_api_base_url,
             # The camera's external_id IS the CrowdCount device_id (set at
-            # registration). With a service secret configured, the container
-            # posts counts on behalf of this device; missing either the id or
-            # the secret leaves the CrowdCountAPIClient disabled (probe:
-            # counts without posting).
+            # registration). Service auth posts on behalf of that device, so
+            # without an external_id there is nothing to post for: withhold
+            # the secret too and let the container run true probe mode (counts
+            # locally, posts nothing). Forwarding a secret with an empty
+            # device id is the one combination the container rejects (exit 3),
+            # which would crash-loop the session into quarantine.
             device_id=self._session.external_id or "",
             service_secret=(
                 self._settings.crowdcount_service_secret.get_secret_value()
-                if self._settings.crowdcount_service_secret
+                if self._settings.crowdcount_service_secret and self._session.external_id
                 else ""
             ),
+            processor_id=self._settings.processor_id,
+            package_id=self._package.package_id,
             width=self._session.approved.width,
             height=self._session.approved.height,
             fps=self._session.approved.fps,
@@ -186,6 +193,7 @@ class CrowdCountWorker(Runtime):
         attached = False
         last_proc_post = 0.0
         last_err: str | None = None
+        attach_deadline = time.monotonic() + self._settings.crowdcount_attach_timeout_seconds
 
         while not self._stop.is_set():
             try:
@@ -212,10 +220,29 @@ class CrowdCountWorker(Runtime):
                         transient_ok=True,
                         payload={"runtime": "crowdcount"},
                     )
+            elif time.monotonic() >= attach_deadline:
+                # Wedged before the ready marker: nothing will come. Reap it
+                # rather than hold the session in ``starting`` forever.
+                self._state = WorkerState.FAILED
+                await self._safe_stop_pm()
+                await self._post_best_effort(
+                    "failed",
+                    error_code="crowdcount_attach_timeout",
+                    error_message=(
+                        f"no ready marker within "
+                        f"{self._settings.crowdcount_attach_timeout_seconds:.0f}s; "
+                        f"last_error={last_err or 'n/a'}"
+                    ),
+                )
+                return
 
         await self._safe_stop_pm()
         rc = self._pm.returncode if self._pm else None
-        graceful = self._stop.is_set() or rc in _CLEAN_EXIT_CODES
+        # rc==0 is clean however it happened. 137/143 mean the container was
+        # killed, which is an ordinary ending ONLY for a stop we asked for —
+        # an unrequested 137 is a docker OOM-kill (or any external kill) and
+        # has to surface as failed, not "stopped".
+        graceful = self._stop.is_set() or rc == 0
         if graceful:
             self._state = WorkerState.STOPPED
             await self._post_best_effort("stopped")

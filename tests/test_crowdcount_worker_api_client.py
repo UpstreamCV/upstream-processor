@@ -34,13 +34,14 @@ def _fake_requests() -> types.ModuleType:
     """Minimal stand-in for the parts of ``requests`` the client touches."""
     mod = types.ModuleType("requests")
 
-    class RequestException(Exception):
+    # Names mirror requests' own; the client catches them by attribute.
+    class RequestException(Exception):  # noqa: N818
         pass
 
     class Timeout(RequestException):
         pass
 
-    class ConnectionError(RequestException):  # noqa: A001 - mirrors requests' name
+    class ConnectionError(RequestException):
         pass
 
     mod.RequestException = RequestException  # type: ignore[attr-defined]
@@ -91,8 +92,13 @@ class _Recorder:
         self.keys: list[str | None] = []
         self.calls = 0
 
-    def __call__(self, url: str, data: bytes = b"", headers: dict[str, str] | None = None,
-                 timeout: float | None = None) -> FakeResponse:
+    def __call__(
+        self,
+        url: str,
+        data: bytes = b"",
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> FakeResponse:
         self.calls += 1
         self.keys.append((headers or {}).get("Idempotency-Key"))
         outcome = self._outcomes.pop(0)
