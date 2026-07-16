@@ -103,10 +103,15 @@ def test_resolves_overhead_people_counter_package() -> None:
     assert spec.model_id is None
     assert spec.tracker_profile_id is None
     assert spec.analytics_profile_id is None
-    # Counts-of-record are NOT an Upstream output; only the alongside
-    # observation is declared.
-    assert spec.outputs == ("processor.line_crossing",)
+    # Declares NO Upstream observation outputs, and emits none: the product is
+    # the counts-of-record posted to crowdcount-server, plus the ephemeral
+    # fanout overlay. Neither is an Upstream observation.
+    assert spec.outputs == ()
     assert spec.supports.get("people_counter") is True
+    # Live + verified in prod since 2026-07-16. production_ready is an honesty
+    # gate that only a 'supported' package may claim (see compatibility.py).
+    assert spec.status == "supported"
+    assert spec.production_ready is True
 
 
 def test_build_worker_dispatches_crowdcount_runtime(fast_settings) -> None:  # type: ignore[no-untyped-def]

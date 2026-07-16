@@ -260,9 +260,9 @@ class Settings(BaseSettings):
     # The crowdcount runtime supervises the existing CrowdCount counting
     # pipeline (built from crowdcount-counter-server ``prod``) as one
     # container per eligible session, mirroring the DeepStream docker
-    # lifecycle. The container owns counting, tracking, and the
-    # counts-of-record posts to crowdcount-server; Upstream owns only the
-    # lifecycle + processor status (v1 is status-only).
+    # lifecycle. The container owns counting, tracking, the counts-of-record
+    # posts to crowdcount-server and the fanout overlay; Upstream owns only
+    # the lifecycle + processor status. No Upstream observations are emitted.
     #
     # Image fallback when the package registry entry declares no
     # ``container_image``. The real image is built from the CrowdCount repo

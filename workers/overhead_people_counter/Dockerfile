@@ -23,9 +23,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
 # PyTorch STABLE cu128 (RTX 50 Blackwell sm_120), then torchreid from source.
-# Stable (not nightly) is pinned-and-aligned and never pruned from the index,
-# so the build is reproducible — the original nightly this was ported from has
-# since been pruned.
+# Stable rather than nightly because nightlies get pruned from the index — the
+# nightly build this was ported from is already gone, which is what stable buys
+# us here: the wheels stay fetchable.
+#
+# It does NOT buy reproducibility, and this build is NOT reproducible: nothing
+# below is version-pinned (and requirements.txt uses >= floors), so torch,
+# torchvision, torchreid and the rest resolve to whatever is current at build
+# time. Two builds on different days can ship different versions. Pinning means
+# capturing the exact set from the image that is actually live and verified in
+# prod (`pip freeze` inside it) — do that rather than guessing versions here.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --break-system-packages torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
     && pip install --no-cache-dir --break-system-packages cython numpy \

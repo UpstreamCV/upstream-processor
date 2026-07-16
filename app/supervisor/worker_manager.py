@@ -55,9 +55,10 @@ def build_worker(
     side-effect free (constructing a DeepStreamWorker does NOT touch Docker —
     the subprocess starts in ``run()``), so this is unit-testable."""
     if spec.runtime == "crowdcount":
-        # Container-per-session CrowdCount counting worker (status-only v1).
-        # The writer is threaded now so the seam doesn't change when
-        # alongside processor.line_crossing emission lands.
+        # Container-per-session CrowdCount counting worker. It emits no
+        # Upstream observations (counts-of-record go to crowdcount-server);
+        # the writer is threaded anyway so the seam doesn't change if
+        # alongside processor.line_crossing emission ever lands.
         return CrowdCountWorker(
             session=session,
             settings=settings,
