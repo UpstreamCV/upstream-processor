@@ -43,6 +43,10 @@ ENV_FRAME_WIDTH = "CC_FRAME_WIDTH"
 ENV_FRAME_HEIGHT = "CC_FRAME_HEIGHT"
 ENV_FRAME_FPS = "CC_FRAME_FPS"
 ENV_SERVICE_SECRET = "CC_SERVICE_SECRET"
+ENV_CAMERA_ID = "CC_CAMERA_ID"
+ENV_SESSION_ID = "CC_SESSION_ID"
+ENV_FANOUT_URL = "CC_FANOUT_URL"
+ENV_FANOUT_SECRET = "CC_FANOUT_SECRET"
 
 
 def build_docker_command(
@@ -81,6 +85,10 @@ class CrowdCountProcessManager:
         fps: int | None = None,
         gpus: str = "all",
         service_secret: str = "",
+        camera_id: str = "",
+        session_id: str = "",
+        fanout_url: str = "",
+        fanout_secret: str = "",
     ) -> None:
         self._rtsp_url = rtsp_url
         self._image = image
@@ -93,6 +101,10 @@ class CrowdCountProcessManager:
         self._fps = fps
         self._gpus = gpus
         self._service_secret = service_secret
+        self._camera_id = camera_id
+        self._session_id = session_id
+        self._fanout_url = fanout_url
+        self._fanout_secret = fanout_secret
         self._container = f"upstream-cc-{uuid4().hex[:12]}"
         self._env_file: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -117,6 +129,14 @@ class CrowdCountProcessManager:
             lines.append(f"{ENV_FRAME_FPS}={self._fps}")
         if self._service_secret:
             lines.append(f"{ENV_SERVICE_SECRET}={self._service_secret}")
+        if self._camera_id:
+            lines.append(f"{ENV_CAMERA_ID}={self._camera_id}")
+        if self._session_id:
+            lines.append(f"{ENV_SESSION_ID}={self._session_id}")
+        if self._fanout_url:
+            lines.append(f"{ENV_FANOUT_URL}={self._fanout_url}")
+        if self._fanout_secret:
+            lines.append(f"{ENV_FANOUT_SECRET}={self._fanout_secret}")
         fd, path = tempfile.mkstemp(prefix="upstream-cc-env-", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")

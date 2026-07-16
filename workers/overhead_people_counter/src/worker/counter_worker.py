@@ -250,6 +250,35 @@ def main():
 
     processor = _build_processor(config)
 
+    # Perception overlay (best-effort): if the fanout URL + secret + camera_id
+    # are configured, publish live detection boxes so they render on the
+    # Upstream dashboard. Purely additive — never affects counting.
+    perception = None
+    fanout_url = os.environ.get('CC_FANOUT_URL', '').strip()
+    fanout_secret = os.environ.get('CC_FANOUT_SECRET', '').strip()
+    camera_id = os.environ.get('CC_CAMERA_ID', '').strip()
+    if fanout_url and fanout_secret and camera_id:
+        try:
+            from worker.perception_publisher import PerceptionPublisher
+            try:
+                fps = float(config.frame_fps)
+            except (TypeError, ValueError):
+                fps = 15.0
+            perception = PerceptionPublisher(
+                camera_id=camera_id,
+                session_id=os.environ.get('CC_SESSION_ID', '').strip() or None,
+                url=fanout_url,
+                secret=fanout_secret,
+                processor_id=os.environ.get('CC_PROCESSOR_ID', '').strip() or None,
+                package_id=os.environ.get('CC_PACKAGE_ID', '').strip() or None,
+                fps=fps,
+            )
+            processor.perception_hook = perception
+            print(f'[{config.stream_name}] perception overlay ON (camera {camera_id})',
+                  flush=True)
+        except Exception as e:
+            logger.warning(f'perception overlay disabled: {e}')
+
     stop_requested = {'flag': False}
 
     def _handle_signal(signum, frame):
@@ -270,6 +299,8 @@ def main():
 
         processor.run()  # blocking until stop, stream loss, or init failure
     finally:
+        if perception is not None:
+            perception.stop()
         # Let in-flight per-crossing count threads finish before exiting.
         time.sleep(COUNT_THREAD_GRACE_SECONDS)
         try:
