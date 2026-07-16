@@ -2523,3 +2523,119 @@ COCO fields are `null` and a clearly-labelled vendor KPI rides in `vendor_kpi_*`
 value plus a "see the NGC model card; not comparable to COCO" note). Two tests in
 `tests/test_registries.py` assert the metrics are published-reference / never
 `upstream_measured` and that the field is optional-but-strict.
+
+## CrowdCount runtime — container-per-session people counter (Phase 2)
+
+The processing plane of the CrowdCount→Upstream migration. **Live
+end-to-end since 2026-07-16**: a Pi (P9386) streams SRT to Upstream, the
+supervisor spawns a counting container for the session, and crossings post
+to prod crowdcount-server. The legacy fleet path (crowdcount-counter-server
+`prod` driving the fleet) is untouched and still runs the fleet.
+
+Same seam as everything else: `runtimes/base.Runtime`.
+`resolver.resolve(package_id)` returns a `PackageSpec` and
+`worker_manager.build_worker` dispatches on `spec.runtime` — `crowdcount` →
+`CrowdCountWorker`. The supervisor, poller, status path and schemas are
+unchanged.
+
+### Division of labor
+
+The decision (2026-07-05/06) was to reuse the existing CrowdCount counting
+code rather than reimplement it on DeepStream. So the **container owns the
+product**: counting, tracking, the counts-of-record posts to
+crowdcount-server, the device online/offline posts, and the perception
+overlay. **Upstream owns the container lifecycle and processor status** —
+nothing more. The counting behavior is the unmodified CrowdCount prod
+`PeopleCounterProcessor` (YOLO v6 + BoT-SORT + OSNet ReID + the doorway
+crossing state machine), ported into `workers/overhead_people_counter/` so
+the image no longer builds out of a different repo.
+
+**Counts-of-record are not an Upstream output.** They go straight from the
+container to crowdcount-server, which remains the system of record for
+counts. The `overhead_people_counter.v1` package therefore declares **no
+observation outputs**, and this runtime emits none — the `ObservationWriter`
+is accepted at the `build_worker` seam but unused, so the seam does not
+change if `processor.line_crossing` emission alongside the count path ever
+lands. This is the one runtime where the interesting output does not flow
+through Upstream's observation log at all.
+
+### Process management
+
+`CrowdCountProcessManager` mirrors `DeepStreamProcessManager` with two
+deliberate differences:
+
+- **No `timeout` wrapper.** The counter is a long-running worker that ends
+  on stream loss or `docker stop`, not a bounded probe.
+- **Session inputs travel in a per-run `--env-file`** (0600 via `mkstemp`,
+  removed on stop) rather than argv, because unlike the probes this process
+  carries a credential (`CC_SERVICE_SECRET`) as well as the session's
+  internal RTSP URL. This keeps both out of host `ps`/argv. It does **not**
+  hide them from `docker inspect`, which shows the resolved container env —
+  the env-file is argv hygiene, not a secrets boundary.
+
+Everything logged on this path is redacted to `scheme://host:port`
+(`app/redact.py` supervisor-side; `base_processor.redact_stream_url` inside
+the container, which cannot import `app/`).
+
+### Credentials
+
+Upstream does not hold per-device CrowdCount passwords, so
+`CC_DEVICE_PASSWORD` is never forwarded. Instead a single shared
+trusted-backend credential (`UPSTREAM_CROWDCOUNT_SERVICE_SECRET` →
+`CC_SERVICE_SECRET`) lets the container post **on behalf of**
+`CC_DEVICE_ID` — the camera's Upstream `external_id`, which IS the
+CrowdCount device id — signing with `X-CC-Service-Signature`. Three modes:
+
+| `CC_DEVICE_ID` | `CC_SERVICE_SECRET` | behavior |
+|---|---|---|
+| set | set | **service auth** — counts post for that device |
+| set | unset | probe: counting runs, nothing posts |
+| unset | unset | probe |
+| unset | set | rejected (exit 3) — the worker withholds the secret rather than produce this |
+
+A secret the server *rejects* is fatal to the container (exit 3) rather
+than silent count loss: without that, every post 401s as a warning while the
+worker keeps reporting `processing`. A *transient* failure on the same post
+is tolerated — an API blip must not kill a counting worker.
+
+### Lifecycle
+
+`starting` → launch → attach on the container's `CROWDCOUNT_READY` stdout
+marker → `processing` heartbeats → `stopped`/`failed`. Bounds that matter:
+
+- **Attach** is bounded by `crowdcount_attach_timeout_seconds` (120s,
+  generous for a cold model load). A container that wedges before the marker
+  is stopped and posted `failed` rather than holding the session in
+  `starting` forever.
+- **Stop** is bounded by `crowdcount_process_stop_timeout_seconds` (8s
+  `docker stop --time`). PID1 is the container's entrypoint: it gets SIGTERM
+  and must exit the frame loop, let in-flight count posts land (1.5s), and
+  post the device `offline` inside that window. The offline post is
+  single-shot for exactly this reason — retries alone could exceed the
+  grace. The stop is honored during **startup** too (connect/model-load), or
+  a stop during those would be SIGKILLed with no `offline` post, leaving the
+  device ghost-online on crowdcount-server.
+- **Exit mapping**: `rc == 0` is clean. `137`/`143` mean the container was
+  killed, which is ordinary only for a stop we requested — an unrequested
+  `137` is a docker OOM-kill and surfaces as `failed`.
+
+### Perception overlay
+
+Additive and never on the counting path: a background thread in the
+container publishes detection boxes + the counting line (the processor's
+`doorway_center`, as a vertical line at `doorway_center * frame width`) to
+the perception-fanout sidecar, using the same envelope DeepStream workers
+publish so the dashboard's one renderer works unchanged. Subscriber-aware
+cadence (~12Hz watched / 0.5Hz idle). Ephemeral and lossy by design; the
+per-frame hook never blocks or raises into the counting loop. Off unless
+url + secret + camera id are all set.
+
+### Known gaps (deferred by decision)
+
+- **No cold-path perception snapshots** — after a >10s hot-path stall the
+  overlay needs a page reload to recover; no durable record either.
+- **Non-CC-camera gating** — another account assigned this package would get
+  the shared secret and post for an unregistered `external_id` (400s). The
+  clean fix is per-account count-destination config.
+- **Shared per-GPU inference sidecar** — inference is per-worker today. Fine
+  at small N; needed around ~100 streams.
