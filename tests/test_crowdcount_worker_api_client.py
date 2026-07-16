@@ -147,13 +147,52 @@ def test_separate_operations_get_distinct_keys(
 def test_update_status_records_auth_rejection(
     client_mod: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A wrong/rotated service secret is a verdict, not a blip: 401 must be
+    """A wrong/rotated service secret is a verdict, not a blip: it must be
     distinguishable so the worker can fail fast instead of silently dropping
     every count."""
-    monkeypatch.setattr(client_mod.requests, "post", _Recorder([FakeResponse(401)]))
+    monkeypatch.setattr(
+        client_mod.requests,
+        "post",
+        _Recorder([
+            FakeResponse(401, {"error": "Invalid service signature",
+                               "code": "service_auth_invalid_signature"})
+        ]),
+    )
     c = _client(client_mod)
     assert c.update_status("online", max_retries=0) is False
     assert c.last_status_auth_ok is False
+    assert "Invalid service signature" in c.last_status_auth_error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {"error": "Timestamp expired (drift: 400s, max: 300s)",
+             "code": "service_auth_timestamp_invalid"},
+            id="clock-skew",
+        ),
+        pytest.param(
+            {"error": "Nonce already used (possible replay attack)",
+             "code": "service_auth_nonce_rejected"},
+            id="nonce-replay",
+        ),
+        pytest.param({"error": "Unauthorized"}, id="no-code-from-older-server"),
+    ],
+)
+def test_update_status_non_credential_401s_are_not_a_verdict(
+    client_mod: Any, monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]
+) -> None:
+    """Only rejections re-signing cannot fix are fatal. Clock skew on the
+    processor host 401s every worker at once — treating that as a bad secret
+    would turn an NTP blip into a fleet-wide outage. A server with no code
+    yields no verdict, so the codes can deploy in either order."""
+    monkeypatch.setattr(
+        client_mod.requests, "post", _Recorder([FakeResponse(401, payload)])
+    )
+    c = _client(client_mod)
+    assert c.update_status("online", max_retries=0) is False
+    assert c.last_status_auth_ok is None
 
 
 def test_update_status_transient_failure_is_not_an_auth_verdict(
