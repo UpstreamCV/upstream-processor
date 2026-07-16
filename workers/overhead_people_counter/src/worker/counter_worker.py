@@ -272,6 +272,7 @@ def main():
                 processor_id=os.environ.get('CC_PROCESSOR_ID', '').strip() or None,
                 package_id=os.environ.get('CC_PACKAGE_ID', '').strip() or None,
                 fps=fps,
+                doorway_center=getattr(processor, 'doorway_config', {}).get('doorway_center'),
             )
             processor.perception_hook = perception
             print(f'[{config.stream_name}] perception overlay ON (camera {camera_id})',

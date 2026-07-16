@@ -301,7 +301,7 @@ class CrowdCountAPIClient:
 
         # Always try to update status, even if API is "disabled" for counting
         # Status updates are important for device management
-        if not self.device_id or not self.password:
+        if not self.device_id or not (self.password or self.use_service_auth):
             self.logger.warning("Cannot update status: no credentials")
             return False
 
