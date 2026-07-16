@@ -4,6 +4,7 @@ Abstract base class for all stream processors
 """
 
 import cv2
+import re
 import time
 import logging
 from abc import ABC, abstractmethod
@@ -17,6 +18,26 @@ except ImportError:
     VIDEO_FPS = 15  # Fallback default
     FRAME_BUFFER_ENABLED = False
     FRAME_BUFFER_SECONDS = 2.5
+
+_STREAM_URL_RE = re.compile(
+    r"^([a-z][a-z0-9+.-]*://)(?:[^/@]*@)?([^/@]+)/(?:.+)$", re.IGNORECASE
+)
+
+
+def redact_stream_url(url: str) -> str:
+    """'rtsp://host:8554/sess_abc123' -> 'rtsp://host:8554/<redacted>'.
+
+    Upstream's internal RTSP URL embeds the per-session stream key, which is
+    the secret the --env-file delivery exists to protect. Container stdout
+    lands in docker logs/journald, so the path must never be logged. Keeps
+    scheme://host:port (reachability is what you debug from a connect log)
+    and drops both the path and any user:password@ authority. Mirrors
+    upstream-processor's app/redact.py; unparseable input is fully masked.
+    """
+    m = _STREAM_URL_RE.match((url or "").strip())
+    if not m:
+        return "<redacted-url>"
+    return f"{m.group(1)}{m.group(2)}/<redacted>"
 
 class BaseStreamProcessor(ABC):
     """
@@ -107,7 +128,7 @@ class BaseStreamProcessor(ABC):
 
         for attempt in range(1, max_retries + 1):
             try:
-                self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {self.rtsp_url}")
+                self.logger.info(f"Connecting to stream (attempt {attempt}/{max_retries}): {redact_stream_url(self.rtsp_url)}")
 
                 # Set FFmpeg options for robust, low-latency RTSP streaming
                 # Critical for stable 15fps at 640p over Tailscale
