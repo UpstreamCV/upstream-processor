@@ -1,0 +1,13 @@
+# Computer Vision
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+lapx>=0.5.2
+
+# HTTP
+requests>=2.31.0
+
+# Numerical
+numpy>=1.24.0
+
+# torch, torchvision, torchreid are installed separately in the Dockerfile
+# (CUDA build + torchreid's Cython compile from source).

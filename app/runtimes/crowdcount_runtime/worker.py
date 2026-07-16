@@ -106,12 +106,17 @@ class CrowdCountWorker(Runtime):
             network=self._settings.crowdcount_docker_network,
             stop_timeout_seconds=self._settings.crowdcount_process_stop_timeout_seconds,
             api_base_url=self._settings.crowdcount_api_base_url,
-            # Device identity (crowdcount device_id) is an open migration
-            # decision — EligibleSession carries no external_id and Upstream
-            # holds no CrowdCount device credentials. Empty => the container's
-            # CrowdCountAPIClient disables itself (counts without posting),
-            # the correct status-only probe behavior.
-            device_id="",
+            # The camera's external_id IS the CrowdCount device_id (set at
+            # registration). With a service secret configured, the container
+            # posts counts on behalf of this device; missing either the id or
+            # the secret leaves the CrowdCountAPIClient disabled (probe:
+            # counts without posting).
+            device_id=self._session.external_id or "",
+            service_secret=(
+                self._settings.crowdcount_service_secret.get_secret_value()
+                if self._settings.crowdcount_service_secret
+                else ""
+            ),
             width=self._session.approved.width,
             height=self._session.approved.height,
             fps=self._session.approved.fps,
