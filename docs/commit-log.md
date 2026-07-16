@@ -4,6 +4,126 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-07-16 - Migration sweep: worker hardening (`fix/sweep-worker-hardening`)
+
+**Why:** the CrowdCount→Upstream migration went live end-to-end this morning
+and a multi-agent audit swept every touched repo. The live path reviewed
+clean; the findings are in the edge/failure paths. This branch fixes the
+processor-side ones. Nothing here changes counting behavior.
+
+**Correctness:**
+- `crowdcount_api_client._signed_request` minted a **fresh Idempotency-Key
+  per HTTP attempt**, so a retry carried a different key than the attempt it
+  was retrying — a ReadTimeout retry against an already-committed request
+  double-counted a crossing. One key per logical operation, reused across
+  its attempts.
+- **SIGTERM during startup was ignored** → SIGKILL → device left ghost-online
+  (the sticky-status ghost class). `processor.stop()` only cleared
+  `self.running`, which `base_processor.run()` re-assigns on entry, and the
+  connect retry loop never checked it. Latched in the
+  `SingleSessionPeopleCounter` subclass; `connect_stream` now drives the base
+  one attempt at a time. Residual: one attempt can still block ~10s inside
+  cv2, which outlasts the 8s grace.
+- **Shutdown could exceed the 8s docker grace** (offline post retries ~12s +
+  1.5s count-thread grace). Lifecycle posts are single-shot now.
+- **A wrong/rotated `CC_SERVICE_SECRET` was silent count loss** — every post
+  401'd as a warning while the worker reported itself healthy. A rejected
+  online post is now fatal (exit 3); transient failures still tolerated.
+
+**Lifecycle / status:**
+- `_default_pm_factory` forwarded `CC_SERVICE_SECRET` with an empty
+  `CC_DEVICE_ID` for a camera with no `external_id` — the one combination the
+  container rejects (exit 3), crash-looping into quarantine. Withheld now
+  (true probe mode).
+- Exit **137 was unconditionally clean**, so a docker OOM-kill posted
+  `stopped`. 137/143 are clean only for a stop we requested.
+- **No attach deadline**: a container wedged before `CROWDCOUNT_READY` held
+  the session in `starting` forever. Bounded by
+  `UPSTREAM_CROWDCOUNT_ATTACH_TIMEOUT_SECONDS` (120s).
+
+**Hygiene:** stopped logging the full internal RTSP URL (session key) on
+every connect attempt; the publisher reuses one `requests.Session` (was a
+socket per publish at ~12Hz) and `stop()` joins its thread; per-frame hook
+errors are counted + logged instead of silently swallowed; API-client records
+no longer print twice.
+
+**Reconcile:** `overhead_people_counter.v1` was `probe`/`production_ready:
+false` with `outputs: [processor.line_crossing]`. It is live+verified in prod
+and emits **no** Upstream observations at all. Now `supported` /
+`production_ready: true` / no outputs, matching the api-server catalog (being
+changed in the same sweep). Verified first that none of these fields gate
+worker spawning or validation for this package.
+
+**Docs:** README crowdcount-runtime section + `UPSTREAM_CROWDCOUNT_*` /
+fanout env rows; module-map unfrozen from M8.1 (`crowdcount_runtime/`,
+`deepstream_runtime/`, `workers/`); `.env.example` crowdcount section; the
+`CC_*` env contract docstrings (7 undocumented vars); this backfill.
+
+---
+
+## 2026-07-16 - Counting line on the overlay + service-auth status fix (PR #4)
+
+**What changed:** the perception envelope now carries the counting line
+(`geometry.lines`) — the processor's `doorway_center` as a vertical line at
+`doorway_center * frame width` — so the dashboard's Geometry toggle renders
+what the counter actually counts against. Also fixed the service-auth status
+post (`update_status` now signs as a service call rather than 401'ing).
+
+**Live:** boxes + counting line render on the Live Monitor; 22 crossings
+fired with stable BoT-SORT track ids, each posted to prod.
+
+---
+
+## 2026-07-15 - Perception fan-out hot path for the counting worker (PR #3)
+
+**What changed:** new `workers/overhead_people_counter/src/worker/
+perception_publisher.py` — a background daemon thread publishing per-frame
+detection boxes + track ids to the perception-fanout sidecar on a
+subscriber-aware cadence (fast when someone is watching, idle otherwise),
+using the same envelope DeepStream workers publish so the dashboard's one
+renderer works unchanged. The per-frame hook is cheap, never blocks the
+counting loop, and never raises into it. `CrowdCountProcessManager` forwards
+`CC_CAMERA_ID` / `CC_SESSION_ID` / `CC_FANOUT_URL` / `CC_FANOUT_SECRET`.
+
+**Design call:** the overlay is ephemeral and lossy by design. Counts-of-
+record are unaffected and remain the durable record.
+
+---
+
+## 2026-07-15 - Port the CrowdCount counting worker into this repo (PR #2)
+
+**Why:** the counting container was built out of crowdcount-counter-server,
+so the image's source lived in a different repo from the runtime that
+supervises it. Ported it here: `workers/overhead_people_counter/` (~4600
+lines) — `PeopleCounterProcessor` (YOLO v6 + BoT-SORT + OSNet ReID + the
+doorway crossing state machine), the signed `CrowdCountAPIClient`, the frame
+jitter buffer, the `CC_*`-driven single-session entrypoint, the V6 weights +
+`botsort.yaml`, and the Dockerfile. The counting behavior is the unmodified
+CrowdCount prod code.
+
+**What did NOT change:** the legacy fleet path. crowdcount-counter-server
+`prod` still runs the fleet; this is a copy, not a cutover.
+
+---
+
+## 2026-07-07 - CrowdCount runtime: container-per-session counting worker
+
+**What changed:** new `app/runtimes/crowdcount_runtime/` — `CrowdCountWorker`
+mirroring `DeepStreamWorker`'s docker-backed lifecycle (guard the RTSP URL,
+post `starting`, launch, attach on the `CROWDCOUNT_READY` stdout marker,
+heartbeat `processing`, map the exit to `stopped`/`failed`) and
+`CrowdCountProcessManager` (no `timeout` wrapper — this is a long-running
+worker, not a bounded probe; session inputs travel in a per-run 0600
+`--env-file`, never argv). New `overhead_people_counter.v1` package,
+`crowdcount` runtime in the resolver + `build_worker` dispatch, and the
+`UPSTREAM_CROWDCOUNT_*` settings.
+
+**Division of labor:** the container owns counting, tracking and the
+counts-of-record posts to crowdcount-server; Upstream owns the container
+lifecycle and processor status.
+
+---
+
 ## 2026-06-20 - BYOM Phase 0: Model Descriptor + Decoder Registry refactor (no behavior change)
 
 **Why:** foundation for the BYOM plan (`docs/byom-architecture.md`). Make the
