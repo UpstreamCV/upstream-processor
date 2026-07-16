@@ -46,6 +46,7 @@ class PerceptionPublisher:
         active_hz=12.0,
         idle_hz=0.5,
         timeout=2.0,
+        doorway_center=None,
     ):
         self._camera_id = camera_id
         self._session_id = session_id or None
@@ -54,6 +55,10 @@ class PerceptionPublisher:
         self._processor_id = processor_id or None
         self._package_id = package_id or None
         self._fps = float(fps) if fps else None
+        # Fraction of frame WIDTH where the (vertical) counting line sits —
+        # the processor's doorway_center. Rendered by the dashboard's Geometry
+        # toggle; None omits the line from the envelope.
+        self._doorway_center = float(doorway_center) if doorway_center is not None else None
         self._active_hz = active_hz
         self._idle_hz = idle_hz
         self._timeout = timeout
@@ -120,6 +125,19 @@ class PerceptionPublisher:
             self._publish(w, h, frame_num, objects)
 
     def _publish(self, w, h, frame_num, objects):
+        # The counting line is internal to the processor (vertical, at
+        # doorway_center * frame width) — surface it so the overlay can draw
+        # what the counter actually counts against.
+        lines = []
+        if self._doorway_center is not None and w:
+            cx = round(w * self._doorway_center)
+            lines.append(
+                {
+                    "id": "counting-line",
+                    "label": "Counting line",
+                    "points": [{"x": cx, "y": 0}, {"x": cx, "y": h}],
+                }
+            )
         envelope = {
             "type": "snapshot",
             "camera_id": self._camera_id,
@@ -135,7 +153,7 @@ class PerceptionPublisher:
                     "fps": self._fps,
                 },
                 "objects": objects,
-                "geometry": {"rois": [], "lines": []},
+                "geometry": {"rois": [], "lines": lines},
             },
         }
         try:
