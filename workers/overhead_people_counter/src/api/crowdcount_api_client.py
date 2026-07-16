@@ -94,6 +94,12 @@ class CrowdCountAPIClient:
         else:
             self._signing_key = ""
 
+        # Verdict from the most recent update_status(): True = the server
+        # accepted our credentials, False = it rejected them (401/403), None =
+        # no verdict (transient failure, or no attempt yet). Lets a caller
+        # distinguish a bad/rotated secret from an API blip.
+        self.last_status_auth_ok: Optional[bool] = None
+
         # Setup logging (only add handler and log once per device_id)
         self.logger = logging.getLogger(f"APIClient-{device_id}")
         if not self.logger.handlers:
@@ -102,13 +108,17 @@ class CrowdCountAPIClient:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+            # This handler IS the output for these records; without this the
+            # root handler (counter_worker's basicConfig) prints them again.
+            self.logger.propagate = False
             # Only log initialization once per device
             if self.enabled:
                 self.logger.info(f"API Client initialized for device: {device_id}")
             else:
                 self.logger.info(f"API Client disabled (no credentials provided)")
 
-    def _signed_request(self, path: str, data: dict, idempotent: bool = False) -> requests.Response:
+    def _signed_request(self, path: str, data: dict, idempotent: bool = False,
+                        idempotency_key: Optional[str] = None) -> requests.Response:
         """Send a signed POST request with optional idempotency key.
 
         Serializes the body, computes HMAC-SHA256 signature, and attaches
@@ -118,6 +128,10 @@ class CrowdCountAPIClient:
             path: API path (e.g. "/add_to_count")
             data: JSON payload dict
             idempotent: Whether to attach an Idempotency-Key header
+            idempotency_key: The key to send. MUST be supplied by callers that
+                retry: every attempt at one logical operation has to carry the
+                SAME key, or a retry after a ReadTimeout the server already
+                committed double-counts. Omitted => a fresh key (single-shot).
 
         Returns:
             The requests.Response object
@@ -137,7 +151,7 @@ class CrowdCountAPIClient:
             "X-CC-Device-Id": self.device_id,
         }
         if idempotent:
-            headers["Idempotency-Key"] = uuid.uuid4().hex
+            headers["Idempotency-Key"] = idempotency_key or uuid.uuid4().hex
 
         return requests.post(
             f"{self.base_url}{path}",
@@ -166,10 +180,16 @@ class CrowdCountAPIClient:
             'count_to_add': str(count)
         }
 
+        # One key for this crossing, reused by every attempt below: a retry
+        # after a timeout the server already committed must be deduplicated,
+        # not counted twice.
+        idem_key = uuid.uuid4().hex
+
         for attempt in range(1 + max_retries):
             try:
                 self.logger.debug(f"POST /add_to_count - Adding {count} to count (attempt {attempt + 1})")
-                response = self._signed_request("/add_to_count", data, idempotent=True)
+                response = self._signed_request("/add_to_count", data, idempotent=True,
+                                                idempotency_key=idem_key)
 
                 if response.status_code == 200:
                     self.logger.info(f"✓ Added {count} to remote count")
@@ -214,10 +234,14 @@ class CrowdCountAPIClient:
             'count_to_sub': str(count)
         }
 
+        # One key for this crossing — see add_to_count.
+        idem_key = uuid.uuid4().hex
+
         for attempt in range(1 + max_retries):
             try:
                 self.logger.debug(f"POST /sub_from_count - Subtracting {count} from count (attempt {attempt + 1})")
-                response = self._signed_request("/sub_from_count", data, idempotent=True)
+                response = self._signed_request("/sub_from_count", data, idempotent=True,
+                                                idempotency_key=idem_key)
 
                 if response.status_code == 200:
                     self.logger.info(f"✓ Subtracted {count} from remote count")
@@ -288,6 +312,10 @@ class CrowdCountAPIClient:
         """
         Update device online/offline status on the server
 
+        Also records the server's verdict on our credentials in
+        last_status_auth_ok, so a caller can fail fast on a rejected
+        credential without treating an API blip as a rejection.
+
         Args:
             status: Either "online" or "offline"
             max_retries: Maximum number of retries on transient failure (default: 2)
@@ -298,6 +326,8 @@ class CrowdCountAPIClient:
         if status not in {"online", "offline"}:
             self.logger.error(f"Invalid status: {status}. Must be 'online' or 'offline'")
             return False
+
+        self.last_status_auth_ok = None
 
         # Always try to update status, even if API is "disabled" for counting
         # Status updates are important for device management
@@ -311,17 +341,24 @@ class CrowdCountAPIClient:
             'status': status
         }
 
+        # One key for this status post, reused by every attempt below.
+        idem_key = uuid.uuid4().hex
+
         for attempt in range(1 + max_retries):
             try:
                 self.logger.debug(f"POST /update_status - Updating status to {status} (attempt {attempt + 1})")
-                response = self._signed_request("/update_status", data, idempotent=True)
+                response = self._signed_request("/update_status", data, idempotent=True,
+                                                idempotency_key=idem_key)
 
                 if response.status_code == 200:
+                    self.last_status_auth_ok = True
                     self.logger.info(f"✓ Device status updated to {status}")
                     return True
                 elif response.status_code == 503:
                     raise requests.ConnectionError("Server starting up (503)")
                 else:
+                    if response.status_code in (401, 403):
+                        self.last_status_auth_ok = False
                     self.logger.warning(f"✗ Status Update Error: HTTP {response.status_code}")
                     return False
 
