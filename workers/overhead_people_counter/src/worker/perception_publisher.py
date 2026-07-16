@@ -12,6 +12,7 @@ is watching, idle otherwise). The per-frame hook is cheap and never blocks the
 counting loop; publishing is entirely best-effort and never raises into it.
 """
 
+import contextlib
 import logging
 import threading
 import time
@@ -69,6 +70,12 @@ class PerceptionPublisher:
         self._subscribers = 0
         self.published = 0
         self.errors = 0
+        self.hook_errors = 0
+
+        # One connection kept alive across publishes: at the active cadence
+        # this posts ~12x/s, and a fresh socket (+ TLS) per publish is pure
+        # churn against a sidecar we talk to continuously.
+        self._http = requests.Session()
 
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="perception-publisher"
@@ -101,9 +108,19 @@ class PerceptionPublisher:
                 )
             with self._lock:
                 self._latest = (int(w), int(h), int(frame_number), objects)
-        except Exception:
-            # The overlay must never be able to break the counting loop.
-            pass
+        except Exception as e:
+            # The overlay must never be able to break the counting loop — but
+            # swallowing silently is how e.g. a Detection attribute rename
+            # kills the overlay with nobody noticing. Count it, and surface
+            # the first one (then rarely, this runs per frame). Logging itself
+            # must not be able to raise in here.
+            self.hook_errors += 1
+            if self.hook_errors == 1 or self.hook_errors % 500 == 0:
+                with contextlib.suppress(Exception):
+                    logger.warning(
+                        "perception hook error #%d (overlay degraded, counting "
+                        "unaffected): %r", self.hook_errors, e
+                    )
 
     # -- background publisher ----------------------------------------------
 
@@ -157,7 +174,7 @@ class PerceptionPublisher:
             },
         }
         try:
-            r = requests.post(
+            r = self._http.post(
                 self._url,
                 json=envelope,
                 headers={"X-Upstream-Webhook-Secret": self._secret},
@@ -181,5 +198,16 @@ class PerceptionPublisher:
             if self.errors <= 3 or self.errors % 100 == 0:
                 logger.warning("fanout publish failed (%s; errors=%d)", e, self.errors)
 
-    def stop(self):
+    def stop(self, timeout=1.0):
+        """Signal the publisher thread and give it a moment to land.
+
+        Short by design: this runs on the SIGTERM path, which has to fit
+        Upstream's 8s docker stop grace alongside the count-thread grace and
+        the offline post. The thread is a daemon, so a wedged POST can never
+        hold up exit; the session is only closed once it is actually done
+        with it.
+        """
         self._stop.set()
+        self._thread.join(timeout=timeout)
+        if not self._thread.is_alive():
+            self._http.close()
