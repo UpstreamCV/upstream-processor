@@ -32,6 +32,34 @@ def _derive_service_key(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
+# Auth rejections that re-signing cannot fix: the credential itself is wrong,
+# absent, or out of scope, so every subsequent post would fail the same way.
+# crowdcount-server's other auth 401s (expired timestamp, replayed nonce) are
+# transient — clock skew must never be mistaken for a bad secret, or an NTP
+# blip on the processor host would fail every counting worker at once. A
+# response with no machine-readable code yields NO verdict, so a server that
+# predates the codes degrades to the old tolerate-and-warn behavior.
+_FATAL_AUTH_CODES = frozenset({
+    "service_auth_invalid_signature",
+    "service_auth_incomplete",
+    "service_auth_not_allowed_for_endpoint",
+})
+
+
+def _auth_error_of(response) -> tuple:
+    """Pull (code, message) out of an auth-failure body; ("", "") if absent."""
+    try:
+        body = response.json()
+    except Exception:
+        return "", ""
+    if not isinstance(body, dict):
+        return "", ""
+    code = body.get("code") or ""
+    message = body.get("error") or ""
+    return (code if isinstance(code, str) else "",
+            message if isinstance(message, str) else "")
+
+
 def _compute_signature(
     signing_key: str,
     method: str,
@@ -95,10 +123,13 @@ class CrowdCountAPIClient:
             self._signing_key = ""
 
         # Verdict from the most recent update_status(): True = the server
-        # accepted our credentials, False = it rejected them (401/403), None =
-        # no verdict (transient failure, or no attempt yet). Lets a caller
+        # accepted our credentials, False = it rejected them as unusable, None
+        # = no verdict (transient failure, or no attempt yet). Lets a caller
         # distinguish a bad/rotated secret from an API blip.
         self.last_status_auth_ok: Optional[bool] = None
+        # The server's message for the most recent non-2xx status post, so a
+        # caller acting on the verdict can say WHY rather than guess.
+        self.last_status_auth_error: str = ""
 
         # Setup logging (only add handler and log once per device_id)
         self.logger = logging.getLogger(f"APIClient-{device_id}")
@@ -358,8 +389,14 @@ class CrowdCountAPIClient:
                     raise requests.ConnectionError("Server starting up (503)")
                 else:
                     if response.status_code in (401, 403):
-                        self.last_status_auth_ok = False
-                    self.logger.warning(f"✗ Status Update Error: HTTP {response.status_code}")
+                        code, message = _auth_error_of(response)
+                        self.last_status_auth_error = message or code
+                        if code in _FATAL_AUTH_CODES:
+                            self.last_status_auth_ok = False
+                    err = self.last_status_auth_error
+                    detail = f": {err}" if err else ""
+                    self.logger.warning(
+                        f"✗ Status Update Error: HTTP {response.status_code}{detail}")
                     return False
 
             except (requests.Timeout, requests.ConnectionError) as e:
