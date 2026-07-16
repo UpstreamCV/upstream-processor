@@ -382,23 +382,29 @@ def main():
         # A rejected credential is not a blip: in service mode every count post
         # would 401 while the worker kept reporting itself healthy, silently
         # losing counts-of-record. Fail fast so the supervisor surfaces it.
-        # Transient failures leave the verdict None and are tolerated.
+        # Only rejections re-signing cannot fix count (see _FATAL_AUTH_CODES);
+        # transient failures and clock skew leave the verdict None.
         if config.service_mode and lifecycle_client.last_status_auth_ok is False:
             print(f'ERROR: CC_SERVICE_SECRET rejected for device {config.device_id} '
-                  f'at {config.api_base_url}; counts would be silently dropped',
+                  f'at {config.api_base_url} ({lifecycle_client.last_status_auth_error}); '
+                  f'counts would be silently dropped',
                   file=sys.stderr, flush=True)
             sys.exit(3)
 
         processor.run()  # blocking until stop, stream loss, or init failure
     finally:
-        if perception is not None:
-            perception.stop()
-        # Let in-flight per-crossing count threads finish before exiting.
-        time.sleep(COUNT_THREAD_GRACE_SECONDS)
+        # Order matters: the offline post is the only thing here that MUST
+        # land inside the 8s docker stop grace (3s online post + 1.5s grace +
+        # 3s offline = 7.5s worst case). The publisher's join can only spend
+        # what is left over, so it goes last — nothing below depends on it,
+        # and its thread is a daemon the interpreter will not wait for.
+        time.sleep(COUNT_THREAD_GRACE_SECONDS)  # let count threads finish
         try:
             lifecycle_client.update_status('offline', max_retries=0)
         except Exception as e:
             logger.warning(f'offline status post failed: {e}')
+        if perception is not None:
+            perception.stop()
         sys.stdout.flush()
 
     if processor.stop_requested or processor.ready_emitted:
