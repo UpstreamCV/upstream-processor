@@ -77,9 +77,7 @@ async def provision_local_path(
         if response.status_code == 400:
             # Already exists -> update it in place so the new session's
             # passphrase takes effect rather than the stale one.
-            response = await client.patch(
-                f"{base}/v3/config/paths/patch/{path}", json=body
-            )
+            response = await client.patch(f"{base}/v3/config/paths/patch/{path}", json=body)
     except httpx.HTTPError as exc:
         # Loopback transport failure means MediaMTX is down or not listening
         # on the configured port — a local problem, reported honestly.
@@ -94,9 +92,7 @@ async def provision_local_path(
     _log.info("provisioned local mediamtx path %s", path)
 
 
-async def deprovision_local_path(
-    client: httpx.AsyncClient, *, base_url: str, path: str
-) -> None:
+async def deprovision_local_path(client: httpx.AsyncClient, *, base_url: str, path: str) -> None:
     """Best-effort path removal. Never raises — cleanup must not break a loop.
 
     A 404 is success (already gone). Anything else is logged and swallowed;
@@ -110,6 +106,4 @@ async def deprovision_local_path(
         _log.warning("deprovision %s failed (transport): %s", path, exc)
         return
     if response.status_code not in (200, 204, 404):
-        _log.warning(
-            "deprovision %s failed: status=%s", path, response.status_code
-        )
+        _log.warning("deprovision %s failed: status=%s", path, response.status_code)
