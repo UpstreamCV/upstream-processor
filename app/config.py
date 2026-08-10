@@ -53,6 +53,33 @@ class Settings(BaseSettings):
     backoff_max_seconds: float = 30.0
     backoff_jitter: float = 0.2
 
+    # --- Pull-based MediaMTX provisioning ---------------------------------
+    # Set UPSTREAM_PROVISIONING_ENABLED=true together with the api-server's
+    # UPSTREAM_MEDIAMTX_PROVISIONING_MODE=pull. Enabling only one side is
+    # safe: the api-server returns an empty pending list in push mode, and a
+    # box with this off simply never collects the work (the api-server then
+    # fails the session on its wait timeout, exactly like a push transport
+    # failure). Default off so a redeploy changes no behaviour.
+    provisioning_enabled: bool = False
+
+    # This box's OWN MediaMTX admin API. Loopback by design — the whole point
+    # of pull mode is that nothing has to reach in from outside.
+    mediamtx_api_base_url: str = "http://127.0.0.1:9997"
+
+    # Agent /start blocks on our ack, so poll far tighter than the 5s worker
+    # reconcile. One cheap authenticated GET per tick.
+    provision_poll_interval_seconds: float = 1.0
+    provision_limit: int = 50
+
+    mediamtx_connect_timeout_seconds: float = 2.0
+    mediamtx_read_timeout_seconds: float = 5.0
+
+    # Lifecycle hooks written into each provisioned path. Leave blank to keep
+    # whatever the static mediamtx.yml already configures — an empty string
+    # would CLEAR the hook and silently disable stream-start/ended reporting.
+    mediamtx_runon_ready: str = ""
+    mediamtx_runon_not_ready: str = ""
+
     max_restarts: int = 5
     restart_window_seconds: float = 60.0
 

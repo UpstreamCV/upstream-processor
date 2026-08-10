@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, TypeVar
+from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -37,6 +38,11 @@ from app.perception.schemas import (
     PerceptionSnapshotPayload,
     PerceptionSnapshotResponse,
 )
+from app.provisioning.schemas import (
+    PendingProvisionsResponse,
+    ProvisionAckPayload,
+    ProvisionAckResponse,
+)
 
 _log = logging.getLogger("upstream_processor.api")
 
@@ -45,6 +51,7 @@ _ELIGIBLE = f"{_BASE_PATH}/eligible-sessions"
 _STATUS = f"{_BASE_PATH}/status"
 _OBSERVATIONS = f"{_BASE_PATH}/observations"
 _PERCEPTION_SNAPSHOTS = f"{_BASE_PATH}/perception-snapshots"
+_PENDING_PROVISIONS = f"{_BASE_PATH}/pending-provisions"
 
 _AUTH_HEADER = "X-Upstream-Webhook-Secret"
 
@@ -166,6 +173,28 @@ class UpstreamApiClient:
             json=observation.model_dump(mode="json", exclude_none=True),
         )
         return self._parse(resp, ObservationResponse)
+
+    async def get_pending_provisions(
+        self, limit: int = 50
+    ) -> PendingProvisionsResponse:
+        """Sessions whose MediaMTX path this box must create locally.
+
+        Empty list when the api-server is in push mode, so this is safe to
+        poll against either mode with no coordination.
+        """
+        resp = await self._send("GET", _PENDING_PROVISIONS, params={"limit": limit})
+        return self._parse(resp, PendingProvisionsResponse)
+
+    async def ack_provision(
+        self, session_id: UUID, payload: ProvisionAckPayload
+    ) -> ProvisionAckResponse:
+        """Report one provisioning outcome. Idempotent server-side."""
+        resp = await self._send(
+            "POST",
+            f"{_PENDING_PROVISIONS}/{session_id}/ack",
+            json=payload.model_dump(mode="json", exclude_none=True),
+        )
+        return self._parse(resp, ProvisionAckResponse)
 
     async def post_perception_snapshot(
         self, payload: PerceptionSnapshotPayload

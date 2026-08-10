@@ -11,6 +11,7 @@ loop, signal handling, and the exit-code contract:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
@@ -19,6 +20,7 @@ from app.api_client.upstream_api import UpstreamApiClient
 from app.config import get_settings
 from app.errors import ApiAuthError, ApiValidationError
 from app.logging_setup import setup_logging
+from app.provisioning.provisioner import Provisioner
 from app.supervisor.session_poller import SessionPoller
 from app.supervisor.worker_manager import WorkerManager
 
@@ -52,6 +54,12 @@ async def _run() -> int:
     poller = SessionPoller(api, settings.eligible_session_limit)
     manager = WorkerManager(poller=poller, api=api, settings=settings, shutdown=shutdown)
 
+    # Pull-mode MediaMTX provisioning runs beside the worker supervisor on
+    # the same outbound-only posture. Off by default; when disabled its run()
+    # returns immediately, so this costs one finished task.
+    provisioner = Provisioner(api=api, settings=settings, shutdown=shutdown)
+    provisioner_task = asyncio.create_task(provisioner.run(), name="provisioner")
+
     try:
         await manager.run()
         _log.info("clean shutdown")
@@ -66,6 +74,13 @@ async def _run() -> int:
         _log.exception("fatal: unexpected error")
         return 1
     finally:
+        # The supervisor owns the shutdown event; setting it here covers the
+        # paths where manager.run() raised before signalling.
+        shutdown.set()
+        provisioner_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await provisioner_task
+        await provisioner.aclose()
         await api.aclose()
 
 
