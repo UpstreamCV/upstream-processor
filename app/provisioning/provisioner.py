@@ -84,9 +84,7 @@ class Provisioner:
         )
         while not self._shutdown.is_set():
             try:
-                resp = await self._api.get_pending_provisions(
-                    limit=self._settings.provision_limit
-                )
+                resp = await self._api.get_pending_provisions(limit=self._settings.provision_limit)
             except ApiAuthError:
                 raise  # fatal config — bubble to main
             except ApiValidationError:
@@ -115,9 +113,7 @@ class Provisioner:
             if len(self._done) > 512:
                 self._done.clear()
 
-            if await wait_or_event(
-                self._shutdown, self._settings.provision_poll_interval_seconds
-            ):
+            if await wait_or_event(self._shutdown, self._settings.provision_poll_interval_seconds):
                 break
 
         await self.aclose()

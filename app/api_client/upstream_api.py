@@ -174,9 +174,7 @@ class UpstreamApiClient:
         )
         return self._parse(resp, ObservationResponse)
 
-    async def get_pending_provisions(
-        self, limit: int = 50
-    ) -> PendingProvisionsResponse:
+    async def get_pending_provisions(self, limit: int = 50) -> PendingProvisionsResponse:
         """Sessions whose MediaMTX path this box must create locally.
 
         Empty list when the api-server is in push mode, so this is safe to
