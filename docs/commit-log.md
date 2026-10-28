@@ -4,6 +4,18 @@ Reverse chronological. Newest at top.
 
 ---
 
+## 2026-10-27 - chore: add all-rights-reserved LICENSE
+
+**Why:** Adds `LICENSE` ahead of making the repo public: copyright
+Upstream Vision, Inc., all rights reserved. The source is visible for
+reference only; no rights to use, copy, modify, or distribute it are
+granted. Third-party components keep their own licenses.
+
+- `LICENSE` (new).
+- `docs/commit-log.md` — this entry.
+
+---
+
 ## 2026-07-16 - Migration sweep: worker hardening (`fix/sweep-worker-hardening`)
 
 **Why:** the CrowdCount→Upstream migration went live end-to-end this morning
